@@ -1102,10 +1102,8 @@ pub fn parse_ref(value: &str) -> Option<&str> {
     if inner.is_empty() {
         return None;
     }
-    // 拒绝嵌套与拼接：内部不得再出现 $ { }
-    if inner.contains(['$', '{', '}']) {
-        return None;
-    }
+    // 标识符规则本身就排除了 `$ { }`（它们都不在 [A-Za-z0-9_] 里），
+    // 所以嵌套与拼接形态由下面这段一并拒掉，不需要单独的守卫。
     let mut chars = inner.chars();
     let first = chars.next()?;
     if !(first.is_ascii_alphabetic() || first == '_') {
