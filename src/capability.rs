@@ -174,12 +174,31 @@ pub enum VersionMatch {
     Unknown,
 }
 
-fn mcp_summary(command: &str, args: &[String]) -> String {
-    if args.is_empty() {
-        command.to_string()
-    } else {
-        format!("{command} {}", args.join(" "))
+/// 把「没有值」和「有值但是哨兵」都收敛成 None，交给 compare_versions 的 `sha: None`
+/// 守卫去降级到 version 分支或 Unknown。实测哨兵：`unknown`（大小写不一）、空串、纯空白。
+pub fn normalize_locator(value: Option<&str>) -> Option<String> {
+    let v = value?.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("unknown") {
+        return None;
     }
+    Some(v.to_string())
+}
+
+/// MCP 的人类可读摘要。**只渲染键名，绝不渲染 env 值**——desired 侧的值永远是 `${VAR}`
+/// 引用，但 actual 侧是 adapter 从 `~/.claude.json` 这类活配置读出来的，可能就是明文真密钥。
+/// spec §3 决策 3：密钥永不进任何产物。
+fn mcp_summary(command: &str, args: &[String], env: &BTreeMap<String, String>) -> String {
+    let mut s = String::from(command);
+    if !args.is_empty() {
+        s.push(' ');
+        s.push_str(&args.join(" "));
+    }
+    if !env.is_empty() {
+        s.push_str(" [env: ");
+        s.push_str(&env.keys().cloned().collect::<Vec<_>>().join(","));
+        s.push(']');
+    }
+    s
 }
 
 /// SHA 优先、version 兜底（spec §2.1 第 3 条）。
@@ -252,8 +271,8 @@ pub fn compare_versions(desired: &Spec, actual: &Spec) -> VersionMatch {
                 VersionMatch::Same
             } else {
                 VersionMatch::Different {
-                    from: mcp_summary(ac, aa),
-                    to: mcp_summary(dc, da),
+                    from: mcp_summary(ac, aa, ae),
+                    to: mcp_summary(dc, da, de),
                 }
             }
         }
@@ -457,6 +476,27 @@ mod tests {
             ),
             VersionMatch::Same
         );
+        // 上面三对 fixture 全都有 command 或 args 上的差异，`de == ae` 那一段其实没被
+        // 看过一眼：把它删掉测试仍全绿。这一对 command+args 逐字相同、**只差 env 值**，
+        // 是唯一能杀掉该变异的形状。摘要按 A2 只渲染键名，所以 from/to 同串是裁定的残余。
+        assert_eq!(
+            compare_versions(
+                &mcp("npx", vec!["-y", "pkg"], vec![("K", "v2")]),
+                &mcp("npx", vec!["-y", "pkg"], vec![("K", "v1")])
+            ),
+            VersionMatch::Different {
+                from: "npx -y pkg [env: K]".into(),
+                to: "npx -y pkg [env: K]".into(),
+            }
+        );
+        // env 逐字相同（键名与值都相同）才算 Same：这一对与上一对只在 env 的值上有差别
+        assert_eq!(
+            compare_versions(
+                &mcp("npx", vec!["-y", "pkg"], vec![("K", "v1")]),
+                &mcp("npx", vec!["-y", "pkg"], vec![("K", "v1")])
+            ),
+            VersionMatch::Same
+        );
     }
 
     /// 两条 `Different` 断言只检查「不等于 Same」，所以把 from/to 写反也照样绿；
@@ -485,6 +525,68 @@ mod tests {
             VersionMatch::Different {
                 from: "oldbin".into(),
                 to: "newbin".into()
+            }
+        );
+    }
+
+    /// `mcp_summary` 的第三个参数是**安全约束**，不是装饰：actual 侧的 env 值由 adapter 从
+    /// 活配置里读出来，可能就是明文真密钥，而摘要会进 Task 14 的终端输出与报告产物。
+    /// 所以这里把每条渲染串逐字钉死——任何把值拼进摘要的写法（`keys()` 换成 `values()`、
+    /// 加个 `= {v}`）都会立刻变红。键名顺序也是契约的一部分：BTreeMap 的字节升序 + `,`
+    /// 分隔，插入顺序不参与。
+    #[test]
+    fn mcp_summary_renders_env_key_names_never_values() {
+        let mcp = |cmd: &str, args: Vec<&str>, env: Vec<(&str, &str)>| Spec::Mcp {
+            command: cmd.into(),
+            args: args.into_iter().map(String::from).collect(),
+            env: env
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        // 同一个键换了值 → 摘要同串。不显示值就分不清值，这是换取「密钥永不进产物」
+        // 而**已裁定接受**的残余，不要试图消掉。
+        assert_eq!(
+            compare_versions(
+                &mcp("npx", vec!["-y", "pkg"], vec![("K", "sk-live-9f3a")]),
+                &mcp("npx", vec!["-y", "pkg"], vec![("K", "${K}")])
+            ),
+            VersionMatch::Different {
+                from: "npx -y pkg [env: K]".into(),
+                to: "npx -y pkg [env: K]".into(),
+            }
+        );
+        // 多键：字节升序、`,` 分隔、无空格；desired 侧的插入顺序是 Z 然后 A
+        assert_eq!(
+            compare_versions(
+                &mcp("npx", vec!["x"], vec![("Z", "sk-live-9f3a"), ("A", "${A}")]),
+                &mcp("npx", vec!["x"], vec![("A", "${A}"), ("Z", "other")])
+            ),
+            VersionMatch::Different {
+                from: "npx x [env: A,Z]".into(),
+                to: "npx x [env: A,Z]".into(),
+            }
+        );
+        // 只有一侧有 env → 另一侧不渲染 `[env: ]` 段，方向仍是 from=actual、to=desired
+        assert_eq!(
+            compare_versions(
+                &mcp("npx", vec!["-y", "pkg"], vec![("TOKEN", "sk-live-9f3a")]),
+                &mcp("npx", vec!["-y", "pkg"], vec![])
+            ),
+            VersionMatch::Different {
+                from: "npx -y pkg".into(),
+                to: "npx -y pkg [env: TOKEN]".into(),
+            }
+        );
+        // 无 args 时 `[env: ]` 段直接跟在 command 后面（那个前导空格是它自己的）
+        assert_eq!(
+            compare_versions(
+                &mcp("newbin", vec![], vec![("K", "${K}")]),
+                &mcp("newbin", vec![], vec![])
+            ),
+            VersionMatch::Different {
+                from: "newbin".into(),
+                to: "newbin [env: K]".into(),
             }
         );
     }
@@ -523,6 +625,86 @@ mod tests {
         assert_eq!(
             compare_versions(&skill, &plugin(Some("1.0"), None)),
             VersionMatch::Unknown
+        );
+    }
+
+    /// 实测本机 locator 有五种形态，其中一种是字面量 `unknown`（大小写不一）、还有空串与
+    /// 纯空白。这些哨兵必须在进 `compare_versions` 之前收敛成 `None`，否则两条
+    /// `sha: Some("unknown")` 会命中「两边都有 SHA」分支判成 `Same`——两个真不同的构建
+    /// 被报成同步，正是本 Task 要消灭的那类假阴性。
+    #[test]
+    fn normalize_locator_collapses_absent_and_sentinel_values() {
+        assert_eq!(normalize_locator(None), None);
+        assert_eq!(normalize_locator(Some("")), None);
+        assert_eq!(normalize_locator(Some("  ")), None);
+        assert_eq!(normalize_locator(Some("\t\n ")), None);
+        assert_eq!(normalize_locator(Some("unknown")), None);
+        assert_eq!(normalize_locator(Some("UNKNOWN")), None);
+        assert_eq!(normalize_locator(Some("UnKnOwN")), None);
+        assert_eq!(normalize_locator(Some(" unknown ")), None);
+        // 真 locator 原样返回（两侧空白 trim 掉）
+        assert_eq!(
+            normalize_locator(Some("6.3.0")).as_deref(),
+            Some("6.3.0"),
+            "version 串不该被哨兵规则吃掉"
+        );
+        assert_eq!(
+            normalize_locator(Some("a1b2c3")).as_deref(),
+            Some("a1b2c3"),
+            "短 sha 串同样原样返回"
+        );
+        assert_eq!(
+            normalize_locator(Some("  b36e0829c6d0140e93cfef2ca599b1b07d4a7797  ")).as_deref(),
+            Some("b36e0829c6d0140e93cfef2ca599b1b07d4a7797")
+        );
+    }
+
+    /// 端到端：归一化 + 比较串成一条流水线，也就是下游（Task 5 的 `ref`、Task 9/10/11 的
+    /// `read_state`）真正要跑的形态。少了归一化，第一对会判成 `Same`（假同步）、第二对会
+    /// 判成 `Different`（假 drift）；两条都必须是 `Unknown`。
+    #[test]
+    fn sentinel_shas_normalize_to_unknown_not_a_false_same() {
+        let normalized = |version: Option<&str>, sha: Option<&str>| Spec::Plugin {
+            marketplace: Some("m".into()),
+            entry: "superpowers".into(),
+            version: normalize_locator(version),
+            sha: normalize_locator(sha),
+            install_path: None,
+            enabled: true,
+        };
+        // 两边都把「没有 SHA」写成同一个哨兵：不归一化 = Same
+        assert_eq!(
+            compare_versions(
+                &normalized(None, Some("unknown")),
+                &normalized(None, Some("unknown"))
+            ),
+            VersionMatch::Unknown
+        );
+        // 哨兵大小写/空白不同就不算「有 SHA」，也不能因为两串不相等就报成 drift
+        assert_eq!(
+            compare_versions(
+                &normalized(None, Some("unknown")),
+                &normalized(None, Some(" UNKNOWN "))
+            ),
+            VersionMatch::Unknown
+        );
+        // 归一化把哨兵清掉之后，version 兜底分支照常工作
+        assert_eq!(
+            compare_versions(
+                &normalized(Some("6.4.1"), Some("unknown")),
+                &normalized(Some("6.4.1"), Some(""))
+            ),
+            VersionMatch::Same
+        );
+        assert_eq!(
+            compare_versions(
+                &normalized(Some("6.4.1"), Some("unknown")),
+                &normalized(Some("6.3.0"), Some("UNKNOWN"))
+            ),
+            VersionMatch::Different {
+                from: "6.3.0".into(),
+                to: "6.4.1".into()
+            }
         );
     }
 }
