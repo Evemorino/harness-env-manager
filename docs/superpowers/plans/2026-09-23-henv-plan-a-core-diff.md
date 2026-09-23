@@ -1013,6 +1013,74 @@ git commit -m "feat: SHA 优先的版本比较，避免 version 字符串误报 
 
 ---
 
+#### Task 3 追加（评审后补，49 变异体检出三条）
+
+评审对 `compare_versions` 扫了 49 个变异体。前一轮补的两条测试确实杀住了 M7/M8/M10，但又暴露三个洞。
+以下三处都要做，全部在 `src/capability.rs` 内。
+
+**A1 — MCP 的 env 相等性有代码、没测试。** 删掉 `&& de == ae` 后 16/16 仍绿，而测试名字
+`mcp_compares_command_args_and_env` 明说 env 参与比较：该测试里每一对 fixture 都差在 command 或
+args 上，从没只差在 env 上；比 `${K}` 的那对两边 env 完全相同，看不见这个字段。补一对断言：
+command 与 args 全同、只有 env 值不同 → `Different`；env 也相同 → `Same`。缺了它，日后有人把比较
+「简化」成 command+args，env 漂移会被静默判成 in-sync——漏报是一枚只读工具最坏的失效方向。
+
+**A2 — `mcp_summary` 带上 env 的键名，但永远不带值。** 现状只吃 `(command, args)`，于是「只差 env」
+的一对渲染成 `from == to` 的同一串，Task 13 生成的更新行显示成「A → A」，看不出变化。改成三参：
+
+```rust
+/// MCP 的人类可读摘要。**只渲染键名，绝不渲染 env 值**——desired 侧的值永远是 `${VAR}`
+/// 引用，但 actual 侧是 adapter 从 `~/.claude.json` 这类活配置读出来的，可能就是明文真密钥。
+/// spec §3 决策 3：密钥永不进任何产物。
+fn mcp_summary(
+    command: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+) -> String {
+    let mut s = String::from(command);
+    if !args.is_empty() {
+        s.push(' ');
+        s.push_str(&args.join(" "));
+    }
+    if !env.is_empty() {
+        s.push_str(" [env: ");
+        s.push_str(&env.keys().cloned().collect::<Vec<_>>().join(","));
+        s.push(']');
+    }
+    s
+}
+```
+
+`from`/`to` 两个调用点都补第三个实参（`de` / `ae`）。**已知残余，不要试图消掉**：同一个键换了值时
+摘要仍是 `[env: K] → [env: K]`。不显示值就无法区分值，这是安全约束换来的代价；`~ update` 前缀加上
+键名已经足够让人定位到「是这个 key」。A1 的新断言按 `[env: K]` 形状写。
+
+**A3 — `sha` / `version` 的哨兵值归一化。** spec §2.1 第 3 条实测本机版本串有五种形态、含字面量
+`unknown`。而现在 `sha: Some("unknown")` 对 `sha: Some("unknown")` 会命中「两边都有 SHA」分支判成
+`Same`——两个真不同的构建被报成同步；空串同理。补：
+
+```rust
+/// 把「没有值」和「有值但是哨兵」都收敛成 None，交给 compare_versions 的 `sha: None`
+/// 守卫去降级到 version 分支或 Unknown。实测哨兵：`unknown`（大小写不一）、空串、纯空白。
+pub fn normalize_locator(value: Option<&str>) -> Option<String> {
+    let v = value?.trim();
+    if v.is_empty() || v.eq_ignore_ascii_case("unknown") {
+        return None;
+    }
+    Some(v.to_string())
+}
+```
+
+两条测试：`normalize_locator` 对 `None`/`Some("")`/`Some("  ")`/`Some("unknown")`/`Some("UNKNOWN")`
+返回 `None`，对 `Some("6.3.0")`/`Some("a1b2c3")` 原样返回；以及一条端到端的——两侧 `sha` 都是
+`Some("unknown")` 时，**先归一化再比较**必须得 `Unknown` 而不是 `Same`。
+
+**归一化的实际调用点在下游，不在本 Task**：Task 5 解析 manifest 的 `ref`、Task 9/10/11 的
+`read_state` 读 version/sha 时都要过 `normalize_locator`。该要求已写进那几轮派发上下文。
+
+补完后 `cargo test --lib capability::` 期望 **19 tests**（Task 2 的 7 个 + 本 Task 的 12 个）。
+
+---
+
 ### Task 4: 密钥引用门禁（secrets）
 
 **Files:**
