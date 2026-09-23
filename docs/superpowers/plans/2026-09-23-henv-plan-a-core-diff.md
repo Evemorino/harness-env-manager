@@ -744,7 +744,11 @@ mod testutil;
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cargo test --lib capability::`
-Expected: PASS（6 tests）
+Expected: PASS（7 tests）
+
+第 7 条 `kind_all_order_is_pinned` 是 Task 2 评审后追加的：本文件的 `Kind::all()` 顺序是
+Task 14 汇总表与 insta golden 的依赖，而原有的 6 条测试对任意排列都通过（`parse` 是从
+`all()` 派生的，round-trip 检不出顺序）。
 
 - [ ] **Step 6: Commit**
 
@@ -949,7 +953,7 @@ pub fn compare_versions(desired: &Spec, actual: &Spec) -> VersionMatch {
 - [ ] **Step 4: 运行测试确认通过**
 
 Run: `cargo test --lib capability::`
-Expected: PASS（13 tests）
+Expected: PASS（14 tests：Task 2 的 7 个 + 本 Task 的 7 个）
 
 - [ ] **Step 5: Commit**
 
@@ -5003,17 +5007,29 @@ mod tests {
 
     #[test]
     fn in_sync_summary_kinds_follow_kind_all_order() {
-        // Kind::all() = [Skill, Mcp, Command, Agent, Hook, Plugin]，计数为 0 的种类跳过。
+        // Kind::all() = [Skill, Mcp, Command, Agent, Hook, Plugin]。六个种类**全部给非零计数**：
+        // 只要有一个是 0，交换它与相邻种类的排列就检不出来（0 计数会被跳过）。
+        // 这条是 `Kind::all()` 顺序在 Task 2 之外的第二道闸，两道都要在。
         let plan = Plan {
             harnesses: vec![hp(
                 "codex",
                 true,
                 vec![],
-                vec![(Kind::Plugin, 2), (Kind::Hook, 5), (Kind::Skill, 1), (Kind::Command, 0)],
+                vec![
+                    (Kind::Skill, 1),
+                    (Kind::Mcp, 2),
+                    (Kind::Command, 3),
+                    (Kind::Agent, 4),
+                    (Kind::Hook, 5),
+                    (Kind::Plugin, 6),
+                ],
             )],
         };
         let out = render(&plan);
-        assert!(out.contains("✓ in-sync  skills:1 hooks:5 plugins:2\n"), "{out}");
+        assert!(
+            out.contains("✓ in-sync  skills:1 mcps:2 commands:3 agents:4 hooks:5 plugins:6\n"),
+            "{out}"
+        );
     }
 
     #[test]
