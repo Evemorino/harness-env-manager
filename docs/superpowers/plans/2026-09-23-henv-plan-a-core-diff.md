@@ -1635,7 +1635,7 @@ mod testutil;
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cargo test --lib manifest::`
-Expected: PASS（19 tests）
+Expected: PASS（20 tests）
 
 若 `rejects_unknown_top_level_and_entry_fields` 失败，确认 `Manifest`、`SkillEntry` 上都有
 `deny_unknown_fields`。若 `aggregates_all_errors_in_one_message` 失败，确认 `validate()` 是收集
@@ -2719,7 +2719,10 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
 
 **Interfaces:**
 - Consumes: `Home::{claude_skills, claude_json, claude_installed_plugins, claude_settings}`、`skills_dir::{read_skill_entries, plugin_from_path, SkillStore}`、`capability::*`
-- Produces: `ClaudeCode::read_state()`；以及 `pub(crate)` 工具 `read_json_if_present`、`split_plugin_key`、`mcp_capability`（Task 11 的 kimi adapter 会复用前两个）
+- Produces: `ClaudeCode::read_state()`；以及三个 `pub(crate)` 工具 `read_json_if_present`、
+  `split_plugin_key`、`mcp_capability`。Task 11 的 kimi adapter 复用 `read_json_if_present`
+  与 `mcp_capability`；`split_plugin_key` 只 claude 用（kimi 的 `installed.json` 是数组、
+  身份在 `id` 字段里，不需要拆 `name@marketplace`）。
 
 实测数据形状（本机 2026-09-23 盘点，即测试 fixture 的依据）：
 
@@ -4177,8 +4180,8 @@ Expected: FAIL —kimi 的 `supports` 仍无条件返回 `Native`。
 
 - [ ] **Step 3: 实现 claude-code 与 codex**
 
-两家的 `supports` 保持 Task 8 的骨架即可（全 `Native`），只需把签名里的 `_cap` 改成 `cap`
-并显式忽略：
+两家的 `supports` 行为与 Task 8 的骨架相同（全 `Native`），只需把骨架里那句
+`// Task 12 细化` 换成说明性注释——参数保持 `_cap`，因为两家都不看能力内容：
 
 `src/adapters/claude_code.rs`：
 ```rust
@@ -4847,7 +4850,7 @@ mod testutil;
 - [ ] **Step 5: 运行测试确认通过**
 
 Run: `cargo test --lib diff::`
-Expected: PASS（18 tests）
+Expected: PASS（20 tests）
 
 若 `entries_are_grouped_by_action_then_label` 失败，检查 `Action::rank` 的数值顺序与
 `entries.sort_by` 是否先比 rank 再比 label。
@@ -5333,11 +5336,12 @@ mod tests {
     use crate::testutil::TempHome;
 
     /// 跑一次 run_diff，返回渲染文本。
+    /// 用 `TempHome::write` 而非 `std::fs::write`：read_only_guard 扫的是整个
+    /// `src/lib.rs`（含 `#[cfg(test)]`），只豁免 `testutil.rs`。
     fn diff(t: &TempHome, manifest: &str) -> String {
-        let path = t.path("env.yaml");
-        std::fs::write(&path, manifest).expect("write manifest");
+        t.write("env.yaml", manifest);
         let mut out = Vec::new();
-        run_diff(&path, &t.home, &mut out).expect("run_diff");
+        run_diff(&t.path("env.yaml"), &t.home, &mut out).expect("run_diff");
         String::from_utf8(out).expect("utf8")
     }
 
@@ -5428,10 +5432,12 @@ mod tests {
     #[test]
     fn invalid_manifest_error_carries_the_path_and_the_validation_detail() {
         let t = TempHome::new();
-        let path = t.path("env.yaml");
-        std::fs::write(&path, "version: 1\nmcps:\n  c:\n    command: npx\n    env:\n      K: literal\n").unwrap();
+        t.write(
+            "env.yaml",
+            "version: 1\nmcps:\n  c:\n    command: npx\n    env:\n      K: literal\n",
+        );
         let mut out = Vec::new();
-        let err = run_diff(&path, &t.home, &mut out).unwrap_err().to_string();
+        let err = run_diff(&t.path("env.yaml"), &t.home, &mut out).unwrap_err().to_string();
         assert!(err.contains("env.yaml"), "{err}");
         assert!(err.contains("mcps.c"), "{err}");
         // 密钥门禁：错误里不许回显值
@@ -5820,7 +5826,7 @@ git commit -m "feat: henv diff CLI 端到端接线，附只读静态守卫"
 | §3 决策 1「plugin 不是特殊公民」 | Task 6（lower 拆解）、Task 7（`plugin_from_path`） |
 | §3 决策 2「apply = f(desired, actual)」 | Task 13（Plan A 只做 f 的只读半边） |
 | §3 决策 3「merge 不覆盖 / `${VAR}` 不展开」 | Task 4；merge 写入属 Plan B |
-| §4 清单 schema 全部字段 | Task 5（19 tests 含 spec §4 完整示例） |
+| §4 清单 schema 全部字段 | Task 5（20 tests 含 spec §4 完整示例） |
 | §4 决策 2「密钥语法即门禁」 | Task 4 + Task 5 校验 |
 | §5 `diff` 管道六条规则 | Task 13 |
 | §5 drift 方向（报告不删） | Task 13 `Counts::remove` 恒 0 + render 的 `--prune` 提示 |
