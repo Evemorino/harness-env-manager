@@ -21,7 +21,8 @@
 - **plugin 身份 = entry 名**（spec §2.1 第 3 条）。`superpowers@claude-plugins-official`、`superpowers@openai-api-curated`、kimi 的 `id: superpowers` 三者身份同为 `superpowers`；marketplace 是 Spec 细节，不参与身份。
 - **版本比较 SHA 优先、version 兜底**；一侧有 SHA 一侧只有 version → `Unknown`，diff 按 in-sync 处理（只读工具不误报）。
 - 所有集合遍历必须**确定性排序**（`BTreeMap` / 显式 `sort`），否则 insta 快照与 diff 输出会抖动。
-- 错误一律 `anyhow::Result`，用 `.context()` 带上文件路径。**配置文件缺失不是错误**（返回空），语法错误才是。
+- 错误一律 `anyhow::Result`，用 `.context()` 带上文件路径。**配置文件缺失不是错误**（返回空），语法错误才是。`resolve()` 这类不打开文件的错误不适用后半句——它没有路径可带，只要消息本身点明了缺哪个环境变量即可。
+- **RED 必须真的红。** 各 Task 把「在 `src/lib.rs` 声明模块」排在写测试之后，但 Rust 只编译被声明的模块：模块没进 `lib.rs` 时 `cargo test --lib foo::` 连测试文件都不构建，报 `0 passed; 0 failed` 并以 0 退出——那是**假绿**，不是预期的红。所以**写第一个测试的同一步骤里就把 `pub mod foo;` 加进 `src/lib.rs`**，后面「声明模块」那一步只用于核对最终形态（含该 Task 新增的模块，顺序按字母表）。判定标准：RED 运行必须出现与被测符号对应的编译错误（`cannot find`、`E0599`、`unresolved`）或真实断言失败；`test result: ok. 0 passed` 一律不算通过。
 - 提交信息用 Conventional Commits（`feat:` / `test:` / `chore:`）。
 
 ## 接口契约（各 Task 共同遵守）
