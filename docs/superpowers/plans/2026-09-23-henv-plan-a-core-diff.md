@@ -1878,6 +1878,14 @@ git commit -m "feat: env.yaml 类型化解析与聚合校验"
 代价两条，都可接受：路径从 `mcps.a.env:` 降级成 `mcps.a:`（所以 expected 文本里必须留 `env` 这个词），
 其余字段的回显点保持原样。**不要**顺手改别的字段的错误处理。
 
+**C1 落地后的一条实测语义变化，后来者必须知道：** 改走 `Value` 之后，`env` 内的重复键不再「后者静默
+覆盖前者」，而是报 serde 的 `duplicate entry with key "..."`。方向上是**变安全了**——原先
+`env: {K: sk-live-abc123, K: "${OK}"}` 能干净通过，等于 henv 给一个仍含明文密钥的文件背书；现在会被
+拦下。代价是这条错误出自反序列化阶段、不进 `validate()` 的聚合，所以含形状错误的文档只报一行。
+这一条同时**消掉了**评审原本记为 Minor 的「env 重复键静默 last-wins」隐患，无需再单独处理。
+`env_refs` 里必须显式检测重复键并报出键名（键名可以出现，值不可以），不要依赖 `Value` 到
+`BTreeMap` 的转换顺手把重复键丢掉。
+
 **C2 — `rejects_claude_marketplace_plugin_without_marketplace_or_entry` 是误导性的。** 删掉
 `requires marketplace` 规则后它仍然绿，因为它**自己的兄弟消息**里就含 `marketplace` 这个词。一个
 「按其命名的规则不可能失败」的测试比没有测试更糟：下次重构 `:258-266` 会拿到绿灯。修成断言
