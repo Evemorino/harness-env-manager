@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6,13 +7,34 @@ pub struct Home {
 }
 
 impl Home {
+    /// 测试路径专用的不可失败构造器。**会吞错**：对 canonicalize 的任何失败都静默
+    /// 回退原路径，不区分 kind。`TempHome` 只会传 `TempDir`，它们总能 canonicalize
+    /// 成功，所以测试里用它没问题；**生产入口不要用这里**，走 `try_new`／`resolve`。
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let raw = root.into();
-        // 目录存在时归一化：macOS 上 /var 是 /private/var 的 symlink，而
-        // skills_dir 用 fs::canonicalize 解析 skill 路径。两边形态不一致会让
-        // classify 的前缀比较永远失配。目录不存在时保留原值（错误由上层报）。
+        // 归一化的原因：macOS 上 /var 是 /private/var 的 symlink，而 skills_dir 用
+        // fs::canonicalize 解析 skill 路径。两边形态不一致会让 classify 的前缀比较
+        // 永远失配。
         let root = std::fs::canonicalize(&raw).unwrap_or(raw);
         Self { root }
+    }
+
+    /// 生产入口：归一化 root，并且**只**在「确实不存在」（`NotFound`）时保留原值，
+    /// 把缺失本身留给上层去报。其余错误 kind（`PermissionDenied`、`ELOOP`、
+    /// `ENOTDIR`、`ENAMETOOLONG` ……）都带着路径冒出去。
+    ///
+    /// 之所以不能一律静默回退：那会让 `Home` 揣着一个非归一化的 root 活下去，
+    /// `skills_dir::classify` 的 `starts_with` 前缀比较永远失配，henv 于是报
+    /// 「没有安装任何 skill」而不是启动即失败。
+    pub fn try_new(root: impl Into<PathBuf>) -> anyhow::Result<Self> {
+        let raw = root.into();
+        match std::fs::canonicalize(&raw) {
+            Ok(canonical) => Ok(Self { root: canonical }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self { root: raw }),
+            Err(e) => Err(e).with_context(|| {
+                format!("failed to canonicalize home root {}", raw.display())
+            }),
+        }
     }
 
     /// $HENV_HOME 优先，其次 $HOME。两者都缺或为空 → 错误。
@@ -30,7 +52,7 @@ impl Home {
         if raw.is_empty() {
             anyhow::bail!("HENV_HOME/HOME is set but empty");
         }
-        Ok(Self::new(PathBuf::from(raw)))
+        Self::try_new(PathBuf::from(raw))
     }
 
     pub fn root(&self) -> &Path {
@@ -81,6 +103,7 @@ impl Home {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::TempHome;
 
     #[test]
     fn joins_harness_paths_under_root() {
@@ -105,6 +128,12 @@ mod tests {
             PathBuf::from("/fake/root/.kimi-code/plugins/installed.json")
         );
         assert_eq!(h.harness_dirs().len(), 3);
+        // 契约是**有序**三元组：只断言长度的话，换掉任意一个目录（比如把 kimi_dir
+        // 换成 agents_skills）或打乱顺序都能让套件继续绿。
+        assert_eq!(
+            h.harness_dirs(),
+            vec![h.claude_dir(), h.codex_dir(), h.kimi_dir()]
+        );
     }
 
     #[test]
@@ -137,5 +166,44 @@ mod tests {
     fn root_is_kept_verbatim_when_it_does_not_exist() {
         let h = Home::new("/definitely/not/here");
         assert_eq!(h.root(), Path::new("/definitely/not/here"));
+    }
+
+    #[test]
+    fn try_new_reports_canonicalize_errors_that_are_not_a_missing_dir() {
+        // ENOTDIR：路径中段是一个普通文件。这类错误不能像 NotFound 那样静默回退，
+        // 否则 Home 揣着一个非归一化的 root 活下去，skills_dir::classify 的
+        // starts_with 前缀比较永远失配，henv 会报「没有安装任何 skill」而不是启动即失败。
+        let t = TempHome::new();
+        t.write("not-a-directory", "这是一个文件，不是目录");
+        let bad = t.path("not-a-directory").join("subdir");
+        // 先确认这个 setup 真的落在**非** NotFound 分支上：否则本测试会退化成
+        // 「一个不存在的路径」，那样即使修复写错了它也照样通过。
+        let setup_kind = std::fs::canonicalize(&bad).err().map(|e| e.kind());
+        assert_ne!(
+            setup_kind,
+            Some(std::io::ErrorKind::NotFound),
+            "setup 必须命中非 NotFound 的 canonicalize 错误，实际是 {setup_kind:?}"
+        );
+        let err = Home::try_new(bad).expect_err("ENOTDIR 必须作为错误返回，不能被回退吞掉");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not-a-directory"),
+            "错误信息里必须带上出问题的路径，实际是：{msg}"
+        );
+    }
+
+    #[test]
+    fn from_env_does_not_swallow_an_unreadable_root() {
+        // from_env（即 resolve 的实体）必须走 try_new：一个真实但归一化不了的 $HOME
+        // 要在启动时带着路径报错，而不是悄悄留下一个非归一化的 root。
+        let t = TempHome::new();
+        t.write("not-a-directory", "这是一个文件，不是目录");
+        let bad = t.path("not-a-directory").join("subdir");
+        let err = Home::from_env(Some(bad.into_os_string()), None)
+            .expect_err("$HOME 归一化失败时不能回退成 Ok");
+        assert!(
+            format!("{err:#}").contains("not-a-directory"),
+            "错误信息里必须带上出问题的路径"
+        );
     }
 }
