@@ -482,6 +482,15 @@ plugins:
         assert!(err.contains("cursor"), "{err}");
     }
 
+    /// 列表校验的「每一个元素都查」：现有 fixture 是单元素，所以只查首元素的实现
+    /// 在这里会**接受** `[codex, cursor]`，未知 harness 静默过关。
+    #[test]
+    fn targets_rejects_unknown_harness_after_the_first() {
+        let yaml = "version: 1\nmcps:\n  a:\n    command: npx\n    targets: [codex, cursor]\n";
+        let err = Manifest::parse(yaml).unwrap_err().to_string();
+        assert!(err.contains("cursor"), "{err}");
+    }
+
     #[test]
     fn targets_rejects_bare_keyword_that_is_not_all() {
         let yaml = "version: 1\nmcps:\n  a:\n    command: npx\n    targets: none\n";
@@ -581,13 +590,55 @@ plugins:
         );
     }
 
+    /// 六个 struct 都要「未知键 = 错误」，而上面那条只钉住了 `Manifest`（它的 SkillEntry
+    /// 断言即使去掉 `deny_unknown_fields` 也照样红，因为同一条目上还带着 local-requires-
+    /// path 那条规则）。这里每行一个 struct、一个拼错的键，并且挑**没有必填字段**的形态，
+    /// 于是 `is_err()` 只能来自 `deny_unknown_fields` 本身。
     #[test]
-    fn rejects_git_skill_without_repo_or_ref() {
-        let err = Manifest::parse("version: 1\nskills:\n  a:\n    source: git\n")
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("repo"), "{err}");
-        assert!(err.contains("ref"), "{err}");
+    fn every_struct_rejects_an_unknown_field() {
+        assert!(Manifest::parse("version: 1\nharnesses:\n  codex:\n    enbled: true\n").is_err());
+        assert!(
+            Manifest::parse("version: 1\nskills:\n  a:\n    source: agents-dir\n    pth: /x\n")
+                .is_err()
+        );
+        assert!(
+            Manifest::parse("version: 1\nmcps:\n  a:\n    command: npx\n    cmd: npx\n").is_err()
+        );
+        assert!(
+            Manifest::parse(
+                "version: 1\nplugins:\n  a:\n    source: github\n    repo: x/y\n    repos: z\n"
+            )
+            .is_err()
+        );
+        assert!(Manifest::parse(
+            "version: 1\nplugins:\n  a:\n    source: github\n    repo: x/y\n    degrade:\n      hookz: report\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn rejects_git_skill_without_repo() {
+        // 只有 `repo` 缺失：`path` 在场，所以「requires ref」不可能来自读错字段。
+        let err = Manifest::parse(
+            "version: 1\nskills:\n  a:\n    source: git\n    ref: v1\n    path: skills\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires `repo`"), "{err}");
+        assert!(!err.contains("requires `ref`"), "{err}");
+    }
+
+    #[test]
+    fn rejects_git_skill_without_ref() {
+        // 与上面那条只差被测字段：`path` 在场，所以把谓词改成读 `s.path` 的实现
+        // 这里会直接**接受**，而 `repo` 规则不会替它把消息凑出来。
+        let err = Manifest::parse(
+            "version: 1\nskills:\n  a:\n    source: git\n    repo: a/b\n    path: skills\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("requires `ref`"), "{err}");
+        assert!(!err.contains("requires `repo`"), "{err}");
     }
 
     #[test]
@@ -607,12 +658,25 @@ plugins:
         assert!(err.contains("agents-dir"), "{err}");
     }
 
+    /// 同一条规则的第二个 disjunct：`ref` 是 git skill 的锁，agents-dir 带它说明用户
+    /// 以为自己在配 git。去掉 `|| s.git_ref.is_some()` 后这条 fixture 会被**接受**。
+    #[test]
+    fn rejects_agents_dir_skill_with_ref() {
+        let err =
+            Manifest::parse("version: 1\nskills:\n  a:\n    source: agents-dir\n    ref: v1\n")
+                .unwrap_err()
+                .to_string();
+        assert!(err.contains("agents-dir"), "{err}");
+    }
+
     #[test]
     fn rejects_claude_marketplace_plugin_without_marketplace_or_entry() {
         let yaml = "version: 1\nplugins:\n  a:\n    source: claude-marketplace\n";
         let err = Manifest::parse(yaml).unwrap_err().to_string();
-        assert!(err.contains("marketplace"), "{err}");
-        assert!(err.contains("entry"), "{err}");
+        // 必须带上 `requires` 前缀：source 的值本身就是 `claude-marketplace`，
+        // 只断言 contains("marketplace") 的话兄弟消息会替被测那条规则作证。
+        assert!(err.contains("requires `marketplace`"), "{err}");
+        assert!(err.contains("requires `entry`"), "{err}");
     }
 
     #[test]
@@ -633,11 +697,15 @@ plugins:
 
     #[test]
     fn aggregates_all_errors_in_one_message() {
-        let yaml = "version: 1\nskills:\n  a:\n    source: git\n  b:\n    source: local\nmcps:\n  c:\n    command: npx\n    env:\n      K: literal\n";
+        // env 两个键，坏的那个排在后面（BTreeMap 序 = AAA, BBB）：只有一个键时
+        // 「每个键都查」这条规则没人钉住，take(1) 会让第二个键上的明文密钥过关。
+        let yaml = "version: 1\nskills:\n  a:\n    source: git\n  b:\n    source: local\nmcps:\n  c:\n    command: npx\n    env:\n      AAA: ${OK}\n      BBB: sk-live-abc123\n";
         let err = Manifest::parse(yaml).unwrap_err().to_string();
         assert!(err.contains("skills.a"), "{err}");
         assert!(err.contains("skills.b"), "{err}");
         assert!(err.contains("mcps.c"), "{err}");
+        assert!(err.contains("BBB"), "second env key must be checked: {err}");
+        assert!(!err.contains("sk-live-abc123"), "must not echo: {err}");
     }
 
     #[test]
