@@ -1844,6 +1844,72 @@ git commit -m "feat: env.yaml 类型化解析与聚合校验"
 
 ---
 
+#### Task 5 追加（评审后补：66 变异体 + 66 条实际渲染消息）
+
+评审判定 **Needs fixes**：行为本身在我能构造的一切输入下都正确（门禁工作、消息逐字折叠、文档化路径
+不回显、单次遍历聚合全部规则且确定性排序），要改的是六处——一处真泄漏、五处「测试看着像钉住了规则
+其实没有」。Minor 一律不进本轮，留给最终评审分诊。
+
+**C1（安全，必须修）— 写错的 `env:` 节点会把密钥原样打印出来。** 门禁只挡了「值不是 `${VAR}`」这条
+文档化路径；而 `serde_yaml_ng::from_str` 自己的**类型错误**在 `validate()` 之前发生，其消息被
+`format!` 无过滤地拼进输出。实测（密钥 `sk-live-abc123`）：
+
+| 输入 | 渲染出的消息 | 回显 |
+|---|---|---|
+| `env: sk-live-abc123`（该给 map 却给了标量） | `mcps.a.env: invalid type: string "sk-live-abc123", expected a map` | **是** |
+| `env: "CONTEXT7_API_KEY=sk-live-abc123"`（忘了嵌套） | 同上，整串带出 | **是** |
+| `args: sk-live-abc123` / `mcps: {a: sk-live}` / `targets: sk-live` | 同样整串带出 | 是 |
+| 整数/浮点/bool/null/序列/映射 | `integer \`424242\``、`a sequence` 等 | 否 |
+
+64 字符的值完整打印、不截断。**修法只针对 `env`，不要做全局脱敏**：`:416` 那条测试**要求**回显用户写的
+值（`err.contains("cursor")`），未知字段名同理——所以全局擦除会直接打掉计划自己的要求。`env` 是唯一
+「内容按定义就是密钥材料」的位置。
+
+```rust
+    #[serde(default, deserialize_with = "env_refs")]
+    env: BTreeMap<String, String>,
+```
+
+`fn env_refs<'de, D>(d: D) -> Result<BTreeMap<String,String>, D::Error>` 的实现要点：先把节点反序列化成
+`serde_yaml_ng::Value`（它的 `Deserialize` 不会失败，因此 serde 永远不会去格式化用户写的值），再自己转成
+`BTreeMap`；形状问题一律用 `de::Error::invalid_type(Unexpected::Other("a string"), &"a mapping of env name to ${VAR} reference")`
+这类**静态词**报告，绝不把 token 拼进 `Unexpected`。标量要照旧强转成字符串（`serde_yaml_ng` 本来就会把
+`command: 424242` 读成 `"424242"`），所以 Number/Bool/Null 走 `to_string()` 而不是报错，否则会改变既有语义。
+代价两条，都可接受：路径从 `mcps.a.env:` 降级成 `mcps.a:`（所以 expected 文本里必须留 `env` 这个词），
+其余字段的回显点保持原样。**不要**顺手改别的字段的错误处理。
+
+**C2 — `rejects_claude_marketplace_plugin_without_marketplace_or_entry` 是误导性的。** 删掉
+`requires marketplace` 规则后它仍然绿，因为它**自己的兄弟消息**里就含 `marketplace` 这个词。一个
+「按其命名的规则不可能失败」的测试比没有测试更糟：下次重构 `:258-266` 会拿到绿灯。修成断言
+`` "requires `marketplace`" `` 反引号原文，或换一对只变动被测字段的 fixture。
+
+**C3 — env 循环的「每个 key 都查」没有钉住，而这是安全规则。** 变异体 `.take(1)` 存活，实测
+`{AAA: "${OK}", BBB: sk-live}` **被接受**——第二个 key 上的明文密钥直接过关。现有两个 fixture 都只有
+一个 env key。修：给聚合那条加第二个 key（BTreeMap 序使 `BBB` 落在最后，任何 `take(1)`/`next()` 都会死）。
+
+**C4 — `agents-dir` 不接受 repo/ref 这条规则只测了一半。** 删掉 `git_ref` 那个 disjunct 存活，实测
+`source: agents-dir` + `ref: v1` **被接受**，于是 Task 6 会降出一个「ref 就是锁」却被无声忽略的 skill。
+报告把它整条记成 KILLED，是错的。修：补 `source: agents-dir` + `ref: x` 一条 fixture。
+
+**C5 — git 的 `ref` 必填没有被归因到 `git_ref`。** 把谓词改成读 `s.path` 照样存活，因为现有 fixture 同时
+省略 `repo`/`path`/`ref`，两种实现产出同样两条消息。修：拆成两条 fixture——`{source: git, repo: a/b}`
+断言恰好是 ref 那条、`{source: git, ref: v1}` 断言恰好是 repo 那条。
+
+**C6 — `deny_unknown_fields` 六个 struct 里只钉住了一个。** 一次去掉五个，49 个测试全绿；而计划的要求是
+「每个 manifest struct，未知 key 必须是错误」。今天行为是对的，但没有任何东西让它保持是对的。
+修：五个一行 `is_err()`，每个用一个拼错的键（`harnesses.codex.enbled`、`plugins.a.degrade.hookz` 等）。
+
+**C7（随 C3 一并做，同一 bug 形状）— `targets` 列表只检查第一个元素。** 变异「只查首元素」存活，因为
+现有 fixture 是单元素列表，于是 `targets: [codex, cursor]` 里的未知 harness 会过关。与 C3 是同一类
+「循环完整性无人钉住」的问题，补一个两元素 fixture 即可。
+
+做完 C1-C7 后 `cargo test --lib manifest::` 期望 **27 tests**（原 20 + C1 的 3 条不回显用例
++ C2/C3/C4/C5/C6/C7 各 1）。四条 Important 级 Minor（`env` 内重复 key 后者静默覆盖前者、serde 类型错误
+打掉聚合、untagged `Repr` 把内部枚举名露给用户、`source: zip-url` 无位置字段）不进本轮，已记入台账
+留给最终评审与 Plan B/C。
+
+---
+
 ### Task 6: 清单降级为能力流（lower）
 
 **Files:**
