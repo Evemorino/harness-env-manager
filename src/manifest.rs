@@ -7,6 +7,7 @@ use crate::capability::{Kind, Targets};
 use crate::secrets;
 use serde::Deserialize;
 use serde::de::{self, Deserializer, Unexpected};
+use serde_yaml_ng::Value;
 use std::collections::BTreeMap;
 
 /// 清单支持的 schema 版本。
@@ -68,7 +69,7 @@ pub struct McpEntry {
     pub command: String,
     #[serde(default)]
     pub args: Vec<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "env_refs")]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub targets: Targets,
@@ -182,6 +183,68 @@ impl<'de> Deserialize<'de> for Targets {
             }
         }
     }
+}
+
+/// `env` 是唯一「内容按定义就是密钥材料」的字段，所以它的形状错误不能由 serde 报：
+/// serde 自己的类型错误会把标量原样渲染成 `invalid type: string "<值>"`，等于把密钥
+/// 打进终端与日志（`mcps.a.env: invalid type: string "sk-live-…"` 是修前的实际输出）。
+/// 这里把整个节点先取成 `Value`——它的 `Deserialize` 不会失败，serde 因此永远不会去
+/// 格式化用户写的值——再由本函数转成 `BTreeMap`，进入消息的只有下面的静态词。
+/// 代价：路径从 `mcps.a.env:` 降级为 `mcps.a:`，所以 expected 文本里保留 `env` 一词。
+fn env_refs<'de, D>(d: D) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    /// 节点种类 → 静态描述，绝不带上内容。
+    fn kind_of(v: &Value) -> Unexpected<'static> {
+        match v {
+            Value::Null => Unexpected::Unit,
+            Value::Bool(_) => Unexpected::Other("a boolean"),
+            Value::Number(_) => Unexpected::Other("a number"),
+            Value::String(_) => Unexpected::Other("a string"),
+            Value::Sequence(_) => Unexpected::Other("a sequence"),
+            Value::Mapping(_) => Unexpected::Other("a map"),
+            Value::Tagged(t) => kind_of(&t.value),
+        }
+    }
+
+    /// 标量照旧强转成字符串（serde 本来就把 `command: 424242` 读成 `"424242"`），
+    /// 这样 Number/Bool/Null 仍然走到 `validate_env`，而不是变成形状错误。
+    fn scalar_of(v: &Value) -> Option<String> {
+        match v {
+            Value::String(s) => Some(s.clone()),
+            Value::Number(n) => Some(n.to_string()),
+            Value::Bool(b) => Some(b.to_string()),
+            Value::Null => Some(String::new()),
+            Value::Tagged(t) => scalar_of(&t.value),
+            Value::Sequence(_) | Value::Mapping(_) => None,
+        }
+    }
+
+    let node = Value::deserialize(d)?;
+    let mut out = BTreeMap::new();
+    match node {
+        // `env:` 写成空节点仍然是「没有变量」，与既有 `default` 行为一致。
+        Value::Null => {}
+        Value::Mapping(map) => {
+            for (k, v) in map {
+                let Some(key) = scalar_of(&k) else {
+                    return Err(de::Error::invalid_type(kind_of(&k), &"an env name string"));
+                };
+                let Some(rendered) = scalar_of(&v) else {
+                    return Err(de::Error::invalid_type(kind_of(&v), &"an env value string"));
+                };
+                out.insert(key, rendered);
+            }
+        }
+        other => {
+            return Err(de::Error::invalid_type(
+                kind_of(&other),
+                &"a mapping of env name to ${VAR}",
+            ));
+        }
+    }
+    Ok(out)
 }
 
 impl Manifest {
@@ -434,6 +497,69 @@ plugins:
             !err.contains("sk-live-abc123"),
             "must not echo secret: {err}"
         );
+    }
+
+    /// 修前的实际输出：`env: sk-live-abc123` → `mcps.a.env: invalid type: string
+    /// "sk-live-abc123", expected a map`，64 字符也完整打印。这些是「该给映射却写了
+    /// 标量」的手滑形态，所以断言的是**值不得出现**。`env` 一词必须由 expected 文本
+    /// 带出来（路径已降级为 `mcps.a:`，没有它就没人知道是哪一写出错）——注意不能只
+    /// 断言 `contains("env")`，外层的 `env.yaml` 会让它恒真。
+    #[test]
+    fn mistyped_env_node_does_not_echo_the_value() {
+        for node in [
+            "sk-live-abc123",
+            "\"CONTEXT7_API_KEY=sk-live-abc123\"",
+            "sk-live-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "424242",
+        ] {
+            let yaml = format!("version: 1\nmcps:\n  a:\n    command: npx\n    env: {node}\n");
+            let err = Manifest::parse(&yaml).expect_err("{node} is not a mapping");
+            let err = err.to_string();
+            assert!(!err.contains("sk-live-abc123"), "must not echo: {err}");
+            assert!(!err.contains("424242"), "must not echo: {err}");
+            assert!(
+                err.contains("expected a mapping of env"),
+                "message must name the env node: {err}"
+            );
+        }
+    }
+
+    /// 键/值一侧的形状错误同样不能带出内容：非序列的键、序列或映射的值。
+    #[test]
+    fn mistyped_env_key_or_value_does_not_echo_the_value() {
+        for (node, expected) in [
+            ("AAA: [sk-live-abc123]", "expected an env value string"),
+            ("AAA: {B: sk-live-abc123}", "expected an env value string"),
+            ("[1, 2]: sk-live-abc123", "expected an env name string"),
+        ] {
+            let yaml =
+                format!("version: 1\nmcps:\n  a:\n    command: npx\n    env:\n      {node}\n");
+            let err = Manifest::parse(&yaml).expect_err("{node} is not a name/value pair");
+            let err = err.to_string();
+            assert!(!err.contains("sk-live-abc123"), "must not echo: {err}");
+            assert!(err.contains(expected), "shape of {node}: {err}");
+        }
+    }
+
+    /// 强转语义不能丢：serde 把 `command: 424242` 读成 `"424242"`，`env` 的标量值（含
+    /// 带标签节点）同样要先变成字符串再交给 `validate_env`。判据是「没有出现形状错误」——
+    /// 形状错误说明值根本没走到门禁，那才是这里要避免的语义漂移。
+    #[test]
+    fn env_scalar_value_still_reaches_the_secret_gate() {
+        for value in ["424242", "42.5", "true", "", "!!str sk-live-abc123"] {
+            let yaml = format!(
+                "version: 1\nmcps:\n  a:\n    command: npx\n    env:\n      AAA: {value}\n"
+            );
+            let err = Manifest::parse(&yaml).expect_err("a non-reference value must be gated");
+            let err = err.to_string();
+            assert!(err.contains("AAA"), "gate must name the key: {err}");
+            assert!(
+                !err.contains("invalid type"),
+                "value {value:?} must reach the gate, not a shape error: {err}"
+            );
+            assert!(!err.contains("424242"), "must not echo: {err}");
+            assert!(!err.contains("sk-live-abc123"), "must not echo: {err}");
+        }
     }
 
     #[test]
