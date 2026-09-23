@@ -18,6 +18,12 @@
 - **HOME 必须可注入。** 任何模块都不得直接调用 `std::env::home_dir` / `dirs::home_dir`；一律经 `Home`。`Home::resolve()` 优先 `$HENV_HOME`，其次 `$HOME`。
 - harness 名常量只有三个：`"claude-code"`、`"codex"`、`"kimi-code"`。
 - **密钥语法即门禁**（spec §4 决策 2）：`mcps.*.env` 的值必须严格匹配 `${VAR}`，任何字面量在 `Manifest::parse` 阶段报错。密钥永不展开进任何产物，错误信息不得回显值。
+- **错误消息的用词要与「可能被当作密钥值写进 fixture 的词」隔离。** 门禁消息里不要出现 `literal`、
+  `reference`、`bare`、`shown` 这类会被测试拿来当假密钥值的单词：Task 4 最初的文案含 `literal`，而
+  Task 5 与 Task 15 各有一处用 `K: literal` 作假值并断言消息里不含该值——后者按字面不可能成立。
+  消息已改为 `(value not shown)`，且 B2 用**整串相等**而非 `contains` 来钉消息，这样 `reference`
+  作为 fixture 值是安全的。后续任何新增错误文案都遵守此条；写「值不得出现」类断言时，假值请选
+  `sk-live-*` 形态，不要选消息里出现过的词。
 - **plugin 身份 = entry 名**（spec §2.1 第 3 条）。`superpowers@claude-plugins-official`、`superpowers@openai-api-curated`、kimi 的 `id: superpowers` 三者身份同为 `superpowers`；marketplace 是 Spec 细节，不参与身份。
 - **版本比较 SHA 优先、version 兜底**；一侧有 SHA 一侧只有 version → `Unknown`，diff 按 in-sync 处理（只读工具不误报）。
 - 所有集合遍历必须**确定性排序**（`BTreeMap` / 显式 `sort`），否则 insta 快照与 diff 输出会抖动。
@@ -1266,19 +1272,24 @@ git commit -m "feat: \${VAR} 密钥引用门禁，拒绝字面量且不回显值
 ```rust
     #[test]
     fn missing_preserves_input_order_and_name_exactly() {
+        // `missing` 收的是 `&dyn Fn`，闭包不能直接 mutate 捕获的 Vec（E0596），
+        // 所以 spy 用 RefCell 装：只借 `&seen`，`Fn` 照样成立。
         let vars = ["Zeta-key", "alpha", "MIX", "b", "_tail"];
-        let mut seen: Vec<String> = Vec::new();
+        let seen: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
         let got = missing(
             &vars.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
             &|k| {
-                seen.push(k.to_string());
+                seen.borrow_mut().push(k.to_string());
                 None
             },
         );
-        assert_eq!(seen, vars, "lookup 必须按输入顺序、原样收到每个名字");
+        assert_eq!(seen.into_inner(), vars, "lookup 必须按输入顺序、原样收到每个名字");
         assert_eq!(got, vars, "全部缺失时应原序原样返回");
     }
 ```
+
+注：先前这里写的 `let mut seen: Vec<String>` 直接 `push` **编译不过**（E0596，`&dyn Fn` 的闭包不能
+mutate 捕获变量），已由实施者换成 `RefCell`。若再写这类 spy，一律用 `RefCell`。
 
 **B4 — 重复名字未定义。** `missing` 现在按输入出现次数逐条输出，去重与不去重两个变异体都活着，
 因为行为本就没规定。裁定：**保持逐条输出**（一次遍历对应一个变量，不去重）；Plan C 的 `doctor`
