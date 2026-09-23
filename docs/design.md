@@ -40,6 +40,52 @@ skills / MCP / plugins 配置，格式互不兼容。任务写到一半切换 ha
 - 用户已有 symlink 同步实践：`~/.codex/AGENTS.md`、`~/.kimi-code/AGENTS.md` →
   `~/.claude/CLAUDE.md`。
 
+### 2.1 实测修正（2026-09-23，写实现计划前盘点本机）
+
+以下 5 条经实测，修正或补充 §1–§3、§8 的前提。**实现计划以本节为准**；与上文冲突处本节胜出。
+
+1. **claude-code 用户级 MCP 不在 `settings.json`，而在 `~/.claude.json` 顶层 `mcpServers`。**
+   该文件 71KB、权限 0600、被 claude-code 频繁重写（含 `numStartups` / `pluginUsage` /
+   `skillUsage` / `projects.*`）。`settings.json` 实际持有 `enabledPlugins`、
+   `extraKnownMarketplaces`、`hooks`、`env`、`permissions`，**无** `mcpServers`。
+   **决策（已确认）**：写路径 shell out 到 `claude mcp add-json`，不直接 merge 该文件——避免与
+   harness 并发写竞争丢数据。读路径仍直接解析 `~/.claude.json`。
+
+2. **三家都有 plugin 机制，且 bundle 自带 per-harness manifest。** superpowers 6.3.0 内含
+   `.claude-plugin/plugin.json`、`.codex-plugin/plugin.json`、`.kimi-plugin/plugin.json`
+   （另有 `.cursor-plugin` / `.hermes-plugin` / `.devin-plugin` / `.pi` / `.opencode` / `.agents`）；
+   kimi-code 已从 GitHub 原生安装 superpowers（tag `v6.3.0`）。故 §1 所举「kimi-code 没有 plugin
+   机制」不成立。**决策（已确认）**：v1 以 **bundle manifest 对账**为主、SHA 优先；仅当目标
+   harness 缺对应 bundle manifest 时才降级拆成散装 skill/MCP——否则会把 kimi 的原生安装拆成
+   符号链接，是降级而非升级。
+   注：kimi 的 bundle manifest 有两种形态——`.kimi-plugin/plugin.json`（superpowers）与根目录
+   `kimi.plugin.json`（modern-web-guidance），探测须覆盖两者。
+
+3. **version 字符串不可作为身份。** claude 插件缓存目录名实测出现 `6.3.0` / `6.4.1` / `1.0.0` /
+   `b36e0829c6d0`（git sha）/ `unknown` 五种形态。claude 记 superpowers=`6.4.1`、kimi 记
+   `v6.3.0`，但两者 `gitCommitSha` / `installedSha` 同为
+   `b36e0829c6d0140e93cfef2ca599b1b07d4a7797`。
+   **决策**：`diff` 身份比较 **SHA 优先、version 兜底**；一侧有 SHA 另一侧只有 version 时判
+   `Unknown` 并按 in-sync 处理（只读工具不应误报）。plugin 的跨 harness 身份用 **entry 名**
+   （如 `superpowers`）；marketplace 各家不同，属 Spec 细节而非身份。
+
+4. **`~/.agents/skills` 共享约定只部分成立。** 实测存在反向链接与绕过：
+   - `~/.agents/skills/mcp-builder → ~/.claude/skills/mcp-builder`（指回 harness）
+   - `~/.agents/skills/superpowers → ~/.codex/superpowers/skills`
+   - `~/.codex/skills/brainstorming → ~/.claude/plugins/cache/claude-plugins-official/superpowers/b36e0829c6d0/skills/brainstorming`
+     （codex 直接链进 claude 插件缓存，完全绕过 `.agents`）
+   - `~/.claude/skills/{trim-cot-leakage,webapp-testing}` 是不属于任何共享库的真实目录
+   - `~/.kimi-code` **没有** skills 目录；kimi 的 skill 只随 plugin bundle 分发
+     （`plugins/managed/<id>/skills/`）
+
+   **决策**：`read_state` 必须传递解析多跳符号链接、识别断链与环，并对每个条目分类
+   `Shared | HarnessLocal | PluginCache | Other`。该分类是 drift 判定（插件缓存内的 skill 不计
+   drift）与 doctor 断链报告的基础。kimi 无用户级 skills 目录 ⇒ 散装 skill 对 kimi 判
+   `Unsupported`，这正是 diff 输出里 `!` 行的真实来源。
+
+5. **`serde_yaml` 已弃用**（crates.io 实测 `0.9.34+deprecated`）。§8 选型改用维护中的分支
+   `serde_yaml_ng = "0.10"`（0.9 的直接 fork，API 兼容）。
+
 ## 3. 架构
 
 单 crate 二进制 `henv`，内部五层：
