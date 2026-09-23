@@ -140,6 +140,25 @@ mod tests {
         assert_eq!(Kind::parse("nope"), None);
     }
 
+    /// `Kind::all()` 的**顺序**是契约的一部分，不只是集合：Task 14 的
+    /// `render::summary()` 按它逐项输出 `skills:42 mcps:6 plugins:3` 计数行，
+    /// 而那一行由 insta 快照逐字节锁定。换成别的排列会让 Task 14 的 golden 因为
+    /// 一个和它自己的改动无关的原因变红，所以在这里把整条序列钉死。
+    #[test]
+    fn kind_all_order_is_pinned() {
+        assert_eq!(
+            Kind::all(),
+            [
+                Kind::Skill,
+                Kind::Mcp,
+                Kind::Command,
+                Kind::Agent,
+                Kind::Hook,
+                Kind::Plugin
+            ]
+        );
+    }
+
     #[test]
     fn cap_id_label_is_kind_slash_name() {
         assert_eq!(CapId::new(Kind::Skill, "dingtalk-mail").label(), "skill/dingtalk-mail");
