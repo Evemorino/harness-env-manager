@@ -18,7 +18,11 @@ impl TempHome {
         let home = Home::new(dir.path());
         // 用 canonicalize 后的 root 构造路径，才能与 adapter 输出（同样 canonicalize 过）直接比较
         let root = home.root().to_path_buf();
-        Self { _dir: dir, home, root }
+        Self {
+            _dir: dir,
+            home,
+            root,
+        }
     }
 
     pub fn path(&self, rel: &str) -> PathBuf {

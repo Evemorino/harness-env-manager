@@ -15,7 +15,14 @@ pub enum Kind {
 
 impl Kind {
     pub fn all() -> [Kind; 6] {
-        [Kind::Skill, Kind::Mcp, Kind::Command, Kind::Agent, Kind::Hook, Kind::Plugin]
+        [
+            Kind::Skill,
+            Kind::Mcp,
+            Kind::Command,
+            Kind::Agent,
+            Kind::Hook,
+            Kind::Plugin,
+        ]
     }
 
     pub fn as_str(&self) -> &'static str {
@@ -44,7 +51,10 @@ pub struct CapId {
 
 impl CapId {
     pub fn new(kind: Kind, name: impl Into<String>) -> Self {
-        Self { kind, name: name.into() }
+        Self {
+            kind,
+            name: name.into(),
+        }
     }
 
     pub fn label(&self) -> String {
@@ -64,7 +74,11 @@ pub enum SkillSource {
     /// 内容已在 ~/.agents/skills 共享库
     AgentsDir,
     /// git 仓库，ref 就是锁（spec §4）
-    Git { repo: String, path: Option<String>, git_ref: String },
+    Git {
+        repo: String,
+        path: Option<String>,
+        git_ref: String,
+    },
     /// 本地开发中的目录
     Local { path: PathBuf },
     /// 由 plugin bundle 携带（不是散装 skill）
@@ -75,8 +89,15 @@ pub enum SkillSource {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Spec {
-    Skill { source: SkillSource, path: Option<PathBuf> },
-    Mcp { command: String, args: Vec<String>, env: BTreeMap<String, String> },
+    Skill {
+        source: SkillSource,
+        path: Option<PathBuf>,
+    },
+    Mcp {
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+    },
     Plugin {
         marketplace: Option<String>,
         entry: String,
@@ -85,9 +106,16 @@ pub enum Spec {
         install_path: Option<PathBuf>,
         enabled: bool,
     },
-    Hook { event: String, command: String },
-    Command { path: PathBuf },
-    Agent { path: PathBuf },
+    Hook {
+        event: String,
+        command: String,
+    },
+    Command {
+        path: PathBuf,
+    },
+    Agent {
+        path: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -124,7 +152,12 @@ pub struct Capability {
 
 impl Capability {
     pub fn new(id: CapId, spec: Spec) -> Self {
-        Self { id, origin: Origin::Manifest, spec, targets: Targets::All }
+        Self {
+            id,
+            origin: Origin::Manifest,
+            spec,
+            targets: Targets::All,
+        }
     }
 }
 
@@ -161,9 +194,15 @@ mod tests {
 
     #[test]
     fn cap_id_label_is_kind_slash_name() {
-        assert_eq!(CapId::new(Kind::Skill, "dingtalk-mail").label(), "skill/dingtalk-mail");
+        assert_eq!(
+            CapId::new(Kind::Skill, "dingtalk-mail").label(),
+            "skill/dingtalk-mail"
+        );
         assert_eq!(CapId::new(Kind::Mcp, "context7").label(), "mcp/context7");
-        assert_eq!(CapId::new(Kind::Plugin, "superpowers").label(), "plugin/superpowers");
+        assert_eq!(
+            CapId::new(Kind::Plugin, "superpowers").label(),
+            "plugin/superpowers"
+        );
     }
 
     #[test]
