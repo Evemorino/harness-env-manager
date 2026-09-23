@@ -1,0 +1,18 @@
+[package]
+name = "henv"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "跨 harness 能力环境管理器"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4.6", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+toml = "1.1"
+
+[dev-dependencies]
+insta = "1.48"
+tempfile = "3"
