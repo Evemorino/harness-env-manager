@@ -1167,9 +1167,6 @@ Expected: FAIL —函数未定义。
 /// 手写校验而非 regex，以守住「不引入 regex 依赖」的约束。
 pub fn parse_ref(value: &str) -> Option<&str> {
     let inner = value.strip_prefix("${")?.strip_suffix('}')?;
-    if inner.is_empty() {
-        return None;
-    }
     // 标识符规则本身就排除了 `$ { }`（它们都不在 [A-Za-z0-9_] 里），
     // 所以嵌套与拼接形态由下面这段一并拒掉，不需要单独的守卫。
     let mut chars = inner.chars();
@@ -1188,7 +1185,7 @@ pub fn validate_env(key: &str, value: &str) -> Result<(), String> {
     match parse_ref(value) {
         Some(_) => Ok(()),
         None => Err(format!(
-            "env `{key}` must be a bare ${{VAR}} reference; literal secrets are rejected"
+            "env `{key}` must be a bare ${{VAR}} reference (value not shown)"
         )),
     }
 }
@@ -1224,6 +1221,72 @@ Expected: PASS（6 tests）
 git add src/secrets.rs src/lib.rs
 git commit -m "feat: \${VAR} 密钥引用门禁，拒绝字面量且不回显值"
 ```
+
+---
+
+#### Task 4 追加（评审后补，48 变异体 + 1890 万输入对照）
+
+评审对 `parse_ref` 写了一份**独立 oracle**（直接按 spec 的 `'${' + [A-Za-z_][A-Za-z0-9_]* + '}'`
+生成接受集），18,874,368 个穷举输入 + 42,398 个人造邻近样本，与交付实现**零分歧**——代码是对的。
+缺的全在测试面：48 个变异体里有 11 个真实覆盖洞（0 个是实现缺陷）。以下四项都是补测试。
+
+**B1 — 包裹语法没被守住。** `$FOO` / `{FOO}` / `${FOO}}` 三个违反 spec 的放宽各自能让 29 个测试
+全绿。`parse_ref` 是 `env.yaml` 与明文密钥之间唯一的屏障，「以后有人把包裹放宽了」正是这个模块
+必须能叫出来的回归。追加进 `rejects_malformed_reference_syntax`：
+
+```rust
+        // 包裹形态是唯一合法外壳：少 $、少 {}、多一个 } 都不算引用
+        assert_eq!(parse_ref("$FOO"), None);
+        assert_eq!(parse_ref("{FOO}"), None);
+        assert_eq!(parse_ref("${FOO}}"), None);
+        assert_eq!(parse_ref("${FOO}${BAR}"), None);
+```
+
+**B2 — 不回显只挡了「整串回显」。** 现有断言是 `!err.contains("sk-live-123")`，所以只回显前缀
+（`sk-`）或首字符的错误照样过关——而「贴心地截断显示」恰恰是最常见的写法，威胁模型是日志和终端
+回滚缓冲。改成钉死整条消息，跨多个取值：
+
+```rust
+    #[test]
+    fn validate_env_message_is_pinned_and_never_carries_the_value() {
+        const WANT: &str = "env `K` must be a bare ${VAR} reference (value not shown)";
+        for v in ["sk-live-123", "s", "", "K", "reference", "  spaced  "] {
+            assert_eq!(validate_env("K", v).unwrap_err(), WANT, "value {v:?} leaked or message drifted");
+        }
+    }
+```
+
+（`"reference"` 这个取值是故意的：如果哪天有人把值拼进消息，它会让 `unwrap_err()` 恰好等于
+`WANT` 的概率归零。）
+
+**B3 — `missing()` 的名字保真没被钉住。** 现 fixture `["A","B","C"]` 本身就是升序、单字符、全大写，
+于是「排序输出」「按长度排序」「先排序再过滤」「查表前统一大写」四个变异体全部存活，只有「反转」
+被抓。换成非升序、混合大小写、含下划线与多字符的名字，并断言**送进 lookup 的名字序列**：
+
+```rust
+    #[test]
+    fn missing_preserves_input_order_and_name_exactly() {
+        let vars = ["Zeta-key", "alpha", "MIX", "b", "_tail"];
+        let mut seen: Vec<String> = Vec::new();
+        let got = missing(
+            &vars.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &|k| {
+                seen.push(k.to_string());
+                None
+            },
+        );
+        assert_eq!(seen, vars, "lookup 必须按输入顺序、原样收到每个名字");
+        assert_eq!(got, vars, "全部缺失时应原序原样返回");
+    }
+```
+
+**B4 — 重复名字未定义。** `missing` 现在按输入出现次数逐条输出，去重与不去重两个变异体都活着，
+因为行为本就没规定。裁定：**保持逐条输出**（一次遍历对应一个变量，不去重）；Plan C 的 `doctor`
+若要合并展示，在它那一层去重。本 Task 不加测试，只记此决定。
+
+补完后 `cargo test --lib secrets::` 期望 **8 tests**。评审还顺手确认了 `bbf870d` 删掉的那个
+`$ { }` 守卫确实不可达（重新引入它的变异体照样被 `rejects_malformed_reference_syntax` 杀掉），
+所以那一删是对的，不要复活。
 
 ---
 
@@ -5566,14 +5629,14 @@ mod tests {
         let t = TempHome::new();
         t.write(
             "env.yaml",
-            "version: 1\nmcps:\n  c:\n    command: npx\n    env:\n      K: literal\n",
+            "version: 1\nmcps:\n  c:\n    command: npx\n    env:\n      K: sk-live-abc123\n",
         );
         let mut out = Vec::new();
         let err = run_diff(&t.path("env.yaml"), &t.home, &mut out).unwrap_err().to_string();
         assert!(err.contains("env.yaml"), "{err}");
         assert!(err.contains("mcps.c"), "{err}");
         // 密钥门禁：错误里不许回显值
-        assert!(!err.contains("literal"), "错误信息不得回显密钥值：{err}");
+        assert!(!err.contains("sk-live-abc123"), "错误信息不得回显密钥值：{err}");
         assert!(out.is_empty(), "出错时不输出半截报告");
     }
 }
