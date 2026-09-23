@@ -18,12 +18,13 @@
 - **HOME 必须可注入。** 任何模块都不得直接调用 `std::env::home_dir` / `dirs::home_dir`；一律经 `Home`。`Home::resolve()` 优先 `$HENV_HOME`，其次 `$HOME`。
 - harness 名常量只有三个：`"claude-code"`、`"codex"`、`"kimi-code"`。
 - **密钥语法即门禁**（spec §4 决策 2）：`mcps.*.env` 的值必须严格匹配 `${VAR}`，任何字面量在 `Manifest::parse` 阶段报错。密钥永不展开进任何产物，错误信息不得回显值。
-- **错误消息的用词要与「可能被当作密钥值写进 fixture 的词」隔离。** 门禁消息里不要出现 `literal`、
-  `reference`、`bare`、`shown` 这类会被测试拿来当假密钥值的单词：Task 4 最初的文案含 `literal`，而
-  Task 5 与 Task 15 各有一处用 `K: literal` 作假值并断言消息里不含该值——后者按字面不可能成立。
-  消息已改为 `(value not shown)`，且 B2 用**整串相等**而非 `contains` 来钉消息，这样 `reference`
-  作为 fixture 值是安全的。后续任何新增错误文案都遵守此条；写「值不得出现」类断言时，假值请选
-  `sk-live-*` 形态，不要选消息里出现过的词。
+- **回显断言用整串相等，不用 `contains`。** 「值没出现在消息里」这类断言若靠 `contains` 实现，会被
+  消息自带的词或值的前缀绕过：Task 4 最初的 `!err.contains("sk-live-123")` 挡不住只回显前缀 `sk-` 的
+  「贴心截断」写法；而 `literal` 一词同时出现在消息文案与测试假值里，使 Task 15 的一条断言按字面
+  永不可满足。定规三条：① 门禁消息文案用**整串相等**钉死（见 Task 4 追加 B2）；② 测「值不回显」时
+  假值取 `sk-live-*` 这种不可能成为消息用词的形态，并**同时**断言整串相等，消息一变形就立刻暴露；
+  ③ 新增错误文案时避免 `literal` 这类「会被当成密钥示例」的词。普通词（`reference`/`value`/`shown`）
+  无法穷尽规避，也**不要求**规避——安全性由 ① 的整串钉死保证，而不是靠控制词表。
 - **plugin 身份 = entry 名**（spec §2.1 第 3 条）。`superpowers@claude-plugins-official`、`superpowers@openai-api-curated`、kimi 的 `id: superpowers` 三者身份同为 `superpowers`；marketplace 是 Spec 细节，不参与身份。
 - **版本比较 SHA 优先、version 兜底**；一侧有 SHA 一侧只有 version → `Unknown`，diff 按 in-sync 处理（只读工具不误报）。
 - 所有集合遍历必须**确定性排序**（`BTreeMap` / 显式 `sort`），否则 insta 快照与 diff 输出会抖动。
