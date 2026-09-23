@@ -459,6 +459,61 @@ mod tests {
         );
     }
 
+    /// 两条 `Different` 断言只检查「不等于 Same」，所以把 from/to 写反也照样绿；
+    /// 这条钉死方向：`from` 是现状（actual），`to` 是期望（desired）。
+    /// 顺带覆盖 `mcp_summary` 的空 args 分支。
+    #[test]
+    fn mcp_different_reports_actual_as_from_and_desired_as_to() {
+        let mcp = |cmd: &str, args: Vec<&str>| Spec::Mcp {
+            command: cmd.into(),
+            args: args.into_iter().map(String::from).collect(),
+            env: Default::default(),
+        };
+        assert_eq!(
+            compare_versions(
+                &mcp("npx", vec!["-y", "pkg-v2"]),
+                &mcp("npx", vec!["-y", "pkg-v1"])
+            ),
+            VersionMatch::Different {
+                from: "npx -y pkg-v1".into(),
+                to: "npx -y pkg-v2".into(),
+            }
+        );
+        // 无 args 时 summary 退化成 command 本身
+        assert_eq!(
+            compare_versions(&mcp("newbin", vec![]), &mcp("oldbin", vec![])),
+            VersionMatch::Different {
+                from: "oldbin".into(),
+                to: "newbin".into()
+            }
+        );
+    }
+
+    /// 这条是本 Task 真正的护栏。version-fallback 分支上那两个 `sha: None` 守卫一旦被删，
+    /// 上面 `mixed_sha_and_version_only_is_unknown` 仍全绿——因为它两边各缺一个字段，
+    /// 无论有没有守卫都进不了第二分支。必须用「一边 sha+version 都有、另一边只有 version」
+    /// 这个形状才检得出来——而这恰好就是本机真实数据形状：claude 记 `6.4.1` + `gitCommitSha`，
+    /// codex/kimi 只记 version。少了守卫，第二分支会先撞上，把本该 Unknown（按 in-sync 处理）
+    /// 的一对报成 `Different { from: "6.3.0", to: "6.4.1" }`，于是每次 diff 都误报 drift。
+    #[test]
+    fn sha_plus_version_against_version_only_is_unknown() {
+        assert_eq!(
+            compare_versions(
+                &plugin(Some("6.4.1"), Some("abc123")),
+                &plugin(Some("6.3.0"), None)
+            ),
+            VersionMatch::Unknown
+        );
+        // 反方向同理：谁的哪一边有 sha 都不该改变结论
+        assert_eq!(
+            compare_versions(
+                &plugin(Some("6.3.0"), None),
+                &plugin(Some("6.4.1"), Some("abc123"))
+            ),
+            VersionMatch::Unknown
+        );
+    }
+
     #[test]
     fn cross_kind_specs_are_unknown() {
         let skill = Spec::Skill {
