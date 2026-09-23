@@ -161,6 +161,106 @@ impl Capability {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VersionMatch {
+    Same,
+    /// from = 现状（actual），to = 期望（desired）
+    Different {
+        from: String,
+        to: String,
+    },
+    /// 无法判定（一侧有 SHA 一侧只有 version、跨 kind、或信息不足）。
+    /// 只读工具不该误报，diff 把 Unknown 当 in-sync。
+    Unknown,
+}
+
+fn mcp_summary(command: &str, args: &[String]) -> String {
+    if args.is_empty() {
+        command.to_string()
+    } else {
+        format!("{command} {}", args.join(" "))
+    }
+}
+
+/// SHA 优先、version 兜底（spec §2.1 第 3 条）。
+pub fn compare_versions(desired: &Spec, actual: &Spec) -> VersionMatch {
+    match (desired, actual) {
+        (Spec::Plugin { sha: Some(d), .. }, Spec::Plugin { sha: Some(a), .. }) => {
+            if d == a {
+                VersionMatch::Same
+            } else {
+                VersionMatch::Different {
+                    from: a.clone(),
+                    to: d.clone(),
+                }
+            }
+        }
+        (
+            Spec::Plugin {
+                sha: None,
+                version: Some(d),
+                ..
+            },
+            Spec::Plugin {
+                sha: None,
+                version: Some(a),
+                ..
+            },
+        ) => {
+            if d == a {
+                VersionMatch::Same
+            } else {
+                VersionMatch::Different {
+                    from: a.clone(),
+                    to: d.clone(),
+                }
+            }
+        }
+        (Spec::Plugin { .. }, Spec::Plugin { .. }) => VersionMatch::Unknown,
+        (
+            Spec::Skill {
+                source: SkillSource::Git { git_ref: d, .. },
+                ..
+            },
+            Spec::Skill {
+                source: SkillSource::Git { git_ref: a, .. },
+                ..
+            },
+        ) => {
+            if d == a {
+                VersionMatch::Same
+            } else {
+                VersionMatch::Different {
+                    from: a.clone(),
+                    to: d.clone(),
+                }
+            }
+        }
+        (
+            Spec::Mcp {
+                command: dc,
+                args: da,
+                env: de,
+            },
+            Spec::Mcp {
+                command: ac,
+                args: aa,
+                env: ae,
+            },
+        ) => {
+            if dc == ac && da == aa && de == ae {
+                VersionMatch::Same
+            } else {
+                VersionMatch::Different {
+                    from: mcp_summary(ac, aa),
+                    to: mcp_summary(dc, da),
+                }
+            }
+        }
+        _ => VersionMatch::Unknown,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +336,138 @@ mod tests {
         );
         assert_eq!(c.origin, Origin::Manifest);
         assert_eq!(c.targets, Targets::All);
+    }
+
+    fn plugin(version: Option<&str>, sha: Option<&str>) -> Spec {
+        Spec::Plugin {
+            marketplace: Some("m".into()),
+            entry: "superpowers".into(),
+            version: version.map(String::from),
+            sha: sha.map(String::from),
+            install_path: None,
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn same_sha_wins_over_differing_version_strings() {
+        // 本机实测场景：claude 6.4.1 vs kimi v6.3.0，SHA 相同
+        let sha = "b36e0829c6d0140e93cfef2ca599b1b07d4a7797";
+        assert_eq!(
+            compare_versions(
+                &plugin(Some("6.4.1"), Some(sha)),
+                &plugin(Some("v6.3.0"), Some(sha))
+            ),
+            VersionMatch::Same
+        );
+    }
+
+    #[test]
+    fn differing_sha_is_different_and_reports_actual_then_desired() {
+        let desired = plugin(Some("6.4.1"), Some("aaa"));
+        let actual = plugin(Some("6.3.0"), Some("bbb"));
+        assert_eq!(
+            compare_versions(&desired, &actual),
+            VersionMatch::Different {
+                from: "bbb".into(),
+                to: "aaa".into()
+            }
+        );
+    }
+
+    #[test]
+    fn version_fallback_when_neither_side_has_sha() {
+        assert_eq!(
+            compare_versions(&plugin(Some("1.2.0"), None), &plugin(Some("1.2.0"), None)),
+            VersionMatch::Same
+        );
+        assert_eq!(
+            compare_versions(&plugin(Some("1.3.0"), None), &plugin(Some("1.2.0"), None)),
+            VersionMatch::Different {
+                from: "1.2.0".into(),
+                to: "1.3.0".into()
+            }
+        );
+    }
+
+    #[test]
+    fn mixed_sha_and_version_only_is_unknown() {
+        assert_eq!(
+            compare_versions(&plugin(None, Some("aaa")), &plugin(Some("6.3.0"), None)),
+            VersionMatch::Unknown
+        );
+        assert_eq!(
+            compare_versions(&plugin(None, None), &plugin(None, None)),
+            VersionMatch::Unknown
+        );
+    }
+
+    #[test]
+    fn git_skill_compares_by_ref() {
+        let git = |r: &str| Spec::Skill {
+            source: SkillSource::Git {
+                repo: "obra/superpowers".into(),
+                path: Some("skills".into()),
+                git_ref: r.into(),
+            },
+            path: None,
+        };
+        assert_eq!(
+            compare_versions(&git("v6.3.0"), &git("v6.3.0")),
+            VersionMatch::Same
+        );
+        assert_eq!(
+            compare_versions(&git("v2.2"), &git("v2.1")),
+            VersionMatch::Different {
+                from: "v2.1".into(),
+                to: "v2.2".into()
+            }
+        );
+    }
+
+    #[test]
+    fn mcp_compares_command_args_and_env() {
+        let mcp = |cmd: &str, args: Vec<&str>, env: Vec<(&str, &str)>| Spec::Mcp {
+            command: cmd.into(),
+            args: args.into_iter().map(String::from).collect(),
+            env: env
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        assert_eq!(
+            compare_versions(
+                &mcp("npx", vec!["-y", "pkg"], vec![]),
+                &mcp("npx", vec!["-y", "pkg"], vec![])
+            ),
+            VersionMatch::Same
+        );
+        assert_ne!(
+            compare_versions(
+                &mcp("npx", vec!["-y", "pkg"], vec![]),
+                &mcp("npx", vec!["-y", "other"], vec![])
+            ),
+            VersionMatch::Same
+        );
+        // ${VAR} 引用参与比较，但比的是引用串本身，不展开
+        assert_eq!(
+            compare_versions(
+                &mcp("npx", vec![], vec![("K", "${K}")]),
+                &mcp("npx", vec![], vec![("K", "${K}")])
+            ),
+            VersionMatch::Same
+        );
+    }
+
+    #[test]
+    fn cross_kind_specs_are_unknown() {
+        let skill = Spec::Skill {
+            source: SkillSource::AgentsDir,
+            path: None,
+        };
+        assert_eq!(
+            compare_versions(&skill, &plugin(Some("1.0"), None)),
+            VersionMatch::Unknown
+        );
     }
 }
