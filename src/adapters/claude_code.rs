@@ -252,6 +252,12 @@ pub(crate) fn split_plugin_key(key: &str) -> (String, Option<String>) {
 /// ——卸载后残留的门禁键（或还没装的 plugin 预先写好开关）是正常状态，硬失败会把健康
 /// 配置判成「读不出来」，那是另一种漏报。所以这里只在「同一条 plugin 上有两种写法」时
 /// 定优先级：全文键更具体，赢裸名。
+///
+/// 两次查找都落空时的代价写在
+/// `a_mis_typed_full_gate_key_silently_reads_as_enabled`：手抖少一个字母的全文键
+/// （`superpower@mp` 对安装记录 `superpowers@mp`）谁也不匹配，于是静默 `enabled: true`。
+/// 那是本裁决**已知**的残留盲点，那条测试钉住它，是为了让下一次改动必须红点什么，
+/// 不是为了说它是对的。
 fn gate_enabled(enabled_map: &BTreeMap<String, bool>, key: &str, entry: &str) -> bool {
     enabled_map
         .get(key)
@@ -1661,6 +1667,43 @@ mod tests {
         assert!(find(&caps, Kind::Plugin, "gone").is_none());
         match &find(&caps, Kind::Plugin, "p").unwrap().spec {
             Spec::Plugin { enabled, .. } => assert!(!enabled),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 门禁的**残留盲点，钉住现状不等于认可现状**：全文键写错了一个字母，于是它既匹配
+    /// 不上安装记录键 `superpowers@mp`、也不是那条记录的裸名 `superpowers`，两次查找全部
+    /// 落空 → `gate_enabled` 退到 `unwrap_or(true)` → 用户以为自己关掉了，diff 却念成
+    /// 「已启用」。
+    /// 为什么不改成上抛（上一轮的裁决，本轮只补名字）：卸载残留和预写的开关键在健康配置里
+    /// 是正常状态，「匹配不上就失败」会把健康配置判成读不出来。实测把 `gate_enabled` 换成
+    /// 「两次查找都落空就 bail」这种过度修复，红的是本条和
+    /// `reads_plugin_with_sha_and_marketplace`（superpowers 没被门禁列出）两条；
+    /// `an_enable_gate_for_a_plugin_that_is_not_installed_is_ignored` 在那个变异下**仍绿**——
+    /// 它钉的是「匹配不上的门禁键不产出能力」，那种键根本走不到 `gate_enabled`。
+    /// 真正的治法是把「没被任何安装记录消费的门禁键」做成 Task 13/14 的**报告项**。
+    #[test]
+    fn a_mis_typed_full_gate_key_silently_reads_as_enabled() {
+        let t = TempHome::new();
+        t.write(
+            ".claude/plugins/installed_plugins.json",
+            r#"{ "version": 2, "plugins": { "superpowers@mp": [ { "version": "1.0" } ] } }"#,
+        );
+        t.write(
+            ".claude/settings.json",
+            r#"{ "enabledPlugins": { "superpower@mp": false } }"#,
+        );
+        let caps = ClaudeCode::new(t.home.clone())
+            .read_state()
+            .expect("匹配不上的门禁键不是故障（当前语义）");
+        match &find(&caps, Kind::Plugin, "superpowers")
+            .expect("plugin 本身仍要读到")
+            .spec
+        {
+            Spec::Plugin { enabled, .. } => assert!(
+                *enabled,
+                "当前语义：两种写法都没命中的门禁 = 未表态 = enabled；改这一条要先过裁决"
+            ),
             other => panic!("{other:?}"),
         }
     }
