@@ -2,6 +2,10 @@ use crate::adapters::{CLAUDE_CODE, HarnessAdapter};
 use crate::capability::{CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets};
 use crate::home::Home;
 use crate::skills_dir::{SkillStore, plugin_from_path, try_read_skill_entries};
+use anyhow::Context;
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::path::Path;
 
 pub struct ClaudeCode {
     home: Home,
@@ -52,6 +56,21 @@ impl ClaudeCode {
         }
         Ok(out)
     }
+
+    /// 用户级 MCP 在 ~/.claude.json 顶层 mcpServers（spec §2.1 第 1 条）。
+    /// `projects.*.mcpServers` 是项目级，v1 不读（spec §1 非目标）。
+    fn read_mcps(&self) -> anyhow::Result<Vec<Capability>> {
+        let Some(root) = read_json_if_present(&self.home.claude_json())? else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        if let Some(servers) = root.get("mcpServers").and_then(Value::as_object) {
+            for (name, cfg) in servers {
+                out.push(mcp_capability(name, cfg, CLAUDE_CODE));
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl HarnessAdapter for ClaudeCode {
@@ -64,12 +83,69 @@ impl HarnessAdapter for ClaudeCode {
     }
 
     fn read_state(&self) -> anyhow::Result<Vec<Capability>> {
-        let caps = self.read_skills()?;
+        let mut caps = self.read_skills()?;
+        caps.extend(self.read_mcps()?);
         Ok(caps)
     }
 
     fn supports(&self, _cap: &Capability) -> Support {
         Support::Native // Task 12 细化
+    }
+}
+
+/// 读 JSON；文件不存在返回 Ok(None)，语法错误返回带路径的 Err。
+///
+/// 「没有这个文件」和「文件在但读不出/解析不了」必须是两种返回——前者是正常状态，
+/// 后者按计划里的失败隔离契约整次 diff 失败。Task 10/11 共用。
+pub(crate) fn read_json_if_present(path: &Path) -> anyhow::Result<Option<Value>> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => {
+            let v = serde_json::from_str(&text)
+                .with_context(|| format!("failed to parse {}", path.display()))?;
+            Ok(Some(v))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::Error::new(e).context(format!("failed to read {}", path.display()))),
+    }
+}
+
+/// 把一个 MCP 配置对象归一化。env 值保持 `${VAR}` 引用形态，绝不展开。
+///
+/// 只搬 `command` / `args` / `env` 三样：`type` 之类先不进 `Spec`（Task 3 的 `Spec::Mcp`
+/// 里没有承载它的字段）。Task 10/11 共用。
+pub(crate) fn mcp_capability(name: &str, cfg: &Value, harness: &str) -> Capability {
+    let mut env = BTreeMap::new();
+    if let Some(obj) = cfg.get("env").and_then(Value::as_object) {
+        for (k, v) in obj {
+            if let Some(s) = v.as_str() {
+                env.insert(k.clone(), s.to_string());
+            }
+        }
+    }
+    Capability {
+        id: CapId::new(Kind::Mcp, name.to_string()),
+        origin: Origin::Adopted {
+            harness: harness.into(),
+        },
+        spec: Spec::Mcp {
+            command: cfg
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            args: cfg
+                .get("args")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect()
+                })
+                .unwrap_or_default(),
+            env,
+        },
+        targets: Targets::All,
     }
 }
 
@@ -187,5 +263,99 @@ mod tests {
             .expect_err("读不出的 skills 目录必须上抛，不能吞成空表");
         let msg = err.to_string();
         assert!(msg.starts_with("failed to read skills dir "), "{msg}");
+    }
+
+    #[test]
+    fn reads_mcp_from_claude_json_not_settings_json() {
+        let t = TempHome::new();
+        t.mkdir(".claude")
+            // settings.json 里放一个同名 MCP，若实现读错文件就会拿到 "wrong"
+            .write(
+                ".claude/settings.json",
+                r#"{ "mcpServers": { "ctx": { "command": "wrong" } } }"#,
+            )
+            .write(
+                ".claude.json",
+                r#"{
+                  "numStartups": 52,
+                  "mcpServers": {
+                    "kimi-cu": {
+                      "type": "stdio",
+                      "command": "/Applications/KimiCU.app/Contents/MacOS/kimi-cu",
+                      "args": ["mcp", "-s", "user"],
+                      "env": {}
+                    },
+                    "ctx": { "command": "npx", "args": ["-y", "@upstash/context7-mcp"],
+                             "env": { "CONTEXT7_API_KEY": "${CONTEXT7_API_KEY}" } }
+                  },
+                  "projects": { "/some/path": { "trust_level": "trusted" } }
+                }"#,
+            );
+
+        let caps = ClaudeCode::new(t.home.clone()).read_state().unwrap();
+        let m = find(&caps, Kind::Mcp, "ctx").expect("mcp read from ~/.claude.json");
+        assert_eq!(
+            m.spec,
+            Spec::Mcp {
+                command: "npx".into(),
+                args: vec!["-y".into(), "@upstash/context7-mcp".into()],
+                env: [(
+                    "CONTEXT7_API_KEY".to_string(),
+                    "${CONTEXT7_API_KEY}".to_string()
+                )]
+                .into(),
+            }
+        );
+        assert!(find(&caps, Kind::Mcp, "kimi-cu").is_some());
+        assert_eq!(caps.iter().filter(|c| c.id.kind == Kind::Mcp).count(), 2);
+    }
+
+    #[test]
+    fn project_level_mcp_servers_are_out_of_scope() {
+        let t = TempHome::new();
+        t.write(
+            ".claude.json",
+            r#"{ "mcpServers": {}, "projects": { "/p": { "mcpServers": { "proj-only": { "command": "c" } } } } }"#,
+        );
+        let caps = ClaudeCode::new(t.home.clone()).read_state().unwrap();
+        assert!(
+            find(&caps, Kind::Mcp, "proj-only").is_none(),
+            "v1 只读用户级 MCP"
+        );
+    }
+
+    #[test]
+    fn env_reference_is_preserved_unexpanded() {
+        let t = TempHome::new();
+        t.write(
+            ".claude.json",
+            r#"{ "mcpServers": { "m": { "command": "c", "env": { "K": "${HENV_TEST_SECRET_XYZ}" } } } }"#,
+        );
+        let caps = ClaudeCode::new(t.home.clone()).read_state().unwrap();
+        match &find(&caps, Kind::Mcp, "m").unwrap().spec {
+            Spec::Mcp { env, .. } => {
+                assert_eq!(env["K"], "${HENV_TEST_SECRET_XYZ}", "must stay a reference");
+                assert!(!env.values().any(|v| v == "expanded-value"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn unrelated_user_fields_do_not_break_parsing() {
+        // merge 安全的前置条件：读侧必须对未知字段免疫
+        let t = TempHome::new();
+        t.write(
+            ".claude.json",
+            r#"{ "userID": "abc", "tipsHistory": {"x": 1}, "mcpServers": { "m": { "command": "c" } },
+                 "someFutureField": [1,2,3] }"#,
+        );
+        t.write(
+            ".claude/settings.json",
+            r#"{ "theme": "auto", "tui": "fullscreen", "permissions": { "allow": ["x"] },
+                 "enabledPlugins": {} }"#,
+        );
+        let caps = ClaudeCode::new(t.home.clone()).read_state().unwrap();
+        assert!(find(&caps, Kind::Mcp, "m").is_some());
     }
 }
