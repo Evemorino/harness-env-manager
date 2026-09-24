@@ -68,11 +68,11 @@ impl ClaudeCode {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
-        // 「没有 mcpServers 这个键」→ 空表（正常状态）；「有键但不是对象」→ 故障上抛。
-        // 前者用户就是没配 MCP，后者是配置写坏了——报成「没配任何 MCP」正是
-        // 「形状故障也是故障」那块点名的假同步。
-        if let Some(servers) = root.get("mcpServers") {
-            for (name, cfg) in expect_object(servers, &file, "key `mcpServers`")? {
+        // 「没有 mcpServers 这个键」和「它的值是显式 `null`」→ 空表（正常状态）；
+        // 键在、值既不是 `null` 也不是对象 → 故障上抛。前者用户就是没配 MCP，后者是配置
+        // 写坏了——报成「没配任何 MCP」正是「形状故障也是故障」那块点名的假同步。
+        if let Some(servers) = optional_object(root.get("mcpServers"), &file, "key `mcpServers`")? {
+            for (name, cfg) in servers {
                 out.push(mcp_capability(name, cfg, CLAUDE_CODE, &file)?);
             }
         }
@@ -82,6 +82,7 @@ impl ClaudeCode {
     /// plugin 的**安装记录**在 `~/.claude/plugins/installed_plugins.json`（键是
     /// `name@marketplace`，值是安装数组），**门禁**在 settings.json 的 `enabledPlugins`。
     /// 一个键可能对应多条安装（实测就是数组），v1 只取第一条；空数组 = 没装成，跳过。
+    /// `"plugins": null` 与缺键同为「一个都没装」（容器层 `null` 裁决，见 `optional_object`）。
     fn read_plugins(&self) -> anyhow::Result<Vec<Capability>> {
         let file = self.home.claude_installed_plugins();
         let Some(root) = read_json_if_present(&file)? else {
@@ -92,13 +93,16 @@ impl ClaudeCode {
         let enabled_map = self.read_enabled_plugins()?;
 
         let mut out = Vec::new();
-        let Some(plugins) = root.get("plugins") else {
+        let Some(plugins) = optional_object(root.get("plugins"), &file, "key `plugins`")? else {
             return Ok(out);
         };
-        for (key, installs) in expect_object(plugins, &file, "key `plugins`")? {
+        for (key, installs) in plugins {
             let (entry, marketplace) = split_plugin_key(key);
             let context = format!("plugins entry `{key}`");
             // 「值不是数组」和「数组确实为空（没装成）」是两种事实：只有后者可以跳过。
+            // 这里不用 optional_array：`plugins` 的每条键都**已经声明**「这个 plugin 有安装
+            // 记录」，`{"p@mp": null}` 是写了键却没给记录，和 `{"p@mp": [null]}` 同族，
+            // 都是坏值而不是「没配」。
             let installs = expect_array(installs, &file, &context)?;
             let Some(first) = installs.first() else {
                 continue;
@@ -140,8 +144,12 @@ impl ClaudeCode {
             return Ok(BTreeMap::new());
         };
         let mut out = BTreeMap::new();
-        if let Some(obj) = root.get("enabledPlugins") {
-            for (k, v) in expect_object(obj, &file, "key `enabledPlugins`")? {
+        // `{"enabledPlugins": null}` = 一条门禁都没写 = 全部未表态 = 全部启用，与缺键同义；
+        // 但只有「键缺失或值为 null」才走这条路，`true` / `[]` 这类坏值仍然上抛。
+        if let Some(obj) =
+            optional_object(root.get("enabledPlugins"), &file, "key `enabledPlugins`")?
+        {
+            for (k, v) in obj {
                 // 非布尔的门禁值是坏数据，不是「没表态」：猜成 true 就是假同步。
                 let Some(b) = v.as_bool() else {
                     anyhow::bail!(
@@ -190,12 +198,18 @@ impl HarnessAdapter for ClaudeCode {
 /// 于是 `[]` / `"oops"` / `5` 这类坏文件会被读成「一个键都没有」= 「这个 harness 没配
 /// 任何能力」，正是「形状故障也是故障」那块禁止的塌缩。守卫放在这里，Task 10/11 复用
 /// 本函数就自动带上，不必各家再写一遍。
+///
+/// 唯一的例外是整个文档就是一个 `null`：那是容器层的「无」，与「没有这个文件」同义
+/// （计划里 `null` 裁决那条：容器层 `null` = 没配，叶子层 `optional_string` 早已这么读），
+/// 所以返回 `Ok(None)` 而不是故障。`false` / `[]` / `"oops"` / `5` 仍然上抛。
 pub(crate) fn read_json_if_present(path: &Path) -> anyhow::Result<Option<Value>> {
     let Some(value) = read_json_value_if_present(path)? else {
         return Ok(None);
     };
     if value.is_object() {
         Ok(Some(value))
+    } else if value.is_null() {
+        Ok(None)
     } else {
         Err(shape_fault(&value, path, "top level", "an object"))
     }
@@ -254,8 +268,10 @@ fn gate_enabled(enabled_map: &BTreeMap<String, bool>, key: &str, entry: &str) ->
 /// 三样各自的「没配」和「配坏了」都不可合并，所以本函数是 `Result`：
 /// `command` 缺键（或显式 `null`）才是 `""`——`Spec::Mcp.command` 是 `String`，
 /// 「没有 command」和「command 是空串」在 v1 里同为「没配」；但 `command: 5` 是故障。
-/// `args` / `env` 缺键 → 空集合；键在而类型不对、或元素/值不是字符串 → 故障上抛，
-/// 否则一个写坏的 `args: "mcp"` 会连同内容一起被丢掉，只剩一个空 args 去看下一次比较。
+/// `args` / `env` 缺键（或显式 `null`，与缺键同义）→ 空集合；键在而类型不对、或元素/值
+/// 不是字符串 → 故障上抛，否则一个写坏的 `args: "mcp"` 会连同内容一起被丢掉，只剩一个空
+/// args 去看下一次比较。`args` 的元素类型是**强制**位置（`expect_string`），所以
+/// `args: [null]` 是故障不是「没配」——这条分界见 `optional_object` 的文档。
 /// `file` 只用于报错定位（Task 11 传它自己的 `~/.kimi-code/mcp.json`）。
 pub(crate) fn mcp_capability(
     name: &str,
@@ -270,11 +286,8 @@ pub(crate) fn mcp_capability(
         .unwrap_or_default();
 
     let mut args = Vec::new();
-    if let Some(value) = cfg.get("args") {
-        for (i, element) in expect_array(value, file, &format!("{context} field `args`"))?
-            .iter()
-            .enumerate()
-        {
+    if let Some(list) = optional_array(cfg.get("args"), file, &format!("{context} field `args`"))? {
+        for (i, element) in list.iter().enumerate() {
             args.push(
                 expect_string(element, file, &format!("{context} field `args[{i}]`"))?.to_string(),
             );
@@ -282,8 +295,9 @@ pub(crate) fn mcp_capability(
     }
 
     let mut env = BTreeMap::new();
-    if let Some(value) = cfg.get("env") {
-        for (k, v) in expect_object(value, file, &format!("{context} field `env`"))? {
+    if let Some(fields) = optional_object(cfg.get("env"), file, &format!("{context} field `env`"))?
+    {
+        for (k, v) in fields {
             env.insert(
                 k.clone(),
                 expect_string(v, file, &format!("{context} field `env` key `{k}`"))?.to_string(),
@@ -323,7 +337,9 @@ fn shape_fault(found: &Value, file: &Path, what: &str, expected: &str) -> anyhow
     )
 }
 
-/// 「键缺失」由调用方的 `Option` 分支处理（那是正常状态），这里只裁决「键在但类型不对」。
+/// **强制**位置的形状裁决：「键缺失」由调用方的 `Option` 分支处理（那是正常状态），
+/// 这里只裁决「类型不对」——包括显式 `null`，它在强制位置是一个写坏的值。
+/// 可以缺位的容器用 `optional_object` / `optional_array`。
 fn expect_object<'a>(
     value: &'a Value,
     file: &Path,
@@ -363,6 +379,41 @@ fn optional_string<'a>(
     expect_string(value, file, &format!("{context} field `{key}`")).map(Some)
 }
 
+/// **可缺位**的容器对象：键缺失**或**值是显式 `null` → `Ok(None)`（都是「没配」，正常状态）；
+/// 值在且不是对象 → 故障上抛。
+///
+/// 为什么容器层的 `null` 算缺位而不是故障：`optional_string` 在叶子层已经把显式 `null`
+/// 读成缺键（JSON 里写 `null` 常是「无」的表示法），容器层若判成故障，同一份配置就有两种
+/// 互相矛盾的读法，而且是往「把没配的东西报成读不出来」那个方向错。
+///
+/// 分界靠**位置**而不是靠类型：`expect_object` / `expect_array` / `expect_string` 服务的是
+/// 「值已经在那里了，必须是对的类型」的位置——数组元素（`args[0]`）、被选中的安装记录、
+/// `mcpServers` 里一个已具名 server 的配置。那些位置的 `null` 是坏值，不是「没配」，
+/// 所以 `type_name` 的 `"null"` 分支必须仍然可达。
+fn optional_object<'a>(
+    value: Option<&'a Value>,
+    file: &Path,
+    what: &str,
+) -> anyhow::Result<Option<&'a Map<String, Value>>> {
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    expect_object(value, file, what).map(Some)
+}
+
+/// `optional_object` 的数组版，同一条分界。调用方是 `args` 这类「缺键 = 空集合」的字段；
+/// 元素类型仍走 `expect_*`，所以 `[null]` 是故障不是空数组。
+fn optional_array<'a>(
+    value: Option<&'a Value>,
+    file: &Path,
+    what: &str,
+) -> anyhow::Result<Option<&'a Vec<Value>>> {
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    expect_array(value, file, what).map(Some)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +425,11 @@ mod tests {
 
     fn find<'a>(caps: &'a [Capability], kind: Kind, name: &str) -> Option<&'a Capability> {
         caps.iter().find(|c| c.id.kind == kind && c.id.name == name)
+    }
+
+    /// 断言失败时把整份输出的 id 列出来，省得只看到「2 != 0」却不知道多出来的是谁。
+    fn labels(caps: &[Capability]) -> Vec<String> {
+        caps.iter().map(|c| c.id.label()).collect()
     }
 
     /// 形状故障的报错文本按**整串**钉死（不 `contains`）：这四段——文件路径、位置（只到
@@ -1245,6 +1301,188 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    // ============ `null` 的两种读法：容器层 = 缺键，强制位置 = 坏值 ============
+
+    /// `{"mcpServers": null}` 与缺键同为「没配 MCP」。叶子层的 `optional_string` 早就把显式
+    /// `null` 读成缺键了，容器层若判故障，同一份配置就有两种互相矛盾的读法——而且错往
+    /// 「把一件本来就没配的事报成整次 diff 失败」那个方向错，正是失败隔离契约禁的。
+    #[test]
+    fn a_null_mcp_servers_container_reads_as_no_servers_configured() {
+        let t = TempHome::new();
+        t.write(".claude.json", r#"{ "mcpServers": null }"#);
+        let caps = ClaudeCode::new(t.home.clone())
+            .read_state()
+            .expect("`mcpServers: null` 是没配，不是形状故障");
+        assert!(caps.is_empty(), "{:?}", labels(&caps));
+    }
+
+    /// `{"plugins": null}` 同上：一个都没装，不是「读不出来」。
+    #[test]
+    fn a_null_plugins_container_reads_as_no_plugins_configured() {
+        let t = TempHome::new();
+        t.write(
+            ".claude/plugins/installed_plugins.json",
+            r#"{ "version": 2, "plugins": null }"#,
+        );
+        let caps = ClaudeCode::new(t.home.clone())
+            .read_state()
+            .expect("`plugins: null` 是没装，不是形状故障");
+        assert!(caps.is_empty(), "{:?}", labels(&caps));
+    }
+
+    /// `{"enabledPlugins": null}` = 一条门禁都没表态 = 全部按启用读，与「没有 settings.json」
+    /// 同义。注意方向和 `only_the_first_install_record...` 一致：这里没有新的信任被给出，
+    /// 只是「没写」继续不等于「坏了」。
+    #[test]
+    fn a_null_enabled_plugins_container_reads_as_no_gates() {
+        let t = TempHome::new();
+        t.write(
+            ".claude/plugins/installed_plugins.json",
+            r#"{ "version": 2, "plugins": { "p@mp": [ { "version": "1.0" } ] } }"#,
+        );
+        t.write(".claude/settings.json", r#"{ "enabledPlugins": null }"#);
+        let caps = ClaudeCode::new(t.home.clone())
+            .read_state()
+            .expect("`enabledPlugins: null` 是没表态，不是形状故障");
+        match &find(&caps, Kind::Plugin, "p")
+            .expect("plugin 仍要读到")
+            .spec
+        {
+            Spec::Plugin { enabled, .. } => assert!(*enabled, "空门禁表按未表态处理"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `args` / `env` 是「缺键 = 空集合」的可选字段，所以 `null` 也读成空集合。
+    /// 两个字段是**两个**独立站点，各自换回 `expect_*` 都要红这里。
+    #[test]
+    fn a_null_mcp_args_or_env_field_reads_as_an_empty_collection() {
+        let t = TempHome::new();
+        t.write(
+            ".claude.json",
+            r#"{ "mcpServers": { "m": { "command": "c", "args": null, "env": null } } }"#,
+        );
+        let caps = ClaudeCode::new(t.home.clone())
+            .read_state()
+            .expect("`args: null` / `env: null` 是没配，不是形状故障");
+        match &find(&caps, Kind::Mcp, "m").unwrap().spec {
+            Spec::Mcp { args, env, .. } => {
+                assert!(args.is_empty(), "{args:?}");
+                assert!(env.is_empty(), "{env:?}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 整个文档就是一个 `null` = 「这个文件什么都没写」，与文件不存在同义（同一个守卫管三家
+    /// 文件，所以逐一点一遍，少一家就是少一次看守）。`[]` / `"oops"` 那类坏文档仍上抛，
+    /// 见 `a_config_file_whose_top_level_is_not_an_object_is_an_error`。
+    #[test]
+    fn a_config_file_that_is_just_null_reads_as_absent_not_as_a_shape_fault() {
+        for rel in [
+            ".claude.json",
+            ".claude/settings.json",
+            ".claude/plugins/installed_plugins.json",
+        ] {
+            let t = TempHome::new();
+            // settings.json 只有「确实有 plugin 要看门禁」时才会被读到，那一轮因此
+            // 应该读到那条 plugin；另外两轮没有别的输入 → 空表。
+            if rel == ".claude/settings.json" {
+                t.write(
+                    ".claude/plugins/installed_plugins.json",
+                    r#"{ "version": 2, "plugins": { "p@mp": [ { "version": "1.0" } ] } }"#,
+                );
+            }
+            t.write(rel, "null");
+            let caps = ClaudeCode::new(t.home.clone())
+                .read_state()
+                .unwrap_or_else(|e| panic!("{rel}: 一个 `null` 文档不是故障：{e}"));
+            let expected = usize::from(rel == ".claude/settings.json");
+            assert_eq!(caps.len(), expected, "{rel}: {:?}", labels(&caps));
+        }
+    }
+
+    /// 反向的一半，也是 `type_name` 的 `"null"` 分支的看守：**数组元素**里的 `null` 不是
+    /// 「没配」，是一个写坏的值。容器层改成「`null` 即缺键」之后，那个分支只剩「值必须
+    /// 在那里」的位置可达（元素、已具名条目、门禁值……），实测把 `"null"` 这个字符串改掉
+    /// 会红四条，全是下面这几类测试；把它当死代码删掉就等于让
+    /// `args: ["-y", null]` 塌成 `["-y", ""]`。
+    #[test]
+    fn a_null_mcp_args_element_is_still_a_shape_fault() {
+        let t = TempHome::new();
+        t.write(
+            ".claude.json",
+            r#"{ "mcpServers": { "m": { "command": "c", "args": ["-y", null] } } }"#,
+        );
+        assert_eq!(
+            read_state_err(&t),
+            shape_msg(
+                &t.path(".claude.json"),
+                "mcp server `m` field `args[1]`",
+                "a string",
+                "null"
+            )
+        );
+    }
+
+    /// 被选中的那条安装记录同样是强制位置：`{"g@mp": [null]}` 是坏记录，不是「没装成」
+    /// （后者是 `empty_install_array_is_skipped` 那个空数组）。
+    #[test]
+    fn a_null_install_record_is_still_a_shape_fault() {
+        let t = TempHome::new();
+        t.write(
+            ".claude/plugins/installed_plugins.json",
+            r#"{ "version": 2, "plugins": { "g@mp": [null] } }"#,
+        );
+        assert_eq!(
+            read_state_err(&t),
+            shape_msg(
+                &t.path(".claude/plugins/installed_plugins.json"),
+                "plugins entry `g@mp`[0]",
+                "an object",
+                "null"
+            )
+        );
+    }
+
+    /// `plugins` 的每条键都**已经声明**「这个 plugin 有安装记录」，所以 `"p@mp": null` 是
+    /// 该给值没给，不是「没配」：容器层的宽容到 `plugins` 这一层为止。
+    /// 这条与 `an_install_list_that_is_not_an_array_is_an_error_naming_the_entry` 同族。
+    #[test]
+    fn a_null_install_list_is_a_shape_fault_naming_the_entry() {
+        let t = TempHome::new();
+        t.write(
+            ".claude/plugins/installed_plugins.json",
+            r#"{ "version": 2, "plugins": { "g@mp": null } }"#,
+        );
+        assert_eq!(
+            read_state_err(&t),
+            shape_msg(
+                &t.path(".claude/plugins/installed_plugins.json"),
+                "plugins entry `g@mp`",
+                "an array",
+                "null"
+            )
+        );
+    }
+
+    /// 同理，`mcpServers` 里已具名的 server 条目是强制位置：写了 `"m": null` 就是坏值。
+    /// 「一个 server 都没列」和「列了却没给配置」不可混为一谈。
+    #[test]
+    fn a_null_named_mcp_server_is_a_shape_fault_naming_the_server() {
+        let t = TempHome::new();
+        t.write(".claude.json", r#"{ "mcpServers": { "m": null } }"#);
+        assert_eq!(
+            read_state_err(&t),
+            shape_msg(
+                &t.path(".claude.json"),
+                "mcp server `m`",
+                "an object",
+                "null"
+            )
+        );
     }
 
     /// 缺 `command` 键与 `command: null` 同为「没配 command」（`Spec::Mcp.command` 是
