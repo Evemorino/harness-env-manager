@@ -738,7 +738,8 @@ mod tests {
         // 把被扫描目录的路径字符串用 "/." 垫到接近 read_dir 的上限，
         // 此时 DirEntry::path() 拼出的条目路径超过上限，fs::read_link 确定地返回 InvalidFilename。
         // 2026-09-24 实测：dirlen=999 时 read_dir 仍成功（上限附近是 1015），
-        // 而 40 字符条目名拼出的 entrylen=1038 已经让 read_link 失败；file_type() 仍是 Ok(true)。
+        // 而条目名 `skill-with-a-deliberately-long-name-40`（38 个字符，末尾的 40 是字面量不是长度）
+        // 拼出的 entrylen=1038 > PATH_MAX(1024)，已经让 read_link 失败；file_type() 仍是 Ok(true)。
         let long = "skill-with-a-deliberately-long-name-40";
         let t = TempHome::new();
         t.mkdir(".claude/skills/realdir")

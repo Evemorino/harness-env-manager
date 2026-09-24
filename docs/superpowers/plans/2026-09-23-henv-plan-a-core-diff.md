@@ -3369,6 +3369,20 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
 范围限定：只读**用户级** MCP（`~/.claude.json` 顶层）。`projects.*.mcpServers` 是项目级，
 不在 v1 范围（spec §1 非目标）。
 
+> **形状故障也是故障（Task 9 评审发现的 Critical，Task 10/11 同样适用）。**
+> `if let Some(x) = root.get("k").and_then(Value::as_object)` 在「键根本不存在」和「键存在但类型不对」
+> 两种情况下**都**走空分支——于是 `{"mcpServers": []}`、`{"plugins": "oops"}`、
+> `{"g@mp": "notarray"}` 这类写坏的配置被报成「这个 harness 没配任何能力」，正是失败隔离契约
+> （见 Task 15 旁 `2ee0b8c` 那条）禁止的假同步。`as_array()` 后 `.first()` 的 `else { continue }`
+> 同罪：它把「值不是数组」和「数组确实为空（没装成）」混为一谈。
+>
+> **正确形状：先区分键在不在，再判类型。** 键缺失 → `Ok(空)`（正常状态）；
+> 键在但类型不对 → `bail!` 带**文件路径 + 键名 + 期望类型**（不带值，值可能是密钥）。
+> 只有「类型对且为空」才是合法的 `Ok(空)`。
+> 同一个形状也出现在 `mcp_capability` 里 `env` 的 `Value::as_object` 与 `args` 的
+> `Value::as_array` + `unwrap_or_default()`：非对象的 `env`、非数组的 `args` 现在静默丢数据
+> （连键名一起丢），至少要不钉住、最好同样上抛。
+
 - [ ] **Step 1: 写失败的测试**
 
 追加到 `src/adapters/claude_code.rs` 末尾：
@@ -3671,9 +3685,9 @@ use std::path::{Path, PathBuf};
 
 ```rust
 impl ClaudeCode {
-    fn read_skills(&self) -> Vec<Capability> {
+    fn read_skills(&self) -> anyhow::Result<Vec<Capability>> {
         let mut out = Vec::new();
-        for e in try_read_skill_entries(&self.home.claude_skills(), &self.home) {
+        for e in try_read_skill_entries(&self.home.claude_skills(), &self.home)? {
             let source = match e.store {
                 SkillStore::Shared => SkillSource::AgentsDir,
                 SkillStore::PluginCache => {
@@ -3717,8 +3731,10 @@ impl ClaudeCode {
         let Some(root) = read_json_if_present(&self.home.claude_installed_plugins())? else {
             return Ok(Vec::new());
         };
-        // settings.json 读失败不该拖垮 plugin 扫描，退化成「全部视为 enabled」
-        let enabled_map = self.read_enabled_plugins().unwrap_or_default();
+        // 门禁读不出来就是读不出来：退化成「全部 enabled」会把用户关掉的 plugin 报成已启用，
+        // 正是失败隔离契约禁止的那种「看起来合理」的假同步。（落地版用 `?`；本节先前这里写的是
+        // `unwrap_or_default()` 加相反的理由，与代码和契约都矛盾——已按代码改正，见 819a07a。）
+        let enabled_map = self.read_enabled_plugins()?;
 
         let mut out = Vec::new();
         let plugins = root.get("plugins").and_then(Value::as_object);
@@ -3844,6 +3860,12 @@ git commit -m "feat: claude-code read_state（MCP 读自 ~/.claude.json 而非 s
 ---
 
 ### Task 10: codex read_state
+
+> **照 Task 9 的「形状故障也是故障」那条写**（Task 9 里 `2ee0b8c` 契约旁边、评审补的 Critical 块）。
+> 本节下面示例里的 `let Some(x) = root.get(..).and_then(toml::Value::as_table) else { .. }`
+> 在「键存在但类型不对」时同样会交出空结果——TOML 侧的对应输入是 `[mcp_servers]` 写成了
+> `mcp_servers = "..."`。已落地的 `src/adapters/claude_code.rs` 就是照这一条改过的样板，
+> 遇到冲突**以代码为准**并把它写回本节。
 
 **Files:**
 - Modify: `src/adapters/codex.rs`
@@ -4256,6 +4278,15 @@ git commit -m "feat: codex read_state（config.toml 动态导航，对未知字�
 ---
 
 ### Task 11: kimi-code read_state
+
+> **照 Task 9 的「形状故障也是故障」那条写**（Task 9 里 `2ee0b8c` 契约旁边、评审补的 Critical 块）。
+> 本节下面示例**逐字**复现了那个被判定为 Critical 的形状：`let Some(list) =
+> root.get("plugins").and_then(Value::as_array) else { return Ok(Vec::new()) }`，以及
+> `p.get("id").and_then(Value::as_str) else { continue }`。kimi 的 `installed.json` 是数组、
+> 身份在 `id` 里，所以这两处一旦遇到类型写坏（`plugins` 不是数组、某条记录没有字符串 `id`）
+> 就会把「配置坏了」报成「没装任何东西」。**落地时必须按 Task 9 已改过的样板处理**：
+> 键缺失 → 空；键在但类型不对 → `bail!` 带路径 + 键名（不带值）。
+> `mcp_capability` / `read_json_if_present` 直接从 `claude_code.rs` 复用，不要另写一份。
 
 **Files:**
 - Modify: `src/adapters/kimi_code.rs`
