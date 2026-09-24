@@ -6289,4 +6289,11 @@ Task 14 的 `in_sync_summary_kinds_follow_kind_all_order` 按此顺序断言。
    Plan C 的 `doctor` 该显式报告「codex 侧 plugin 版本无法核验」，不要假装能比。
 5. **`apply` 的确认交互与 `--yes`/`--prune` 标志**（spec §5）属 Plan B；
    `scan` 的收养写回 `env.yaml` 与 `doctor` 的环境体检属 Plan C。
-6. **`henv diff` 恒 exit 0**。要门禁语义就加 `doctor --check`，别改 `diff`。
+7. **`degrade:` 策略在 Plan A 里结构性惰性，这是设计后果不是缺陷——但必须说清楚。**
+   Plan A 不拆解 plugin（见下条 2），所以 desired 侧永远不会出现 `Origin::Plugin` 的能力，
+   `DegradeTable::action` 对每条能力都走 `_ => Report`。于是 `env.yaml` 里写的
+   `degrade: {hooks: skip}` **当前不产生任何可观察差异**。Plan A 的 `diff` 仍然正确地报告
+   装不下的能力（Task 12 的 `supports()` 决定），只是不会按策略静音它。
+   **要求**：(a) `lower.rs` 里那句「只作用于实际侧」的注释是错的，实际两侧都不生效，改成
+   上述准确表述；(b) `henv diff` 的输出或文档要让用户知道 `degrade` 目前只是声明性占位，
+   不要让人以为写了 `skip` 就生效。真正生效点在 Plan B 拆解落地时。要门禁语义就加 `doctor --check`，别改 `diff`。
