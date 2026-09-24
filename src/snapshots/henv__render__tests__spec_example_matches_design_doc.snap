@@ -1,0 +1,12 @@
+---
+source: src/render.rs
+expression: render(&spec_plan())
+---
+claude-code   ✓ in-sync  skills:42 mcps:6 plugins:3
+codex         + install  mcp/browser-use, mcp/context7
+              ~ update   skill/dingtalk-mail (v2.1 → v2.2)
+              ! undeliverable  hook/superpowers:pre-commit (no hook support)
+kimi-code     + install  mcp/context7
+              - drift    mcp/experimental-thing (未在清单中，--prune 可删)
+
+Plan: 3 install, 1 update, 0 remove, 1 undeliverable, 1 drift
