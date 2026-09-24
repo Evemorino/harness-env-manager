@@ -247,6 +247,125 @@ where
     Ok(out)
 }
 
+/// 会带出**用户写的值**的三种 serde 消息标记（`unknown variant` 的内容在反引号里）。
+const VALUE_MARKERS: [&str; 3] = ["invalid type: ", "invalid value: ", "unknown variant "];
+/// 只带**键名**的三种标记，见 `redact_serde_message` 文档第 3 条。
+const KEY_ONLY_MARKERS: [&str; 3] = ["unknown field ", "missing field ", "duplicate field "];
+/// `Unexpected` 的渲染里带内容的那几种前缀 → 静态类型词（与 `env_refs` 里给节点种类的那批
+/// 静态词同一批，所以 `env` 那处的既有消息一个字都不变）。
+const CONTENT_ACTUALS: [(&str, &str); 5] = [
+    ("string \"", "a string"),
+    ("integer `", "a number"),
+    ("floating point `", "a number"),
+    ("boolean `", "a boolean"),
+    ("character `", "a character"),
+];
+/// 解析器把「实际值」与「模式要求」分开的固定串。
+const EXPECTED_SEP: &str = ", expected ";
+const REDACTED_ACTUAL: &str = "a value (not shown)";
+const REDACTED_VARIANT: &str = "(value not shown)";
+const REDACTED_SHAPE: &str = "unrecognized parse problem (parser text not shown)";
+
+/// 认得的 serde 标记里取**最靠前**的那个（值里可以自带标记词，实测
+/// `version: "invalid type: sk-live-…"`，从后往前找会把值的尾巴当成消息头留下）。
+fn value_marker(msg: &str) -> Option<(usize, &'static str)> {
+    VALUE_MARKERS
+        .into_iter()
+        .filter_map(|marker| msg.find(marker).map(|at| (at, marker)))
+        .min()
+}
+
+/// 引号与反引号是 serde 包住「用户写的内容」唯二的两种方式。
+fn may_carry_content(msg: &str) -> bool {
+    msg.contains('"') || msg.contains('`')
+}
+
+/// 认不出的消息里唯一还能安全保留的成分是点号路径前缀：`": "` 之前、且它自己不含引号
+/// （含引号说明那段已经可能是值的一截，整段丢掉）。
+fn safe_path_prefix(msg: &str) -> Option<&str> {
+    let (prefix, _) = msg.split_once(": ")?;
+    (!may_carry_content(prefix)).then_some(prefix)
+}
+
+/// actual 段（`invalid type:` / `invalid value:` 后面那截）→ 静态词。
+fn redact_actual(actual: &str) -> &str {
+    for (prefix, word) in CONTENT_ACTUALS {
+        if actual.starts_with(prefix) {
+            return word;
+        }
+    }
+    // 走到这里要么是解析器自己的静态词（`sequence` / `map` / `unit value`，以及 `env_refs`
+    // 递进来的 `a string` 这类 `Unexpected::Other`），要么是不认识的**带内容形态**。
+    if may_carry_content(actual) {
+        REDACTED_ACTUAL
+    } else {
+        actual
+    }
+}
+
+/// serde 渲染形状错误时会把**用户写的标量原样**打印进消息：`invalid type: string "<值>"` /
+/// `invalid value: string "<值>"` / ```unknown variant `<值>````。`env.yaml` 解成 typed struct，
+/// 所以任何字段只要「值不满足期望类型」就走这条路——实测六种形态（`version`、
+/// `mcps.*.args`、`degrade.*`、`targets`、两个 `source` 枚举、`harnesses.*.enabled`）都会
+/// 把值带出来，多行块标量也整段带出。而这件事发生在 `m.validate()` 那道 `${VAR}` 门禁**之前**：
+/// 一条误粘的明文密钥如果同时不满足期望类型，就是被门禁自己打印出来的。
+///
+/// 本函数只做**这一条解析路径**上的遮蔽（`Manifest::parse` 是唯一调用方；`env_refs` 与 codex
+/// 的 TOML 侧同样是单点修法，全局 scrubbing 会破坏别的输出）。白名单的是**serde 的消息形状**，
+/// 不是「看起来像密钥的子串」——后者一定漏掉下一种格式，而且漏掉之后测试仍然全绿。三条规则：
+///
+/// 1. `invalid type:` / `invalid value:`：内容只可能待在 actual 段里，所以整段换成静态类型词；
+///    `expected …` 段是模式文本（来自 struct / enum 定义与我们的 `&"…"` 字面量），原样保留。
+///    actual 与 expected 按**最后一次** `", expected "` 切：值里可以自带这个子串。
+/// 2. ```unknown variant `X` ```：X 是用户写的值 → 整个名字丢掉，不去猜它从哪结束。
+/// 3. 只带**键名**的三种（`unknown field` / `missing field` / `duplicate field`）原样保留。
+///    键名不是 `${VAR}` 规则管的对象，而点号路径前缀本来就由同一个文件的键组成
+///    （`mcps.<条目名>.args`）——遮掉键只会让人找不到出错行，却挡不住值。
+///
+/// 三种都不认得的形状（解析器换了措辞、或我们没建模过的第三种内容载体）：**宁可少说也不回显**，
+/// 换成一句静态理由，再补上前缀与 `location` 给的 `at line L column C`。`location` 是解析器的
+/// 结构化输出，不是文档内容，所以重建位置不会把值带回来。
+fn redact_serde_message(raw: &str, location: Option<(usize, usize)>) -> String {
+    if let Some((at, marker)) = value_marker(raw) {
+        let body = &raw[at + marker.len()..];
+        let (actual, expected) = match body.rsplit_once(EXPECTED_SEP) {
+            Some((actual, expected)) => (actual, Some(expected)),
+            None => (body, None),
+        };
+        let mut out = String::with_capacity(raw.len());
+        out.push_str(&raw[..at]);
+        out.push_str(marker);
+        // `unknown variant ` 的措辞里「实际值」就是那个名字本身，没有类型词可留。
+        if marker == "unknown variant " {
+            out.push_str(REDACTED_VARIANT);
+        } else {
+            out.push_str(redact_actual(actual));
+        }
+        if let Some(expected) = expected {
+            out.push_str(EXPECTED_SEP);
+            out.push_str(expected);
+        }
+        return out;
+    }
+    if KEY_ONLY_MARKERS
+        .into_iter()
+        .any(|marker| raw.contains(marker))
+        || !may_carry_content(raw)
+    {
+        return raw.to_string();
+    }
+    let mut out = String::new();
+    if let Some(prefix) = safe_path_prefix(raw) {
+        out.push_str(prefix);
+        out.push_str(": ");
+    }
+    out.push_str(REDACTED_SHAPE);
+    if let Some((line, column)) = location {
+        out.push_str(&format!(" at line {line} column {column}"));
+    }
+    out
+}
+
 /// 「字段在但空白」与「字段缺失」是两种不同的失败：`requires_x` 那条管缺失，这里管空白。
 /// 两者都必须拦下来，因为空白值会原样进 `lower`：`entry: ""` 降出 `CapId{Plugin, ""}`
 /// （label `plugin/`）、并把 degrade 表键到 `""`——于是任何报不出 plugin 身份的东西都会
@@ -262,9 +381,19 @@ fn reject_blank(at: &str, field: &str, value: Option<&str>, e: &mut Vec<String>)
 
 impl Manifest {
     /// 解析 + 校验。校验错误聚合成单个 anyhow 错误，每条带 `skills.a` 式路径。
+    ///
+    /// 解析失败那一支**必须**经 `redact_serde_message` 再拼消息：typed 反序列化的形状错误
+    /// 自带用户写的标量，而这里是 `${VAR}` 门禁之前唯一会打印该文件内容的地方。
     pub fn parse(text: &str) -> anyhow::Result<Manifest> {
-        let m: Manifest = serde_yaml_ng::from_str(text)
-            .map_err(|e| anyhow::anyhow!("failed to parse env.yaml: {e}"))?;
+        let m: Manifest = serde_yaml_ng::from_str(text).map_err(|e| {
+            // 位置取解析器的结构化输出，不取消息文本里的 `at line …`——最后一道分支要用
+            // 它重建定位，而那条分支的整串消息都已经被换掉了。
+            let location = e.location().map(|l| (l.line(), l.column()));
+            anyhow::anyhow!(
+                "failed to parse env.yaml: {}",
+                redact_serde_message(&e.to_string(), location)
+            )
+        })?;
         let errors = m.validate();
         if errors.is_empty() {
             Ok(m)
@@ -493,20 +622,31 @@ plugins:
         assert!(!m.mcps["b"].targets.includes("kimi-code"));
     }
 
+    /// 这两条原本断言 `err.contains("cursor")`——而被断言的那个词正是 serde 回显的**值**，
+    /// 与 `mistyped_scalars_never_reach_the_rendered_parse_error` 要挡掉的是同一件事（值写成
+    /// `sk-live-…` 时它就是被同一条消息打印出来的）。现在整串钉死遮蔽后的形态：真正的牙齿是
+    /// 「这条输入必须报错」＋「报的是哪一个条目、哪一行」，harness 名由用户自己看着那行改。
     #[test]
     fn targets_rejects_unknown_harness_in_list() {
         let yaml = "version: 1\nmcps:\n  a:\n    command: npx\n    targets: [cursor]\n";
         let err = Manifest::parse(yaml).unwrap_err().to_string();
-        assert!(err.contains("cursor"), "{err}");
+        assert_eq!(
+            err,
+            "failed to parse env.yaml: mcps.a: invalid value: a string, expected one of claude-code, codex, kimi-code at line 4 column 5"
+        );
     }
 
     /// 列表校验的「每一个元素都查」：现有 fixture 是单元素，所以只查首元素的实现
-    /// 在这里会**接受** `[codex, cursor]`，未知 harness 静默过关。
+    /// 在这里会**接受** `[codex, cursor]`，未知 harness 静默过关——所以本条与上面那条
+    /// 消息逐字相同并不冗余：判据是「它照样必须报错」。
     #[test]
     fn targets_rejects_unknown_harness_after_the_first() {
         let yaml = "version: 1\nmcps:\n  a:\n    command: npx\n    targets: [codex, cursor]\n";
         let err = Manifest::parse(yaml).unwrap_err().to_string();
-        assert!(err.contains("cursor"), "{err}");
+        assert_eq!(
+            err,
+            "failed to parse env.yaml: mcps.a: invalid value: a string, expected one of claude-code, codex, kimi-code at line 4 column 5"
+        );
     }
 
     #[test]
@@ -824,5 +964,189 @@ plugins:
             .unwrap_err()
             .to_string();
         assert!(err.contains("env.yaml"), "{err}");
+    }
+
+    /// 五类字段各埋一个假密钥，断言**渲染出来的报错逐字等于遮蔽后的形态**。
+    ///
+    /// 修前的实际输出（`{:#}` 与 `{:?}` 一模一样——`anyhow!` 拼的是字符串，没有 cause 链，
+    /// 所以两种打印形态都带值，这是与 codex TOML 那处**不同的机制**）：
+    /// ```text
+    /// failed to parse env.yaml: version: invalid type: string "sk-live-9f3a2b7c", expected u32 at line 1 column 10
+    /// failed to parse env.yaml: mcps.a.args: invalid type: string "sk-live-9f3a2b7c", expected a sequence at line 5 column 11
+    /// failed to parse env.yaml: plugins.p.degrade: invalid value: string "sk-live-9f3a2b7c", expected "report" or "skip" at line 7 column 7
+    /// failed to parse env.yaml: mcps.a: invalid value: string "sk-live-9f3a2b7c", expected "all" or a list of harness names at line 4 column 5
+    /// failed to parse env.yaml: skills.a.source: unknown variant `sk-live-9f3a2b7c`, expected one of `agents-dir`, `git`, `local` at line 4 column 13
+    /// ```
+    /// 这条路**在 `m.validate()` 那道 `${VAR}` 门禁之前**，所以一条误粘的明文密钥只要同时
+    /// 不满足期望类型，就是被门禁自己打印出来的。断言用整串相等（计划 Global Constraints ①）：
+    /// 路径、位置、`expected` 文本、遮蔽词任何一处变形都会立刻红，「值没出现」也因此不是靠
+    /// `contains` 凑出来的。`want` 自身还要过一遍「不含植进去的值」，防止把修前的输出抄进表里。
+    #[test]
+    fn mistyped_scalars_never_reach_the_rendered_parse_error() {
+        const SECRET: &str = "sk-live-9f3a2b7c";
+        for (yaml, want) in [
+            // version（u32）：标量、带引号的标量、浮点、布尔、以及装不下的整数。
+            (
+                "version: sk-live-9f3a2b7c\n",
+                "failed to parse env.yaml: version: invalid type: a string, expected u32 at line 1 column 10",
+            ),
+            (
+                "version: \"sk-live-9f3a2b7c\"\n",
+                "failed to parse env.yaml: version: invalid type: a string, expected u32 at line 1 column 10",
+            ),
+            (
+                "version: 1.5\n",
+                "failed to parse env.yaml: version: invalid type: a number, expected u32 at line 1 column 10",
+            ),
+            (
+                "version: true\n",
+                "failed to parse env.yaml: version: invalid type: a boolean, expected u32 at line 1 column 10",
+            ),
+            (
+                "version: 12345678901234567890\n",
+                "failed to parse env.yaml: version: invalid value: a number, expected u32 at line 1 column 10",
+            ),
+            // mcps.*.args（Vec<String>）：整个条目被写成块标量时同理，值带换行也只算一段。
+            (
+                "version: 1\nmcps:\n  a:\n    command: npx\n    args: sk-live-9f3a2b7c\n",
+                "failed to parse env.yaml: mcps.a.args: invalid type: a string, expected a sequence at line 5 column 11",
+            ),
+            (
+                "version: 1\nmcps:\n  a: |\n    sk-live-9f3a2b7c\n",
+                "failed to parse env.yaml: mcps.a: invalid type: a string, expected struct McpEntry at line 3 column 6",
+            ),
+            // degrade.*（手写 invalid_value）与 targets（同）：`expected` 文本自带引号，
+            // 遮蔽只准动 actual 那一段。
+            (
+                "version: 1\nplugins:\n  p:\n    source: github\n    repo: a/b\n    degrade:\n      hooks: sk-live-9f3a2b7c\n",
+                "failed to parse env.yaml: plugins.p.degrade: invalid value: a string, expected \"report\" or \"skip\" at line 7 column 7",
+            ),
+            (
+                "version: 1\nmcps:\n  a:\n    command: npx\n    targets: sk-live-9f3a2b7c\n",
+                "failed to parse env.yaml: mcps.a: invalid value: a string, expected \"all\" or a list of harness names at line 4 column 5",
+            ),
+            (
+                "version: 1\nmcps:\n  a:\n    command: npx\n    targets: [sk-live-9f3a2b7c]\n",
+                "failed to parse env.yaml: mcps.a: invalid value: a string, expected one of claude-code, codex, kimi-code at line 4 column 5",
+            ),
+            // source 枚举（serde 派生的 unknown variant，两个 enum 各一条）。
+            (
+                "version: 1\nskills:\n  a:\n    source: sk-live-9f3a2b7c\n",
+                "failed to parse env.yaml: skills.a.source: unknown variant (value not shown), expected one of `agents-dir`, `git`, `local` at line 4 column 13",
+            ),
+            (
+                "version: 1\nplugins:\n  a:\n    source: sk-live-9f3a2b7c\n",
+                "failed to parse env.yaml: plugins.a.source: unknown variant (value not shown), expected one of `claude-marketplace`, `github`, `zip-url` at line 4 column 13",
+            ),
+            // 派单没点名的第 6 处同类：harnesses.*.enabled（bool），以及值里自带标记词的形态。
+            (
+                "version: 1\nharnesses:\n  codex:\n    enabled: sk-live-9f3a2b7c\n",
+                "failed to parse env.yaml: harnesses.codex.enabled: invalid type: a string, expected a boolean at line 4 column 14",
+            ),
+            (
+                "version: \"invalid type: sk-live-9f3a2b7c\"\n",
+                "failed to parse env.yaml: version: invalid type: a string, expected u32 at line 1 column 10",
+            ),
+            // 值里自带 `, expected `：必须按**最后一次**出现切，否则值的后半截会留在消息里。
+            (
+                "version: \"a, expected sk-live-9f3a2b7c\"\n",
+                "failed to parse env.yaml: version: invalid type: a string, expected u32 at line 1 column 10",
+            ),
+        ] {
+            assert!(
+                !want.contains(SECRET),
+                "fixture 写错了：期望的消息里还带着植进去的值"
+            );
+            let err = Manifest::parse(yaml).expect_err("坏值必须在解析期就报出来");
+            // `{:#}` 与 `{:?}` 是 Task 15 计划打印的两种形态，两种都得过。
+            assert_eq!(format!("{err:#}"), want, "yaml = {yaml:?}");
+            assert_eq!(format!("{err:?}"), want, "yaml = {yaml:?}");
+        }
+    }
+
+    /// `redact_serde_message` 的分支表。这些形态**没法**只靠 env.yaml fixture 从外面打到
+    /// （尤其是「解析器换了措辞」那条），所以直接测函数本身——生产侧只有一个调用方
+    /// （`Manifest::parse`），遮蔽范围仍然是这一条解析路径。
+    #[test]
+    fn the_sanitizer_whitelists_message_shapes_and_fails_closed_on_the_rest() {
+        for (raw, location, want) in [
+            // 认不出、且自带引号：整条换成静态理由，位置用解析器给的结构化值重建。
+            (
+                "mcps.a: some brand new parser complaint about \"sk-live-9f3a2b7c\"",
+                Some((4, 5)),
+                "mcps.a: unrecognized parse problem (parser text not shown) at line 4 column 5",
+            ),
+            // 同上，但引号出现在 `": "` 之前——这时连前缀都不能留（它可能已经是值的一截）。
+            (
+                "string \"x\": some brand new parser complaint",
+                Some((1, 2)),
+                "unrecognized parse problem (parser text not shown) at line 1 column 2",
+            ),
+            // 认不出、没有 `at line`（`duplicate field` 那类会给出 None）：不编造位置。
+            (
+                "brand new complaint about \"sk-live-9f3a2b7c\"",
+                None,
+                "unrecognized parse problem (parser text not shown)",
+            ),
+            // 认不出但不含引号 = libyaml 自己的措辞（实测：found a tab character …），
+            // 原样放过——语法错是最高频的报错，把它降级成一句「解析失败」就是拿可用性换安全。
+            (
+                "found a tab character that violates indentation at line 2 column 1, while scanning a plain scalar at line 1 column 10",
+                Some((2, 1)),
+                "found a tab character that violates indentation at line 2 column 1, while scanning a plain scalar at line 1 column 10",
+            ),
+            // 只带键名的三种原样放过（裁决见 `redact_serde_message` 文档第 3 条）。
+            (
+                "skills.a: unknown field `pth`, expected one of `source`, `repo`, `path`, `ref`, `targets`",
+                Some((5, 5)),
+                "skills.a: unknown field `pth`, expected one of `source`, `repo`, `path`, `ref`, `targets`",
+            ),
+            (
+                "mcps.a: missing field `command`",
+                Some((3, 1)),
+                "mcps.a: missing field `command`",
+            ),
+            (
+                "mcps.a: duplicate field `command`",
+                Some((3, 6)),
+                "mcps.a: duplicate field `command`",
+            ),
+            // 下一种「带内容的 actual 形态」：前缀不认识又含引号 → 丢内容，但 `expected` 留住。
+            (
+                "version: invalid type: byte string \"736b2d6c697665\", expected u32",
+                Some((1, 10)),
+                "version: invalid type: a value (not shown), expected u32",
+            ),
+            // actual 段本身是解析器的静态词 → 一个字都不动。
+            (
+                "skills.a.source: invalid type: map, expected a YAML tag starting with '!'",
+                Some((4, 13)),
+                "skills.a.source: invalid type: map, expected a YAML tag starting with '!'",
+            ),
+            // 值里自带反引号：整个名字丢掉，不去猜它到哪结束。
+            (
+                "skills.a.source: unknown variant `a`b`, expected one of `git`",
+                Some((4, 13)),
+                "skills.a.source: unknown variant (value not shown), expected one of `git`",
+            ),
+            // 值里自带 `, expected `（单元级，配合上面那条端到端的）。
+            (
+                "version: invalid type: string \"a, expected b\", expected u32",
+                Some((1, 10)),
+                "version: invalid type: a string, expected u32",
+            ),
+            // 没有 `, expected ` 收尾的形态（截断/未来措辞）：actual 照样丢。
+            (
+                "invalid value: string \"sk-live-9f3a2b7c\"",
+                None,
+                "invalid value: a string",
+            ),
+        ] {
+            assert_eq!(
+                redact_serde_message(raw, location),
+                want,
+                "raw = {raw:?} location = {location:?}"
+            );
+        }
     }
 }
