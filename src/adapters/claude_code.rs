@@ -340,7 +340,7 @@ fn shape_fault(found: &Value, file: &Path, what: &str, expected: &str) -> anyhow
 /// **强制**位置的形状裁决：「键缺失」由调用方的 `Option` 分支处理（那是正常状态），
 /// 这里只裁决「类型不对」——包括显式 `null`，它在强制位置是一个写坏的值。
 /// 可以缺位的容器用 `optional_object` / `optional_array`。
-fn expect_object<'a>(
+pub(crate) fn expect_object<'a>(
     value: &'a Value,
     file: &Path,
     what: &str,
@@ -350,13 +350,21 @@ fn expect_object<'a>(
         .ok_or_else(|| shape_fault(value, file, what, "an object"))
 }
 
-fn expect_array<'a>(value: &'a Value, file: &Path, what: &str) -> anyhow::Result<&'a Vec<Value>> {
+pub(crate) fn expect_array<'a>(
+    value: &'a Value,
+    file: &Path,
+    what: &str,
+) -> anyhow::Result<&'a Vec<Value>> {
     value
         .as_array()
         .ok_or_else(|| shape_fault(value, file, what, "an array"))
 }
 
-fn expect_string<'a>(value: &'a Value, file: &Path, what: &str) -> anyhow::Result<&'a str> {
+pub(crate) fn expect_string<'a>(
+    value: &'a Value,
+    file: &Path,
+    what: &str,
+) -> anyhow::Result<&'a str> {
     value
         .as_str()
         .ok_or_else(|| shape_fault(value, file, what, "a string"))
@@ -364,7 +372,7 @@ fn expect_string<'a>(value: &'a Value, file: &Path, what: &str) -> anyhow::Resul
 
 /// 可选字符串字段：键缺失 → `Ok(None)`；显式 `null` → `Ok(None)`（JSON 里写「无」的
 /// 常见形态，与缺键同义）；**有值但不是字符串** → 故障上抛，不塌成 `None`。
-fn optional_string<'a>(
+pub(crate) fn optional_string<'a>(
     obj: &'a Map<String, Value>,
     key: &str,
     file: &Path,
@@ -390,7 +398,11 @@ fn optional_string<'a>(
 /// 「值已经在那里了，必须是对的类型」的位置——数组元素（`args[0]`）、被选中的安装记录、
 /// `mcpServers` 里一个已具名 server 的配置。那些位置的 `null` 是坏值，不是「没配」，
 /// 所以 `type_name` 的 `"null"` 分支必须仍然可达。
-fn optional_object<'a>(
+///
+/// 六个形状原语（`expect_object` / `expect_array` / `expect_string` / `optional_string` /
+/// 本函数 / `optional_array`）都是 `pub(crate)`：Task 10/11 复用它们，不许另写一份。
+/// 「看见缺键」的那三个是 `optional_*`，它们收 `Option<&Value>`；`expect_*` 只收 `&Value`。
+pub(crate) fn optional_object<'a>(
     value: Option<&'a Value>,
     file: &Path,
     what: &str,
@@ -403,7 +415,7 @@ fn optional_object<'a>(
 
 /// `optional_object` 的数组版，同一条分界。调用方是 `args` 这类「缺键 = 空集合」的字段；
 /// 元素类型仍走 `expect_*`，所以 `[null]` 是故障不是空数组。
-fn optional_array<'a>(
+pub(crate) fn optional_array<'a>(
     value: Option<&'a Value>,
     file: &Path,
     what: &str,
