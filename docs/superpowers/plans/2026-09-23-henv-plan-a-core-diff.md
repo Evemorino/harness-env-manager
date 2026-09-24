@@ -3344,13 +3344,29 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
   `split_plugin_key`、`mcp_capability`。Task 11 的 kimi adapter 复用 `read_json_if_present`
   与 `mcp_capability`；`split_plugin_key` 只 claude 用（kimi 的 `installed.json` 是数组、
   身份在 `id` 字段里，不需要拆 `name@marketplace`）。
-  **落地后的签名（Task 9 修复轮 `c35d9c1`；本节下面的示例代码是修复前的形状）：**
+  **落地后的签名（Task 9 修复轮 `c35d9c1`；本节下面的示例代码是修复前的形状，照代码不要照示例）：**
   `read_json_if_present(&Path) -> Result<Option<Value>>` 保证返回的文档**是对象**（顶层
-  不是对象 = 形状故障），这一处三家共用，kimi/codex 不必各自再写一遍；
+  不是对象 = 形状故障）；只有 claude 与 kimi 两家走 JSON，**codex 读 TOML，两个 helper 都不复用**。
   `mcp_capability(name, cfg, harness, file) -> Result<Capability>` 现在是**可失败的**，
   第四个参数只用于报错定位（调用方自己的那个 JSON 文件），`command` / `args` / `env`
-  的「键在但类型不对」由它上抛。配套的三态原语 `expect_object` / `expect_array` /
-  `expect_string` / `optional_string` 就在 `claude_code.rs`，照它们写，别另建一套。
+  的「键在但类型不对」由它上抛。
+
+  配套的**四个**形状原语 `expect_object` / `expect_array` / `expect_string` / `optional_string`
+  定义在 `claude_code.rs`。**可见性是个真问题，不是文风问题**：`c35d9c1` 落地时它们是模块私有的
+  `fn`，所以本段先前那句「照它们写，别另建一套」对 Task 11 不可执行——它要么复制一份（正是那句话
+  禁止的），要么等它们被提升。Task 9 第二轮修复负责把四者提升为 `pub(crate)`；
+  **在那之前不要复制**，改用自己的 `pub(crate)` 提升并提交即可。
+
+  两条不变式（各家都要守）：`expect_*` 收的是 `&Value` 而**不是** `Option<&Value>`，所以「键缺失」
+  根本到不了它们那里——缺失一律由调用方的 `Option` 分支裁决为正常状态。`optional_string` 是**唯一**
+  看见缺失的那个，它返回 `Ok(None)`，并且把显式 `null` 也当作缺键。
+
+  **本节下面还没改完的示例（截至 `9bcbc71`，读示例前先看清）**：`read_mcps` 与 `mcp_capability`
+  两处已按落地形态改正；**`read_plugins` 与 `read_enabled_plugins` 两段仍是修复前的形状**
+  （`root.get("plugins").and_then(Value::as_object)` 的塌缩、`installs.as_array().and_then(first)`
+  把「不是数组」和「空数组」混为一谈）。权威形态在 `src/adapters/claude_code.rs:86-152`。
+  这里不趁手抄一遍是刻意的：第二轮要按上面那条 `null` 裁决再改同一批函数，现在抄完立刻又过期。
+  **Task 11 复用这两个形状时，读源码，别读本节示例。**
 
 实测数据形状（本机 2026-09-23 盘点，即测试 fixture 的依据）：
 
@@ -3386,6 +3402,14 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
 > **正确形状：先区分键在不在，再判类型。** 键缺失 → `Ok(空)`（正常状态）；
 > 键在但类型不对 → `bail!` 带**文件路径 + 键名 + 期望类型**（不带值，值可能是密钥）。
 > 只有「类型对且为空」才是合法的 `Ok(空)`。
+>
+> **`null` 的裁决（Task 9 第二轮补，逐层一致）：** 容器层的显式 `null` 与缺键同义——
+> `{"mcpServers": null}`、`{"plugins": null}`、`{"enabledPlugins": null}` 都是「没配」，返回空结果，
+> **不是**故障。理由就是 `optional_string` 对叶子层已经给过的那条：JSON 里写 `null` 常是「无」的
+> 表示法；叶子判缺失、容器判故障，是同一份配置里两种互相矛盾的读法。
+> 但**数组元素**里的 `null`（`args: [null]`）仍是故障：它不是「没配」，是一个写坏的值。
+> 因此 `type_name` 的 `"null"` 分支必须仍然可达，并由一条 `args` 元素测试钉住——不要因为它在容器层
+> 不可达就删掉。
 > 同一个形状也出现在 `mcp_capability` 里 `env` 的 `Value::as_object` 与 `args` 的
 > `Value::as_array` + `unwrap_or_default()`：非对象的 `env`、非数组的 `args` 现在静默丢数据
 > （连键名一起丢），至少要不钉住、最好同样上抛。
@@ -3722,13 +3746,17 @@ impl ClaudeCode {
 
     /// 用户级 MCP 在 ~/.claude.json 顶层 mcpServers（spec §2.1 第 1 条）。
     fn read_mcps(&self) -> anyhow::Result<Vec<Capability>> {
-        let Some(root) = read_json_if_present(&self.home.claude_json())? else {
+        let file = self.home.claude_json();
+        let Some(root) = read_json_if_present(&file)? else {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
-        if let Some(servers) = root.get("mcpServers").and_then(Value::as_object) {
-            for (name, cfg) in servers {
-                out.push(mcp_capability(name, cfg, CLAUDE_CODE));
+        // 「没有 mcpServers 这个键」→ 空表（正常状态）；「有键但不是对象」→ 故障上抛。
+        // 用 `if let Some(x) = root.get(..).and_then(Value::as_object)` 会把两者合并成同一个
+        // 空分支，于是 `{"mcpServers": []}` 被报成「没配任何 MCP」——假同步。
+        if let Some(servers) = root.get("mcpServers") {
+            for (name, cfg) in expect_object(servers, &file, "key `mcpServers`")? {
+                out.push(mcp_capability(name, cfg, CLAUDE_CODE, &file)?);
             }
         }
         Ok(out)
@@ -3737,8 +3765,7 @@ impl ClaudeCode {
     fn read_plugins(&self) -> anyhow::Result<Vec<Capability>> {
         let Some(root) = read_json_if_present(&self.home.claude_installed_plugins())? else {
             return Ok(Vec::new());
-        };
-        // 门禁读不出来就是读不出来：退化成「全部 enabled」会把用户关掉的 plugin 报成已启用，
+        };        // 门禁读不出来就是读不出来：退化成「全部 enabled」会把用户关掉的 plugin 报成已启用，
         // 正是失败隔离契约禁止的那种「看起来合理」的假同步。（落地版用 `?`；本节先前这里写的是
         // `unwrap_or_default()` 加相反的理由，与代码和契约都矛盾——已按代码改正，见 819a07a。）
         let enabled_map = self.read_enabled_plugins()?;
@@ -3809,29 +3836,47 @@ pub(crate) fn split_plugin_key(key: &str) -> (String, Option<String>) {
 }
 
 /// 把一个 MCP 配置对象归一化。env 值保持 `${VAR}` 引用形态，绝不展开。
-pub(crate) fn mcp_capability(name: &str, cfg: &Value, harness: &str) -> Capability {
-    let mut env = BTreeMap::new();
-    if let Some(obj) = cfg.get("env").and_then(Value::as_object) {
-        for (k, v) in obj {
-            if let Some(s) = v.as_str() {
-                env.insert(k.clone(), s.to_string());
-            }
+/// 落地版（`c35d9c1`）是**可失败的**：第四个参数 `file` 只用于报错定位。
+/// `command` 缺键或空串都是 v1 的「没配」；`command: 5` 是故障。
+/// `args` / `env` 缺键 → 空集合；键在而类型不对、或元素/值不是字符串 → 上抛，
+/// 否则一个写坏的 `args: "mcp"` 会连内容一起被丢掉，只剩空 args 去看下一次比较。
+pub(crate) fn mcp_capability(
+    name: &str,
+    cfg: &Value,
+    harness: &str,
+    file: &Path,
+) -> anyhow::Result<Capability> {
+    let context = format!("mcp server `{name}`");
+    let cfg = expect_object(cfg, file, &context)?;
+    let command = optional_string(cfg, "command", file, &context)?
+        .map(String::from)
+        .unwrap_or_default();
+    let mut args = Vec::new();
+    if let Some(value) = cfg.get("args") {
+        for (i, element) in expect_array(value, file, &format!("{context} field `args`"))?
+            .iter()
+            .enumerate()
+        {
+            args.push(
+                expect_string(element, file, &format!("{context} field `args[{i}]`"))?.to_string(),
+            );
         }
     }
-    Capability {
+    let mut env = BTreeMap::new();
+    if let Some(value) = cfg.get("env") {
+        for (k, v) in expect_object(value, file, &format!("{context} field `env`"))? {
+            env.insert(
+                k.clone(),
+                expect_string(v, file, &format!("{context} field `env` key `{k}`"))?.to_string(),
+            );
+        }
+    }
+    Ok(Capability {
         id: CapId::new(Kind::Mcp, name.to_string()),
         origin: Origin::Adopted { harness: harness.into() },
-        spec: Spec::Mcp {
-            command: cfg.get("command").and_then(Value::as_str).unwrap_or("").to_string(),
-            args: cfg
-                .get("args")
-                .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(Value::as_str).map(String::from).collect())
-                .unwrap_or_default(),
-            env,
-        },
+        spec: Spec::Mcp { command, args, env },
         targets: Targets::All,
-    }
+    })
 }
 ```
 
@@ -4555,7 +4600,10 @@ Expected: FAIL —`read_state` 仍返回空 Vec。
 替换 `src/adapters/kimi_code.rs` 的 import 段：
 
 ```rust
-use crate::adapters::claude_code::{mcp_capability, read_json_if_present};
+use crate::adapters::claude_code::{
+    expect_array, expect_object, expect_string, mcp_capability, optional_string,
+    read_json_if_present,
+};
 use crate::adapters::{HarnessAdapter, KIMI_CODE};
 use crate::capability::{CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets};
 use crate::home::Home;
@@ -4569,13 +4617,15 @@ use std::path::PathBuf;
 ```rust
 impl KimiCode {
     fn read_mcps(&self) -> anyhow::Result<Vec<Capability>> {
-        let Some(root) = read_json_if_present(&self.home.kimi_mcp())? else {
+        let file = self.home.kimi_mcp();
+        let Some(root) = read_json_if_present(&file)? else {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
-        if let Some(servers) = root.get("mcpServers").and_then(Value::as_object) {
-            for (name, cfg) in servers {
-                out.push(mcp_capability(name, cfg, KIMI_CODE));
+        // 「没这个键」→ 空；「有键但不是对象」→ 故障（见 Task 9「形状故障也是故障」那条）。
+        if let Some(servers) = root.get("mcpServers") {
+            for (name, cfg) in expect_object(servers, &file, "key `mcpServers`")? {
+                out.push(mcp_capability(name, cfg, KIMI_CODE, &file)?);
             }
         }
         Ok(out)
