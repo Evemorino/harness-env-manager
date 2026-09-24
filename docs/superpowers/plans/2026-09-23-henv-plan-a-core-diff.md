@@ -5768,7 +5768,7 @@ git commit -m "feat: diff 纯函数，drift 豁免 plugin bundle 分发物"
 
 **Files:**
 - Create: `src/render.rs`
-- Create: `src/snapshots/henv-render__spec_example_matches_design_doc.snap`（由 insta 生成，需入库）
+- Create: `src/snapshots/henv__render__tests__spec_example_matches_design_doc.snap`（由 insta 生成，需入库）
 - Modify: `src/lib.rs`（加 `pub mod render;`）
 
 **Interfaces:**
@@ -6160,7 +6160,7 @@ fn summary(h: &HarnessPlan) -> String {
 Run: `cargo test --lib render::`
 Expected: 11 个断言测试 PASS；`spec_example_matches_design_doc` **FAIL**，报
 `snapshot assertion for 'spec_example_matches_design_doc' failed` 并写出
-`src/snapshots/henv-render__spec_example_matches_design_doc.snap.new`。
+`src/snapshots/henv__render__tests__spec_example_matches_design_doc.snap.new`。
 
 这是 insta 的正常「新快照」流程，不是 bug。先看一眼 `.snap.new` 的内容是否与
 spec §5 示例逐行对得上（除上文记录的两处有意偏离），对得上再进 Step 5。
@@ -6169,15 +6169,15 @@ spec §5 示例逐行对得上（除上文记录的两处有意偏离），对�
 
 - [ ] **Step 5: 接受快照**
 
-Run: `INSTA_UPDATE=always cargo test --lib render::spec_example`
-Expected: PASS，`.snap.new` 被改写为 `src/snapshots/henv-render__spec_example_matches_design_doc.snap`。
+Run: `INSTA_UPDATE=always cargo test --lib render::`
+Expected: PASS，`.snap.new` 被改写为 `src/snapshots/henv__render__tests__spec_example_matches_design_doc.snap`。
 
 用单条命令的 `INSTA_UPDATE` 环境变量，**不要**全局装 `cargo-insta`
 （用户约束：不做侵入式全局安装，环境变量只作用于一条命令）。
 
 - [ ] **Step 6: 校验快照内容**
 
-Run: `cat src/snapshots/henv-render__spec_example_matches_design_doc.snap`
+Run: `cat src/snapshots/henv__render__tests__spec_example_matches_design_doc.snap`
 Expected: 头部是 insta 的 `--- / source / expression` 元信息，正文精确为：
 
 ```text
