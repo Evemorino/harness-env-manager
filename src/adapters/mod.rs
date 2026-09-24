@@ -120,6 +120,13 @@ mod tests {
         let reg = registry(&t.home);
         assert!(lookup(&reg, "codex").is_some());
         assert!(lookup(&reg, "cursor").is_none());
+        // 大小写敏感的精确匹配：`manifest` 侧的 `KNOWN_HARNESSES.contains` 是精确串
+        // 比较，这里若放宽成 `eq_ignore_ascii_case`，`Codex` 就能穿过 lookup 进到报告
+        // 行标签里，两处的判定却还互不一致（变异实测：只留前两行的话该放宽能活下来）。
+        assert!(
+            lookup(&reg, "Codex").is_none(),
+            "lookup 必须按精确串匹配，否则与 manifest 的 targets 校验不一致"
+        );
     }
 
     #[test]
@@ -160,5 +167,27 @@ mod tests {
             let caps = a.read_state().expect("missing config must not be an error");
             assert!(caps.is_empty(), "{} returned {:?}", a.name(), caps);
         }
+    }
+
+    /// Plan A 全程只读：`detect` 就是「目录在不在」这一个检查，`read_state` 只往里看。
+    /// 上面那组 detect 测试**拦不住**一个顺手建目录的实现——`create_dir_all(..).is_ok()`
+    /// 调用完自己就把 `is_dir` 变成正，于是「空 home 上 detect 为假」那条断言是在给
+    /// 上一次调用擦过的地板作证。这里直接查注入 root 的目录项，把「什么都没留下」钉死。
+    /// Task 9-11 往 `read_state` 里填真实扫描时，这条是同一道闸门。
+    #[test]
+    fn detect_and_read_state_leave_the_injected_root_untouched() {
+        let t = TempHome::new();
+        for a in registry(&t.home) {
+            let _ = a.detect();
+            let _ = a.read_state().expect("missing config must not be an error");
+        }
+        let left: Vec<std::ffi::OsString> = std::fs::read_dir(t.home.root())
+            .expect("injected root still exists")
+            .map(|e| e.expect("read_dir entry").file_name())
+            .collect();
+        assert!(
+            left.is_empty(),
+            "adapter 在注入的 root 下留下了东西：{left:?}"
+        );
     }
 }
