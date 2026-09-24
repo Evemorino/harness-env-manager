@@ -993,7 +993,10 @@ mod tests {
     /// 不是认可合并是对的：合并留下哪条由 serde_json `Map` 的键序（BTreeMap，未开
     /// `preserve_order`）+ 稳定排序决定，所以是可复现的。真要区分两个 marketplace 得把
     /// 它纳入 `CapId`，那是 Task 13/14 的裁决，不在 Task 9。
-    /// 变异实测：删掉 `dedup_by` 那行，红的只有这一条（`dups.len()` 变成 2）。
+    /// 变异实测（第二轮在 178 条套件上重跑 6 次，结果一致）：删掉 `dedup_by` 那行，红的只有
+    /// 这一条（`dups.len()` 变成 2）。`output_is_sorted_and_deduplicated_by_id` 不看守这一步：
+    /// 它的 fixture 四条 id 互不相等，删掉 dedup 它照样绿——所以「去重真的发生了」这件事
+    /// 只有本条在钉。
     #[test]
     fn same_entry_name_from_two_marketplaces_collapses_to_one_capability() {
         let t = TempHome::new();
@@ -1677,10 +1680,10 @@ mod tests {
     /// 「已启用」。
     /// 为什么不改成上抛（上一轮的裁决，本轮只补名字）：卸载残留和预写的开关键在健康配置里
     /// 是正常状态，「匹配不上就失败」会把健康配置判成读不出来。实测把 `gate_enabled` 换成
-    /// 「两次查找都落空就 bail」这种过度修复，红的是本条和
-    /// `reads_plugin_with_sha_and_marketplace`（superpowers 没被门禁列出）两条；
+    /// 「两次查找都落空就 bail」这种过度修复，红的正是本条和
+    /// `reads_plugin_with_sha_and_marketplace`（`superpowers` 压根没被门禁列出）两条；
     /// `an_enable_gate_for_a_plugin_that_is_not_installed_is_ignored` 在那个变异下**仍绿**——
-    /// 它钉的是「匹配不上的门禁键不产出能力」，那种键根本走不到 `gate_enabled`。
+    /// 它钉的是「匹配不上的门禁键不产出一条能力」，那种键根本走不到 `gate_enabled`。
     /// 真正的治法是把「没被任何安装记录消费的门禁键」做成 Task 13/14 的**报告项**。
     #[test]
     fn a_mis_typed_full_gate_key_silently_reads_as_enabled() {
