@@ -10,12 +10,15 @@ impl Home {
     /// 测试路径专用的不可失败构造器。**会吞错**：对 canonicalize 的任何失败都静默
     /// 回退原路径，不区分 kind。`TempHome` 只会传 `TempDir`，它们总能 canonicalize
     /// 成功，所以测试里用它没问题；**生产入口不要用这里**，走 `try_new`／`resolve`。
+    ///
+    /// 归一化本身仍走 [`Home::try_canonicalize`]（本文件里 `fs::canonicalize` 的唯一调用
+    /// 点），只是把它的错误也一律吃掉——「吞错」是这里的契约，不是那条归一化规则的。
     pub fn new(root: impl Into<PathBuf>) -> Self {
         let raw = root.into();
         // 归一化的原因：macOS 上 /var 是 /private/var 的 symlink，而 skills_dir 用
         // fs::canonicalize 解析 skill 路径。两边形态不一致会让 classify 的前缀比较
         // 永远失配。
-        let root = std::fs::canonicalize(&raw).unwrap_or(raw);
+        let root = Self::try_canonicalize(&raw).unwrap_or(raw);
         Self { root }
     }
 
@@ -26,13 +29,29 @@ impl Home {
     /// 之所以不能一律静默回退：那会让 `Home` 揣着一个非归一化的 root 活下去，
     /// `skills_dir::classify` 的 `starts_with` 前缀比较永远失配，henv 于是报
     /// 「没有安装任何 skill」而不是启动即失败。
+    ///
+    /// 归一化规则本身在 [`Home::try_canonicalize`]，与 root 派生前缀（`skills_dir` 的
+    /// `HomePrefixes`）共用同一份实现——同一语义不允许存在两份、两套契约。
     pub fn try_new(root: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let raw = root.into();
-        match std::fs::canonicalize(&raw) {
-            Ok(canonical) => Ok(Self { root: canonical }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self { root: raw }),
-            Err(e) => Err(e)
-                .with_context(|| format!("failed to canonicalize home root {}", raw.display())),
+        let canonical = Self::try_canonicalize(&raw)
+            .with_context(|| format!("failed to canonicalize home root {}", raw.display()))?;
+        Ok(Self { root: canonical })
+    }
+
+    /// root 与 root 派生路径**共用**的归一化规则，是整个 crate 里「什么时候允许保留
+    /// 字面路径」的唯一出处：
+    ///
+    /// - `Ok(canonical)`：能解就解到与 `fs::canonicalize` 同一形态。
+    /// - 只有 `NotFound`（那一层还没建）才原样返回字面路径——「还没建的库」继续按
+    ///   字面前缀匹配，行为不变，且这条路径**不**是错误。
+    /// - 其余 kind（`PermissionDenied`/`ENOTDIR`/`ELOOP`/…）原样上抛，由调用方补自己
+    ///   的上下文：静默回退会让比较两侧退回不同形态，归类于是悄悄错成 `Other`。
+    pub(crate) fn try_canonicalize(path: &Path) -> std::io::Result<PathBuf> {
+        match std::fs::canonicalize(path) {
+            Ok(canonical) => Ok(canonical),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+            Err(e) => Err(e),
         }
     }
 

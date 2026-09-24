@@ -2268,6 +2268,10 @@ git commit -m "feat: 清单降级为归一化 Capability 流，plugin 身份用 
 **Interfaces:**
 - Consumes: `home::Home`（Task 1）
 - Produces: `SkillStore`、`SkillEntry`、`read_skill_entries`、`classify`、`plugin_from_path`
+  ⚠️ 这一行是 Task 7 落笔时的形状。D0-D5 补完之后请以文末
+  **「Task 7 追加 · 落地后的最终契约」**为准：`classify` 的第二参数已改成 `&HomePrefixes`，
+  生产入口换成 `try_read_skill_entries`，归一化规则并到了 `Home` 上。照本节转写就会把
+  D1/D3/D4 的修复装回去。
 
 这是 spec §2.1 第 4 条的落地件。实测本机存在五种形态：真实目录、相对 symlink 指向共享库、
 symlink **指回 harness**（反向）、symlink 直接进 plugin 缓存（绕过 `.agents`）、断链。
@@ -2635,6 +2639,40 @@ git commit -m "feat: skills 目录扫描，识别多跳链接/断链/来源分�
 再传进 `classify`，顺带让 `classify` 恢复纯函数、也让 D2 的裁决显式化。
 
 做完 D0-D5 后 `cargo test --lib skills_dir::` 期望 **21 tests**（现 17 + D1/D2/D4/D5 各 1）。
+
+##### Task 7 追加 · 落地后的最终契约（D0-D5 已完成；转写 Task 9/10/11/13 时照这一节抄，不要照 Step 3）
+
+- **归一化规则全 crate 只有一份，在 `Home` 上**：`Home::try_canonicalize(&Path) ->
+  std::io::Result<PathBuf>`（`pub(crate)`）——能解就用规范形态；**只有** `NotFound` 原样返回
+  字面路径（那一层还没建，字面前缀照样能匹配）；其余 kind 作为 `io::Error` 上抛，由调用方补
+  自己的上下文。`Home::try_new`、`skills_dir::HomePrefixes` 与 `Home::new`（后者只是把错误
+  也一律吃掉，仍只许测试用）三处都走它。**以后再要归一化 home 路径就调它，别再写第二份
+  `unwrap_or_else(原值)`**——D3 的根因就是两份同语义代码各按各的契约演化。
+- **`classify` 签名变了**：`classify(resolved: &Path, prefixes: &HomePrefixes) -> SkillStore`，
+  纯函数、零 IO。前缀由 `HomePrefixes::new(&Home) -> anyhow::Result<Self>` 一次算好，整次扫描
+  共用一份（→ 分类结论不再依赖「问的时机」，每条 entry 也不重复 canonicalize 四个前缀）。
+  裁决顺序 `Shared` → `PluginCache` → `HarnessLocal` → `Other` **是契约**，理由是共享库为单一
+  真源、claude 插件缓存物理上在 `~/.claude` 之内；由
+  `a_harness_dir_that_is_the_shared_store_is_classified_shared` 钉住（D2）。
+- **豁免位 == 身份位**（D1）：`is_in_plugin_cache(p) == plugin_from_path(p).is_some()`，
+  `plugins` 必须在缓存段之前。Task 13 可以放心把 `PluginCache` 当 drift 豁免位用——它不会再
+  豁免掉一个报不出 plugin 身份的路径。残留：判定只看段序列、不锚定 harness 根，所以
+  `<任意位置>/plugins/cache/<mp>/<name>/<sha>/skills/<s>` 埋在别的目录里仍算缓存（比修前窄，
+  但没有消干净）。
+- **两个扫描入口**：`try_read_skill_entries(&Path, &Home) -> anyhow::Result<Vec<SkillEntry>>`
+  是**生产入口**（Task 13 与 adapter 必须用它）；`read_skill_entries` 保留为不可失败的便利版，
+  实现是 `try_` 版 `.unwrap_or_default()`，也就是会把「读不了」吞成空表——**只给测试和只关心
+  正常数据的调用方**。新增调用点请一律走 `try_`，否则 D4 白修。
+- **静默与上抛的分界**（D4）：只有 `NotFound`（目录不存在、home 那一层还没建）可以是空结果。
+  `read_dir` 的其余 kind、逐条 list / `file_type` / `read_link` 失败、home 前缀归一化失败
+  → 全部带着路径上抛（丢一条 = 漏报，对只读工具最坏）。断链（ENOENT）与软链成环（ELOOP）
+  **仍是数据**，绝不上抛、绝不 panic：条目照常出现，`resolved: None` + `is_broken()`。
+  注：三处逐条上抛（list / stat / read_link）在本机**无法注入故障**，变异体实测存活——它们是
+  代码层面的正确形状，不是被测试钉住的规则，别当成已有覆盖，也别「顺手」改回 `continue`。
+- **`SkillEntry.path` 不归一化**（D5）：它是扫描到的磁盘位置，adapters/doctor 按它显示，也必须
+  保持原样才可 diff；两侧比较一律用 `resolved`（`path` 可能带着没解开的软链段，直接比会重新
+  踩 `/var` vs `/private/var`）。多跳解析由 `fs::canonicalize` 一次完成，两跳链的回归测试是
+  `path_stays_the_scanned_location_and_a_two_hop_chain_still_resolves`。
 
 ---
 
