@@ -218,6 +218,12 @@ pub(crate) fn read_json_if_present(path: &Path) -> anyhow::Result<Option<Value>>
 /// 纯解析半边（不存在 → `Ok(None)`，语法错 → 带路径的 Err），不校验顶层形状。
 /// 顶层形状单独一步，是为了让报错里的「top level must be an object」和解析失败
 /// 的「failed to parse」是两条可分别看守的故障。
+///
+/// `with_context` 留下的 cause 为什么不会漏值：`serde_json::Error` 的 `Display` 实测
+/// （1.0.151）只有「原因文本 + line/column」，不含源码，所以整条链渲染出来也没有原文。
+/// 这与 `toml::de::Error` **相反**——后者逐字回显出错行，codex 侧因此只取
+/// `Error::message()`（见 `adapters::codex::read_config`）。**不要在下面拼接任何文档原文**，
+/// 门是 `a_json_parse_failure_never_echoes_the_offending_line`。
 fn read_json_value_if_present(path: &Path) -> anyhow::Result<Option<Value>> {
     match std::fs::read_to_string(path) {
         Ok(text) => {
@@ -967,6 +973,53 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains(".claude.json"), "{err}");
+    }
+
+    /// `toml::de::Error` 在 Task 10 实测**逐字回显出错那一行的源码**（`2 | TOKEN = "sk-live-…"`），
+    /// 而本文件 `read_json_value_if_present` 的 `.with_context(..)` 把 `serde_json::Error`
+    /// 原样留在 cause 链里、Task 15 的 CLI 又打算打印整条链——所以「JSON 侧不回显」在此之前
+    /// 只是一条**没人测过的假设**。本条把它变成门。
+    /// 实测结果（serde_json 1.0.151）：`Display` 只给「原因文本 + line/column」，不含源码，
+    /// 所以本条**通过**；它把「不回显」钉成回归门槛——解析器哪天改口、或有人把出错行拼进
+    /// 报错，这条就红。
+    /// 通过**不等于**「JSON 路径一般安全」：真正撑着这件事的是本仓一律解成无类型 `Value`
+    /// （带类型的 derive 反序列化会产出 serde 的 `invalid type: string "…"`，那里面就是值），
+    /// 而不是 serde_json 客气。
+    /// 断言渲染用 `{:#}` 与 `{:?}`：`to_string()` 只有首行，`with_context` 管不住 cause，
+    /// 只看首行会漏掉整条链（同一条教训见 codex 的
+    /// `a_toml_parse_failure_never_echoes_the_offending_line`）。
+    #[test]
+    fn a_json_parse_failure_never_echoes_the_offending_line() {
+        let t = TempHome::new();
+        // 密钥就写在**出错那一行**上：值没加引号，解析器停下来的位置正是 `sk-live-…`。
+        t.write(
+            ".claude.json",
+            "{\n  \"mcpServers\": {\n    \"ctx\": { \"env\": { \"TOKEN\": sk-live-9f3a2b7c } }\n  }\n}\n",
+        );
+        let err = ClaudeCode::new(t.home.clone())
+            .read_state()
+            .expect_err("语法坏的 .claude.json 必须是故障");
+        // `TOKEN` 是那行上的键名：形状故障的报错允许带键名，但这条坏在**解析之前**，
+        // 任何回显原文（整行还是半个 token 都一样）都会把它带出来。
+        for rendered in [format!("{err:#}"), format!("{err:?}")] {
+            assert!(
+                !rendered.contains("sk-live-9f3a2b7c"),
+                "整条报错链都不得带出原值：{rendered}"
+            );
+            assert!(
+                !rendered.contains("TOKEN"),
+                "报错不得回显出错那一行的原文：{rendered}"
+            );
+            // 路径与解析器自己的原因文本都还得在——不回显不能降级成一句「解析失败」。
+            assert!(
+                rendered.contains(&t.path(".claude.json").display().to_string()),
+                "报错必须点明是哪个文件：{rendered}"
+            );
+            assert!(
+                rendered.contains("expected value"),
+                "报错必须留下解析器给的原因文本：{rendered}"
+            );
+        }
     }
 
     #[test]
