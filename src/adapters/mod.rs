@@ -281,7 +281,10 @@ mod tests {
 
     /// `.claude` 是一个**普通文件**或**断链**时，`exists()` 也返回 true，于是 detect 声称
     /// 「装了 claude」，紧接着 `read_state` 交出空表——「没装」和「装了但读不出」重新变得
-    /// 不可区分，这正是 D4 在 scanner 侧刚消掉的形状。detect 只认目录。
+    /// 不可区分，这正是 D4 在 scanner 侧刚消掉的形状。契约是 detect **不得**用 `exists()`，
+    /// 而按实际承载配置的位置区分目录与文件：harness 可以经由文件探测，只要那确实是它的
+    /// 配置所在（claude 的 MCP 在 `~/.claude.json`），但必须 `is_dir()` / `is_file()`，不能
+    /// 只看「存在」。
     #[test]
     fn detect_rejects_a_regular_file_at_the_harness_path() {
         let t = TempHome::new();

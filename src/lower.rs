@@ -38,10 +38,13 @@ fn expand_tilde(raw: &str) -> PathBuf {
 
 /// 只读 `HENV_HOME` / `HOME` 环境变量，不碰文件系统——`lower` 全程无 IO，所以这里不能走
 /// `Home::resolve()`（它对 root 做 `canonicalize`，那是文件系统调用）。优先级与
-/// `Home::resolve()` 一致：`HENV_HOME` 优先，其次 `HOME`。这是全局约束「一律经 `Home`」
-/// 的唯一例外，且是刻意的：Plan B 若给 `lower` 引入 IO，届时改为接收已解析的 root。
+/// `Home::resolve()` 一致：`HENV_HOME` 优先，其次 `HOME`；空的 `HENV_HOME` 落到 `HOME`
+/// 而不是顶掉它（`lower` 不返回 `Result`，没法照搬 `Home::resolve()` 的硬报错，退化成
+/// 下一个来源）。这是全局约束「一律经 `Home`」的唯一例外，且是刻意的：Plan B 若给
+/// `lower` 引入 IO，届时改为接收已解析的 root。
 fn home_from_env() -> Option<PathBuf> {
     std::env::var_os("HENV_HOME")
+        .filter(|v| !v.is_empty())
         .or_else(|| std::env::var_os("HOME"))
         .map(PathBuf::from)
 }
