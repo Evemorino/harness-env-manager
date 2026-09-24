@@ -1408,23 +1408,39 @@ mod tests {
         }
     }
 
-    /// `args` / `env` 是「缺键 = 空集合」的可选字段，所以 `null` 也读成空集合。
-    /// 两个字段是**两个**独立站点，各自换回 `expect_*` 都要红这里。
+    /// `args` 是「缺键 = 空集合」的可选字段，所以 `args: null` 读成空 args。
+    /// 与下一条是**两个**独立站点（keep-one 实测：本条只对 `args` 换回 `expect_array` 起反应，
+    /// `env` 那侧的退化只红下一条），合并成一条就会让一次 `.expect` 同时替两个站点背书。
     #[test]
-    fn a_null_mcp_args_or_env_field_reads_as_an_empty_collection() {
+    fn a_null_mcp_args_field_reads_as_an_empty_args_list() {
         let t = TempHome::new();
         t.write(
             ".claude.json",
-            r#"{ "mcpServers": { "m": { "command": "c", "args": null, "env": null } } }"#,
+            r#"{ "mcpServers": { "m": { "command": "c", "args": null } } }"#,
         );
         let caps = ClaudeCode::new(t.home.clone())
             .read_state()
-            .expect("`args: null` / `env: null` 是没配，不是形状故障");
+            .expect("`args: null` 是没配 args，不是形状故障");
         match &find(&caps, Kind::Mcp, "m").unwrap().spec {
-            Spec::Mcp { args, env, .. } => {
-                assert!(args.is_empty(), "{args:?}");
-                assert!(env.is_empty(), "{env:?}");
-            }
+            Spec::Mcp { args, .. } => assert!(args.is_empty(), "{args:?}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `env` 那一侧的同一分界：`env: null` = 没有环境变量，不是故障；
+    /// `env: [ [ "K", "V" ] ]` 才是故障（`a_non_object_mcp_env_is_an_error_naming_the_server_and_field`）。
+    #[test]
+    fn a_null_mcp_env_field_reads_as_an_empty_env_map() {
+        let t = TempHome::new();
+        t.write(
+            ".claude.json",
+            r#"{ "mcpServers": { "m": { "command": "c", "env": null } } }"#,
+        );
+        let caps = ClaudeCode::new(t.home.clone())
+            .read_state()
+            .expect("`env: null` 是没配 env，不是形状故障");
+        match &find(&caps, Kind::Mcp, "m").unwrap().spec {
+            Spec::Mcp { env, .. } => assert!(env.is_empty(), "{env:?}"),
             other => panic!("{other:?}"),
         }
     }
