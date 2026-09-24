@@ -1,11 +1,13 @@
 use crate::adapters::{CLAUDE_CODE, HarnessAdapter};
-use crate::capability::{CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets};
+use crate::capability::{
+    CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets, normalize_locator,
+};
 use crate::home::Home;
 use crate::skills_dir::{SkillStore, plugin_from_path, try_read_skill_entries};
 use anyhow::Context;
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub struct ClaudeCode {
     home: Home,
@@ -71,6 +73,74 @@ impl ClaudeCode {
         }
         Ok(out)
     }
+
+    /// plugin 的**安装记录**在 `~/.claude/plugins/installed_plugins.json`（键是
+    /// `name@marketplace`，值是安装数组），**门禁**在 settings.json 的 `enabledPlugins`。
+    /// 一个键可能对应多条安装（实测就是数组），v1 只取第一条；空数组 = 没装成，跳过。
+    fn read_plugins(&self) -> anyhow::Result<Vec<Capability>> {
+        let Some(root) = read_json_if_present(&self.home.claude_installed_plugins())? else {
+            return Ok(Vec::new());
+        };
+        // 门禁读不出来就是读不出来：退化成「全部 enabled」会把用户关掉的 plugin 报成
+        // 已启用，正是失败隔离契约禁止的那种「看起来合理」的假同步。
+        let enabled_map = self.read_enabled_plugins()?;
+
+        let mut out = Vec::new();
+        let plugins = root.get("plugins").and_then(Value::as_object);
+        for (key, installs) in plugins.into_iter().flatten() {
+            let (entry, marketplace) = split_plugin_key(key);
+            let Some(install) = installs.as_array().and_then(|a| a.first()) else {
+                continue;
+            };
+            let enabled = enabled_map.get(key).copied().unwrap_or(true);
+            out.push(Capability {
+                id: CapId::new(Kind::Plugin, entry.clone()),
+                origin: Origin::Adopted {
+                    harness: CLAUDE_CODE.into(),
+                },
+                spec: Spec::Plugin {
+                    marketplace,
+                    entry,
+                    version: normalize_locator(install.get("version").and_then(Value::as_str)),
+                    sha: normalize_locator(install.get("gitCommitSha").and_then(Value::as_str)),
+                    install_path: install
+                        .get("installPath")
+                        .and_then(Value::as_str)
+                        .map(PathBuf::from),
+                    enabled,
+                },
+                targets: Targets::All,
+            });
+        }
+        Ok(out)
+    }
+
+    /// settings.json 的 enabledPlugins 是门禁；installed_plugins.json 才是安装记录。
+    /// 没列出的 key 默认启用（未列 = 未表态）。
+    fn read_enabled_plugins(&self) -> anyhow::Result<BTreeMap<String, bool>> {
+        let Some(root) = read_json_if_present(&self.home.claude_settings())? else {
+            return Ok(BTreeMap::new());
+        };
+        let mut out = BTreeMap::new();
+        if let Some(obj) = root.get("enabledPlugins").and_then(Value::as_object) {
+            for (k, v) in obj {
+                // 非布尔的门禁值是坏数据，不是「没表态」：猜成 true 就是假同步。
+                let Some(b) = v.as_bool() else {
+                    anyhow::bail!(
+                        "failed to parse enabledPlugins entry {k}: expected a boolean, found {}",
+                        match v {
+                            Value::Null => "null",
+                            Value::String(_) => "a string",
+                            Value::Number(_) => "a number",
+                            _ => "a container",
+                        }
+                    );
+                };
+                out.insert(k.clone(), b);
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl HarnessAdapter for ClaudeCode {
@@ -85,6 +155,7 @@ impl HarnessAdapter for ClaudeCode {
     fn read_state(&self) -> anyhow::Result<Vec<Capability>> {
         let mut caps = self.read_skills()?;
         caps.extend(self.read_mcps()?);
+        caps.extend(self.read_plugins()?);
         Ok(caps)
     }
 
@@ -106,6 +177,16 @@ pub(crate) fn read_json_if_present(path: &Path) -> anyhow::Result<Option<Value>>
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(anyhow::Error::new(e).context(format!("failed to read {}", path.display()))),
+    }
+}
+
+/// `"superpowers@claude-plugins-official"` → `("superpowers", Some("claude-plugins-official"))`
+///
+/// 只有 claude 需要拆：kimi 的 `installed.json` 是数组、身份直接躺在 `id` 字段里（Task 11）。
+pub(crate) fn split_plugin_key(key: &str) -> (String, Option<String>) {
+    match key.split_once('@') {
+        Some((entry, mp)) => (entry.to_string(), Some(mp.to_string())),
+        None => (key.to_string(), None),
     }
 }
 
@@ -154,6 +235,7 @@ mod tests {
     use super::*;
     use crate::capability::{Kind, Origin, SkillSource, Spec, Targets};
     use crate::testutil::TempHome;
+    use std::path::PathBuf;
 
     fn find<'a>(caps: &'a [Capability], kind: Kind, name: &str) -> Option<&'a Capability> {
         caps.iter().find(|c| c.id.kind == kind && c.id.name == name)
@@ -357,5 +439,182 @@ mod tests {
         );
         let caps = ClaudeCode::new(t.home.clone()).read_state().unwrap();
         assert!(find(&caps, Kind::Mcp, "m").is_some());
+    }
+
+    #[test]
+    fn reads_plugin_with_sha_and_marketplace() {
+        let t = TempHome::new();
+        t.write(
+            ".claude/plugins/installed_plugins.json",
+            r#"{
+              "version": 2,
+              "plugins": {
+                "superpowers@claude-plugins-official": [
+                  { "scope": "user",
+                    "installPath": "/Users/x/.claude/plugins/cache/claude-plugins-official/superpowers/6.4.1",
+                    "version": "6.4.1",
+                    "installedAt": "2026-08-26T15:19:21.589Z",
+                    "lastUpdated": "2026-09-23T00:37:36.131Z",
+                    "gitCommitSha": "b36e0829c6d0140e93cfef2ca599b1b07d4a7797" }
+                ],
+                "context7@claude-plugins-official": [
+                  { "scope": "user", "installPath": "/p/context7", "version": "db467cc56673" }
+                ]
+              }
+            }"#,
+        );
+        t.write(
+            ".claude/settings.json",
+            r#"{ "enabledPlugins": { "context7@claude-plugins-official": false } }"#,
+        );
+
+        let caps = ClaudeCode::new(t.home.clone()).read_state().unwrap();
+        let sp = find(&caps, Kind::Plugin, "superpowers").expect("identity is the entry name");
+        assert_eq!(
+            sp.spec,
+            Spec::Plugin {
+                marketplace: Some("claude-plugins-official".into()),
+                entry: "superpowers".into(),
+                version: Some("6.4.1".into()),
+                sha: Some("b36e0829c6d0140e93cfef2ca599b1b07d4a7797".into()),
+                install_path: Some(PathBuf::from(
+                    "/Users/x/.claude/plugins/cache/claude-plugins-official/superpowers/6.4.1"
+                )),
+                enabled: true,
+            }
+        );
+
+        let c7 = find(&caps, Kind::Plugin, "context7").unwrap();
+        match &c7.spec {
+            Spec::Plugin {
+                enabled,
+                sha,
+                version,
+                ..
+            } => {
+                assert!(!enabled, "settings.json enabledPlugins=false must win");
+                assert_eq!(*sha, None);
+                assert_eq!(
+                    version.as_deref(),
+                    Some("db467cc56673"),
+                    "sha 形状的 version 目录名仍留在 version 字段，不猜测"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_without_sha_field_is_none_not_empty() {
+        let t = TempHome::new();
+        t.write(
+            ".claude/plugins/installed_plugins.json",
+            r#"{ "version": 2, "plugins": { "x@mp": [ { "scope": "user", "version": "1.0.0" } ] } }"#,
+        );
+        let caps = ClaudeCode::new(t.home.clone()).read_state().unwrap();
+        match &find(&caps, Kind::Plugin, "x").unwrap().spec {
+            Spec::Plugin { sha, version, .. } => {
+                assert_eq!(*sha, None);
+                assert_eq!(version.as_deref(), Some("1.0.0"));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_key_without_marketplace_suffix_still_parses() {
+        let t = TempHome::new();
+        t.write(
+            ".claude/plugins/installed_plugins.json",
+            r#"{ "version": 2, "plugins": { "solo": [ { "version": "1.0" } ] } }"#,
+        );
+        let caps = ClaudeCode::new(t.home.clone()).read_state().unwrap();
+        match &find(&caps, Kind::Plugin, "solo").unwrap().spec {
+            Spec::Plugin {
+                marketplace, entry, ..
+            } => {
+                assert_eq!(*marketplace, None);
+                assert_eq!(entry, "solo");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_install_array_is_skipped() {
+        let t = TempHome::new();
+        t.write(
+            ".claude/plugins/installed_plugins.json",
+            r#"{ "version": 2, "plugins": { "ghost@mp": [] } }"#,
+        );
+        let caps = ClaudeCode::new(t.home.clone()).read_state().unwrap();
+        assert!(find(&caps, Kind::Plugin, "ghost").is_none());
+    }
+
+    /// 派单字面代码在 `read_plugins` 里写的是
+    /// `self.read_enabled_plugins().unwrap_or_default()`（注释：「读失败不该拖垮 plugin
+    /// 扫描，退化成全部视为 enabled」）。那正是失败隔离契约禁止的形状：一个语法坏掉的
+    /// settings.json 会把用户**关掉**的 plugin 报成 `enabled: true`，diff 于是把
+    /// 「你禁用了它」念成「已同步」，而报告里没有任何地方说明 settings.json 没读成。
+    /// 所以这里上抛，并留这条测试看守（把 `?` 换回 `.unwrap_or_default()` 只红这一条）。
+    #[test]
+    fn a_malformed_settings_json_is_an_error_not_a_silent_enable_all() {
+        let t = TempHome::new();
+        t.write(
+            ".claude/plugins/installed_plugins.json",
+            r#"{ "version": 2, "plugins": { "p@mp": [ { "version": "1.0" } ] } }"#,
+        );
+        t.write(".claude/settings.json", "{ enabledPlugins: ");
+        let err = ClaudeCode::new(t.home.clone())
+            .read_state()
+            .expect_err("settings.json 语法坏了不能当成「没有任何 disabled」");
+        let msg = err.to_string();
+        assert!(msg.contains("settings.json"), "{msg}");
+    }
+
+    /// `enabledPlugins` 的门禁值只认布尔。写成字符串 `"false"` 是手改 settings.json 的常见
+    /// 笔误，猜成 `true` 又是一次假同步，所以带 plugin 键名上抛。
+    /// 报错里出现的是**键名和值的类型**，不是值本身——「活配置里的值不进产物」这条规矩
+    /// 对 settings.json 同样适用（MCP env 只是它最容易被踩的那个实例）。
+    #[test]
+    fn a_non_boolean_enable_gate_is_an_error_naming_the_plugin() {
+        let t = TempHome::new();
+        t.write(
+            ".claude/plugins/installed_plugins.json",
+            r#"{ "version": 2, "plugins": { "p@mp": [ { "version": "1.0" } ] } }"#,
+        );
+        t.write(
+            ".claude/settings.json",
+            r#"{ "enabledPlugins": { "p@mp": "false" } }"#,
+        );
+        let err = ClaudeCode::new(t.home.clone())
+            .read_state()
+            .expect_err("非布尔门禁不能猜成启用")
+            .to_string();
+        assert!(err.contains("enabledPlugins entry p@mp"), "{err}");
+        assert!(err.contains("a string"), "{err}");
+        assert!(!err.contains("false"), "报错里不得出现原值：{err}");
+    }
+
+    /// version / sha 必须过 [`normalize_locator`]：本机 `installed_plugins.json` 里就躺着
+    /// 字面量 `unknown`，不归一化的话两条 `Some("unknown")` 会命中 `compare_versions`
+    /// 的「两边都有 SHA」分支，两个真不同的构建被报成 `Same`。派单 14 条没有这个形状。
+    /// 变异实测：把 `normalize_locator(..)` 换成裸 `.and_then(Value::as_str)` 时只有这一条红
+    /// （version 与 sha 两处是**两个**独立变异体，实测各红一次，都在同一条测试里）。
+    #[test]
+    fn sentinel_version_and_sha_become_none() {
+        let t = TempHome::new();
+        t.write(
+            ".claude/plugins/installed_plugins.json",
+            r#"{ "version": 2, "plugins": { "p@mp": [ { "version": "unknown", "gitCommitSha": "" } ] } }"#,
+        );
+        let caps = ClaudeCode::new(t.home.clone()).read_state().unwrap();
+        match &find(&caps, Kind::Plugin, "p").unwrap().spec {
+            Spec::Plugin { version, sha, .. } => {
+                assert_eq!(*sha, None, "空串不是定位符");
+                assert_eq!(*version, None, "`unknown` 不是版本号");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
