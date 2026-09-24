@@ -1967,6 +1967,13 @@ degrade 表键到 `""`——于是一个报不出 plugin 身份、名字恰为�
 `source`；把检查挪进 `match s.source` 只有这条会红）。做完后 `cargo test --lib manifest::`
 期望 **29 tests**。
 
+**R2（同一轮）— `source: zip-url` 的降级形状现在被钉住了，缺口本身仍然开着。** 上面记的第四条
+Minor（zip-url 无位置字段）**不**在本轮补字段；但「不可测」不是它的理由——今天
+`plugins: {zp: {source: zip-url}}` 降成什么，是可测的，而未钉住的形状会无声漂移。
+现在由 `lower.rs` 的 `zip_url_plugin_lowers_with_no_marketplace` 钉住：
+`marketplace: None`、`entry` = 清单 key。给 zip-url 补 `url`/locator 的那天，这条测试**必须**
+跟着改（并且要在这一节记下新形状），不许让 `marketplace` 从 `None` 悄悄变成 `Some(..)`。
+
 ---
 
 ### Task 6: 清单降级为能力流（lower）
@@ -6348,3 +6355,6 @@ Task 14 的 `in_sync_summary_kinds_follow_kind_all_order` 按此顺序断言。
    **要求**：(a) `lower.rs` 里那句「只作用于实际侧」的注释是错的，实际两侧都不生效，改成
    上述准确表述；(b) `henv diff` 的输出或文档要让用户知道 `degrade` 目前只是声明性占位，
    不要让人以为写了 `skip` 就生效。真正生效点在 Plan B 拆解落地时。要门禁语义就加 `doctor --check`，别改 `diff`。
+   **进度（residual 轮）**：(a) 已落地——`lower.rs` 的 `DegradeTable` 文档现在写的是「两侧都是
+   惰性的」，并注明惰性是设计后果、不许在 `lower` 里“顺手修”。(b) **仍未做**，落在 Task 14
+   （render）：`henv diff` 的输出或文档必须让用户知道 `degrade` 目前是声明性占位。

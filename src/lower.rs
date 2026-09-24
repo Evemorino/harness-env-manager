@@ -126,8 +126,11 @@ pub fn lower(m: &Manifest) -> Vec<Capability> {
 /// plugin 名 → degrade 策略。非 plugin 来源的能力一律 Report。
 ///
 /// 键就是 [`plugin_identity`]，与 `lower` 发能力用的是同一个函数（审计 U11）。
-/// 查表只认 `Origin::Plugin`：`lower` 产出的全是 `Origin::Manifest`，实际侧（Task 8-11
-/// 的 adapter）才会带 `Origin::Plugin`，所以这张表在 Plan A 里**只作用于实际侧**。
+/// 查表只认 `Origin::Plugin`，而 Plan A 两侧各差一半、谁也吃不到它：**desired 侧**（`lower`
+/// 产出的）全是 `Origin::Manifest`，没有可命中的键；**actual 侧**的 bundle 能力带
+/// `Origin::Plugin`，但 Task 13 只对 desired 侧查表，没人来问。所以这张表在 Plan A 里
+/// **两侧都是惰性的**，`degrade: {hooks: skip}` 目前不产生任何可观察差异（计划交接决策 7）。
+/// 让策略生效是 Plan B 拆解 plugin 时的事——那是设计后果，不是这里要“顺手修掉”的 bug。
 #[derive(Debug, Clone, Default)]
 pub struct DegradeTable {
     by_plugin: BTreeMap<String, DegradePolicy>,
@@ -289,6 +292,34 @@ plugins:
                 assert_eq!(*sha, None);
                 assert_eq!(*version, None);
                 assert!(*enabled, "desired plugins are enabled by definition");
+            }
+            other => panic!("expected Plugin, got {other:?}"),
+        }
+    }
+
+    /// zip-url 源今天降成什么形状，这条就是那个形状的看守者：清单里没有任何可当**来源
+    /// 标识**的位置字段（`marketplace` / `repo` 都没有），所以 `marketplace` 是 `None`、
+    /// `entry` 回退到清单 key。
+    ///
+    /// 「zip-url 缺 url 字段」是**计划**层面的缺口（Task 5 追加已记为留给 Plan B/C），
+    /// 但缺口的存在不等于形状不可测：不钉住的话，将来补 `url` 时把 `marketplace` 从
+    /// `None` 改成 `Some(..)` 是无声漂移——golden 自洽、没有别的测试会红。
+    /// 实测变异体：`PluginSourceKind::ZipUrl => Some(entry.clone())`（给该源补一个「拿身份
+    /// 当来源标识」的 locator）→ 整套 121 个里**只有**这条报红，其余测试没有一个用 zip-url 源。
+    /// 反过来说，`=> p.entry.clone()` 是个**假变异体**：本 fixture 没写 `entry`，它照样是
+    /// `None`，两种实现下测试同色，所以不能拿它当证据。
+    /// 信号的**唯一**来源是 `marketplace` 那一行：只留 `entry` 那条断言时，上面的变异体存活。
+    /// `entry` 那一行与 `degrade_table_and_lower_share_one_plugin_identity` 的第一组重复，
+    /// 留在这里只是为了把「该源不许另起身份」写进同一个 fixture，它不额外杀变异体。
+    #[test]
+    fn zip_url_plugin_lowers_with_no_marketplace() {
+        let caps = lower(&m("version: 1\nplugins:\n  zp: { source: zip-url }\n"));
+        match &caps[0].spec {
+            Spec::Plugin {
+                marketplace, entry, ..
+            } => {
+                assert_eq!(marketplace, &None, "zip-url 没有可当来源标识的位置字段");
+                assert_eq!(entry, "zp", "身份仍是清单 key，不该被换成别的东西");
             }
             other => panic!("expected Plugin, got {other:?}"),
         }
