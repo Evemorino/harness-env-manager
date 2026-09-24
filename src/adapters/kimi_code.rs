@@ -1119,7 +1119,11 @@ mod tests {
         for kind in [Kind::Mcp, Kind::Plugin] {
             let cap = Capability::new(
                 CapId::new(kind, "x"),
-                Spec::Mcp { command: "c".into(), args: vec![], env: Default::default() },
+                Spec::Mcp {
+                    command: "c".into(),
+                    args: vec![],
+                    env: Default::default(),
+                },
             );
             assert_eq!(a.supports(&cap), Support::Native, "{kind:?}");
         }
@@ -1134,12 +1138,21 @@ mod tests {
         for kind in [Kind::Skill, Kind::Hook, Kind::Command, Kind::Agent] {
             let cap = Capability::new(
                 CapId::new(kind, "x"),
-                Spec::Hook { event: "E".into(), command: "c".into() },
+                Spec::Hook {
+                    event: "E".into(),
+                    command: "c".into(),
+                },
             );
             match a.supports(&cap) {
                 Support::Unsupported { reason } => {
-                    assert!(!reason.is_empty(), "{kind:?} needs a reason for the `!` line");
-                    assert!(reason.contains("kimi-code"), "{kind:?} reason names the harness: {reason}");
+                    assert!(
+                        !reason.is_empty(),
+                        "{kind:?} needs a reason for the `!` line"
+                    );
+                    assert!(
+                        reason.contains("kimi-code"),
+                        "{kind:?} reason names the harness: {reason}"
+                    );
                 }
                 other => panic!("{kind:?} expected Unsupported, got {other:?}"),
             }
@@ -1155,16 +1168,25 @@ mod tests {
 
         let loose = Capability::new(
             CapId::new(Kind::Skill, "my-draft"),
-            Spec::Skill { source: SkillSource::Local { path: PathBuf::from("/x") }, path: None },
+            Spec::Skill {
+                source: SkillSource::Local {
+                    path: PathBuf::from("/x"),
+                },
+                path: None,
+            },
         );
         assert!(matches!(a.supports(&loose), Support::Unsupported { .. }));
 
         // 同一个 kind，但由 bundle 携带 → 随原生 plugin 安装一起落地
         let bundled = Capability {
             id: CapId::new(Kind::Skill, "brainstorming"),
-            origin: Origin::Plugin { name: "superpowers".into() },
+            origin: Origin::Plugin {
+                name: "superpowers".into(),
+            },
             spec: Spec::Skill {
-                source: SkillSource::PluginBundle { plugin: "superpowers".into() },
+                source: SkillSource::PluginBundle {
+                    plugin: "superpowers".into(),
+                },
                 path: None,
             },
             targets: Targets::All,
@@ -1180,8 +1202,13 @@ mod tests {
         let a = KimiCode::new(t.home.clone());
         let bundled_hook = Capability {
             id: CapId::new(Kind::Hook, "superpowers:session-start"),
-            origin: Origin::Plugin { name: "superpowers".into() },
-            spec: Spec::Hook { event: "SessionStart".into(), command: "run-hook".into() },
+            origin: Origin::Plugin {
+                name: "superpowers".into(),
+            },
+            spec: Spec::Hook {
+                event: "SessionStart".into(),
+                command: "run-hook".into(),
+            },
             targets: Targets::All,
         };
         assert_eq!(a.supports(&bundled_hook), Support::Native);

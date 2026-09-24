@@ -1923,7 +1923,12 @@ mod tests {
         let t = TempHome::new();
         let a = ClaudeCode::new(t.home.clone());
         for kind in Kind::all() {
-            let cap = Capability::new(CapId::new(kind, "x"), Spec::Command { path: PathBuf::from("/x") });
+            let cap = Capability::new(
+                CapId::new(kind, "x"),
+                Spec::Command {
+                    path: PathBuf::from("/x"),
+                },
+            );
             assert_eq!(a.supports(&cap), Support::Native, "{kind:?}");
         }
     }

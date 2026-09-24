@@ -258,10 +258,7 @@ mod tests {
             let cap = cap_of_kind(kind);
             for a in &reg {
                 let is_kimi_loose = a.name() == KIMI_CODE
-                    && matches!(
-                        kind,
-                        Kind::Skill | Kind::Hook | Kind::Command | Kind::Agent
-                    );
+                    && matches!(kind, Kind::Skill | Kind::Hook | Kind::Command | Kind::Agent);
                 if is_kimi_loose {
                     assert!(
                         matches!(a.supports(&cap), Support::Unsupported { .. }),
