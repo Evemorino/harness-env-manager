@@ -3340,33 +3340,54 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
 
 **Interfaces:**
 - Consumes: `Home::{claude_skills, claude_json, claude_installed_plugins, claude_settings}`、`skills_dir::{try_read_skill_entries, plugin_from_path, SkillStore}`、`capability::*`
-- Produces: `ClaudeCode::read_state()`；以及三个 `pub(crate)` 工具 `read_json_if_present`、
-  `split_plugin_key`、`mcp_capability`。Task 11 的 kimi adapter 复用 `read_json_if_present`
-  与 `mcp_capability`；`split_plugin_key` 只 claude 用（kimi 的 `installed.json` 是数组、
-  身份在 `id` 字段里，不需要拆 `name@marketplace`）。
-  **落地后的签名（Task 9 修复轮 `c35d9c1`；本节下面的示例代码是修复前的形状，照代码不要照示例）：**
-  `read_json_if_present(&Path) -> Result<Option<Value>>` 保证返回的文档**是对象**（顶层
-  不是对象 = 形状故障）；只有 claude 与 kimi 两家走 JSON，**codex 读 TOML，两个 helper 都不复用**。
-  `mcp_capability(name, cfg, harness, file) -> Result<Capability>` 现在是**可失败的**，
-  第四个参数只用于报错定位（调用方自己的那个 JSON 文件），`command` / `args` / `env`
-  的「键在但类型不对」由它上抛。
+- Produces: `ClaudeCode::read_state()`。跨 adapter 复用的 `pub(crate)` 面（**可见性已按 `fee8dd3`
+  逐个核过，别再照记忆写**）：`read_json_if_present`、`split_plugin_key`、`mcp_capability`，
+  以及**六个**形状原语 `expect_object` / `expect_array` / `expect_string` /
+  `optional_string` / `optional_object` / `optional_array`。
+  **模块私有、拿不到的**：`gate_enabled`、`type_name`、`shape_fault`、`read_json_value_if_present`
+  ——它们是 claude 自己的门禁与报错细节；原语内部会调用它们，所以外部只用原语就够，
+  **不要**试图 import 这四个。
+  `split_plugin_key` 只 claude 用（kimi 的 `installed.json` 是数组、身份在 `id` 字段里，
+  不需要拆 `name@marketplace`）。
 
-  配套的**四个**形状原语 `expect_object` / `expect_array` / `expect_string` / `optional_string`
-  定义在 `claude_code.rs`。**可见性是个真问题，不是文风问题**：`c35d9c1` 落地时它们是模块私有的
-  `fn`，所以本段先前那句「照它们写，别另建一套」对 Task 11 不可执行——它要么复制一份（正是那句话
-  禁止的），要么等它们被提升。Task 9 第二轮修复负责把四者提升为 `pub(crate)`；
-  **在那之前不要复制**，改用自己的 `pub(crate)` 提升并提交即可。
+  六个原语的精确签名（`fee8dd3`，照这个写调用，别猜）：
+
+  ```rust
+  // 「值必须存在且类型对」——参数是 &Value，缺失到不了这里
+  fn expect_object<'a>(value: &'a Value,  file: &Path, what: &str) -> anyhow::Result<&'a Map<String, Value>>
+  fn expect_array <'a>(value: &'a Value,  file: &Path, what: &str) -> anyhow::Result<&'a Vec<Value>>
+  fn expect_string<'a>(value: &'a Value,  file: &Path, what: &str) -> anyhow::Result<&'a str>
+  // 「可以缺失」——注意两类参数形状**不一样**，这是最容易写错的地方：
+  fn optional_string<'a>(obj: &'a Map<String, Value>, key: &str, file: &Path, context: &str)
+      -> anyhow::Result<Option<&'a str>>          // 收「表 + 键名」
+  fn optional_object<'a>(value: Option<&'a Value>, file: &Path, what: &str)
+      -> anyhow::Result<Option<&'a Map<String, Value>>>;  // 收「Option<&Value>」
+  fn optional_array  <'a>(value: Option<&'a Value>, file: &Path, what: &str)
+      -> anyhow::Result<Option<&'a Vec<Value>>>;          // 同上
+  ```
+
+  也就是说 `optional_object(root.get("plugins"), &file, "key `plugins`")?` 直接接 `root.get(..)`，
+  而 `optional_string(install, "version", &file, &context)?` 接的是**表**加键名。
+  三个 `optional_*` 都把「缺键」和「显式 `null`」同样读成 `Ok(None)`。
+
+  **签名**（本节下面的示例已按 `fee8dd3` 的落地形态逐字改过，两者应当一致；若不一致以源码为准并回报差异）：
+  `read_json_if_present(&Path) -> Result<Option<Value>>` 保证返回的文档**是对象**（顶层不是对象 =
+  形状故障）；只有 claude 与 kimi 两家走 JSON，**codex 读 TOML，这些 helper 一个都不复用**。
+  `mcp_capability(name, cfg, harness, file) -> Result<Capability>` 是**可失败的**，第四个参数只用于
+  报错定位（调用方自己的那个 JSON 文件）。
 
   两条不变式（各家都要守）：`expect_*` 收的是 `&Value` 而**不是** `Option<&Value>`，所以「键缺失」
-  根本到不了它们那里——缺失一律由调用方的 `Option` 分支裁决为正常状态。`optional_string` 是**唯一**
-  看见缺失的那个，它返回 `Ok(None)`，并且把显式 `null` 也当作缺键。
+  根本到不了它们那里。`optional_*` 三兄弟才是「缺失可为正常」的那一侧：**键缺失或值为显式
+  `null`** 一律 `Ok(None)`；有值但类型不对仍上抛。
+  **强制位置的 `null` 仍是故障**：数组元素（`args: [null]`、`{"p@mp": [null]}`）不是「没配」，
+  是坏值——所以 `plugins` 的每条键用 `expect_array` 而**不是** `optional_array`，理由写在
+  `read_plugins` 的注释里。`type_name` 的 `"null"` 分支因此必须保持可达，并由一条数组元素测试钉住。
 
-  **本节下面还没改完的示例（截至 `9bcbc71`，读示例前先看清）**：`read_mcps` 与 `mcp_capability`
-  两处已按落地形态改正；**`read_plugins` 与 `read_enabled_plugins` 两段仍是修复前的形状**
-  （`root.get("plugins").and_then(Value::as_object)` 的塌缩、`installs.as_array().and_then(first)`
-  把「不是数组」和「空数组」混为一谈）。权威形态在 `src/adapters/claude_code.rs:86-152`。
-  这里不趁手抄一遍是刻意的：第二轮要按上面那条 `null` 裁决再改同一批函数，现在抄完立刻又过期。
-  **Task 11 复用这两个形状时，读源码，别读本节示例。**
+  **Task 11 会撞上的一个空洞（现在就说明，别让它自己发现）**：kimi 的每条记录带 `enabled` 布尔，
+  而 claude 那边同类判定用的是私有的 `gate_enabled` + `type_name`，`expect_*` 里**没有布尔版**。
+  直接写 `.and_then(Value::as_bool).unwrap_or(true)` 就是本计划刚判定为 Critical 的那个塌缩。
+  正确做法：给这六个原语补第七个 `expect_bool`（同样 `pub(crate)`、同样只报类型不报值），
+  在 Task 11 的 commit 里一并落地并写回本节。
 
 实测数据形状（本机 2026-09-23 盘点，即测试 fixture 的依据）：
 
@@ -3392,7 +3413,8 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
 范围限定：只读**用户级** MCP（`~/.claude.json` 顶层）。`projects.*.mcpServers` 是项目级，
 不在 v1 范围（spec §1 非目标）。
 
-> **形状故障也是故障（Task 9 评审发现的 Critical，Task 10/11 同样适用）。**
+> **形状故障也是故障（Task 9 评审发现的 Critical；claude 侧已在 `c35d9c1`+`eab428e` 落地，
+> Task 10/11 同样适用）。**
 > `if let Some(x) = root.get("k").and_then(Value::as_object)` 在「键根本不存在」和「键存在但类型不对」
 > 两种情况下**都**走空分支——于是 `{"mcpServers": []}`、`{"plugins": "oops"}`、
 > `{"g@mp": "notarray"}` 这类写坏的配置被报成「这个 harness 没配任何能力」，正是失败隔离契约
@@ -3403,16 +3425,16 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
 > 键在但类型不对 → `bail!` 带**文件路径 + 键名 + 期望类型**（不带值，值可能是密钥）。
 > 只有「类型对且为空」才是合法的 `Ok(空)`。
 >
-> **`null` 的裁决（Task 9 第二轮补，逐层一致）：** 容器层的显式 `null` 与缺键同义——
+> **`null` 的裁决（已按此落地于 `eab428e`，逐层一致）：** 容器层的显式 `null` 与缺键同义——
 > `{"mcpServers": null}`、`{"plugins": null}`、`{"enabledPlugins": null}` 都是「没配」，返回空结果，
 > **不是**故障。理由就是 `optional_string` 对叶子层已经给过的那条：JSON 里写 `null` 常是「无」的
 > 表示法；叶子判缺失、容器判故障，是同一份配置里两种互相矛盾的读法。
-> 但**数组元素**里的 `null`（`args: [null]`）仍是故障：它不是「没配」，是一个写坏的值。
-> 因此 `type_name` 的 `"null"` 分支必须仍然可达，并由一条 `args` 元素测试钉住——不要因为它在容器层
-> 不可达就删掉。
-> 同一个形状也出现在 `mcp_capability` 里 `env` 的 `Value::as_object` 与 `args` 的
-> `Value::as_array` + `unwrap_or_default()`：非对象的 `env`、非数组的 `args` 现在静默丢数据
-> （连键名一起丢），至少要不钉住、最好同样上抛。
+> 但**数组元素**里的 `null`（`args: [null]`、`{"p@mp": [null]}`）仍是故障：它不是「没配」，是坏值——
+> 所以 `read_plugins` 的每条键用 `expect_array` 而不是 `optional_array`。
+> `type_name` 的 `"null"` 分支因此保持可达，并由一条数组元素测试钉住（不要因为它在容器层不可达就删）。
+>
+> `mcp_capability` 里的 `env` / `args` 同一个形状也已改成上抛（`c35d9c1`）：非对象的 `env`、
+> 非数组的 `args`、以及**元素或值不是字符串**现在都是故障，不再静默丢数据。
 
 - [ ] **Step 1: 写失败的测试**
 
@@ -3745,48 +3767,73 @@ impl ClaudeCode {
     }
 
     /// 用户级 MCP 在 ~/.claude.json 顶层 mcpServers（spec §2.1 第 1 条）。
+    /// `projects.*.mcpServers` 是项目级，v1 不读（spec §1 非目标）。
     fn read_mcps(&self) -> anyhow::Result<Vec<Capability>> {
         let file = self.home.claude_json();
         let Some(root) = read_json_if_present(&file)? else {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
-        // 「没有 mcpServers 这个键」→ 空表（正常状态）；「有键但不是对象」→ 故障上抛。
-        // 用 `if let Some(x) = root.get(..).and_then(Value::as_object)` 会把两者合并成同一个
-        // 空分支，于是 `{"mcpServers": []}` 被报成「没配任何 MCP」——假同步。
-        if let Some(servers) = root.get("mcpServers") {
-            for (name, cfg) in expect_object(servers, &file, "key `mcpServers`")? {
+        // 「没有 mcpServers 这个键」和「它的值是显式 `null`」→ 空表（正常状态）；
+        // 键在、值既不是 `null` 也不是对象 → 故障上抛。前者用户就是没配 MCP，后者是配置
+        // 写坏了——报成「没配任何 MCP」正是「形状故障也是故障」那块点名的假同步。
+        if let Some(servers) = optional_object(root.get("mcpServers"), &file, "key `mcpServers`")? {
+            for (name, cfg) in servers {
                 out.push(mcp_capability(name, cfg, CLAUDE_CODE, &file)?);
             }
         }
         Ok(out)
     }
 
+    /// plugin 的**安装记录**在 `~/.claude/plugins/installed_plugins.json`（键是
+    /// `name@marketplace`，值是安装数组），**门禁**在 settings.json 的 `enabledPlugins`。
+    /// 一个键可能对应多条安装（实测就是数组），v1 只取第一条；空数组 = 没装成，跳过。
+    /// `"plugins": null` 与缺键同为「一个都没装」（容器层 `null` 裁决，见 `optional_object`）。
     fn read_plugins(&self) -> anyhow::Result<Vec<Capability>> {
-        let Some(root) = read_json_if_present(&self.home.claude_installed_plugins())? else {
+        let file = self.home.claude_installed_plugins();
+        let Some(root) = read_json_if_present(&file)? else {
             return Ok(Vec::new());
-        };        // 门禁读不出来就是读不出来：退化成「全部 enabled」会把用户关掉的 plugin 报成已启用，
-        // 正是失败隔离契约禁止的那种「看起来合理」的假同步。（落地版用 `?`；本节先前这里写的是
-        // `unwrap_or_default()` 加相反的理由，与代码和契约都矛盾——已按代码改正，见 819a07a。）
+        };
+        // 门禁读不出来就是读不出来：退化成「全部 enabled」会把用户关掉的 plugin 报成
+        // 已启用，正是失败隔离契约禁止的那种「看起来合理」的假同步。
         let enabled_map = self.read_enabled_plugins()?;
 
         let mut out = Vec::new();
-        let plugins = root.get("plugins").and_then(Value::as_object);
-        for (key, installs) in plugins.into_iter().flatten() {
+        let Some(plugins) = optional_object(root.get("plugins"), &file, "key `plugins`")? else {
+            return Ok(out);
+        };
+        for (key, installs) in plugins {
             let (entry, marketplace) = split_plugin_key(key);
-            let Some(install) = installs.as_array().and_then(|a| a.first()) else {
+            let context = format!("plugins entry `{key}`");
+            // 「值不是数组」和「数组确实为空（没装成）」是两种事实：只有后者可以跳过。
+            // 这里不用 optional_array：`plugins` 的每条键都**已经声明**「这个 plugin 有安装
+            // 记录」，`{"p@mp": null}` 是写了键却没给记录，和 `{"p@mp": [null]}` 同族，
+            // 都是坏值而不是「没配」。
+            let installs = expect_array(installs, &file, &context)?;
+            let Some(first) = installs.first() else {
                 continue;
             };
-            let enabled = enabled_map.get(key).copied().unwrap_or(true);
+            let install = expect_object(first, &file, &format!("{context}[0]"))?;
+            let enabled = gate_enabled(&enabled_map, key, &entry);
             out.push(Capability {
                 id: CapId::new(Kind::Plugin, entry.clone()),
-                origin: Origin::Adopted { harness: CLAUDE_CODE.into() },
+                origin: Origin::Adopted {
+                    harness: CLAUDE_CODE.into(),
+                },
                 spec: Spec::Plugin {
                     marketplace,
                     entry,
-                    version: install.get("version").and_then(Value::as_str).map(String::from),
-                    sha: install.get("gitCommitSha").and_then(Value::as_str).map(String::from),
-                    install_path: install.get("installPath").and_then(Value::as_str).map(PathBuf::from),
+                    version: normalize_locator(optional_string(
+                        install, "version", &file, &context,
+                    )?),
+                    sha: normalize_locator(optional_string(
+                        install,
+                        "gitCommitSha",
+                        &file,
+                        &context,
+                    )?),
+                    install_path: optional_string(install, "installPath", &file, &context)?
+                        .map(PathBuf::from),
                     enabled,
                 },
                 targets: Targets::All,
@@ -3796,14 +3843,27 @@ impl ClaudeCode {
     }
 
     /// settings.json 的 enabledPlugins 是门禁；installed_plugins.json 才是安装记录。
+    /// 没列出的 key 默认启用（未列 = 未表态）。
     fn read_enabled_plugins(&self) -> anyhow::Result<BTreeMap<String, bool>> {
-        let Some(root) = read_json_if_present(&self.home.claude_settings())? else {
+        let file = self.home.claude_settings();
+        let Some(root) = read_json_if_present(&file)? else {
             return Ok(BTreeMap::new());
         };
         let mut out = BTreeMap::new();
-        if let Some(obj) = root.get("enabledPlugins").and_then(Value::as_object) {
+        // `{"enabledPlugins": null}` = 一条门禁都没写 = 全部未表态 = 全部启用，与缺键同义；
+        // 但只有「键缺失或值为 null」才走这条路，`true` / `[]` 这类坏值仍然上抛。
+        if let Some(obj) =
+            optional_object(root.get("enabledPlugins"), &file, "key `enabledPlugins`")?
+        {
             for (k, v) in obj {
-                out.insert(k.clone(), v.as_bool().unwrap_or(true));
+                // 非布尔的门禁值是坏数据，不是「没表态」：猜成 true 就是假同步。
+                let Some(b) = v.as_bool() else {
+                    anyhow::bail!(
+                        "failed to parse enabledPlugins entry {k}: expected a boolean, found {}",
+                        type_name(v)
+                    );
+                };
+                out.insert(k.clone(), b);
             }
         }
         Ok(out)
@@ -3811,11 +3871,32 @@ impl ClaudeCode {
 }
 ```
 
-在同文件末尾追加三个 `pub(crate)` 工具（Task 11 复用前两个）：
+在同文件末尾追加下面这些工具。`pub(crate)` 的复用面共 **9 个**：`read_json_if_present`、
+`split_plugin_key`（只 claude 用）、`mcp_capability`，加六个形状原语。
+**保持模块私有**的有 `read_json_value_if_present` / `gate_enabled` / `type_name` / `shape_fault`——
+它们是实现细节，原语内部会调用，外部拿到也用不上。
 
 ```rust
-/// 读 JSON；文件不存在返回 Ok(None)，语法错误返回带路径的 Err。
+/// 读 JSON 并**保证顶层是对象**：文件不存在或整个文档是 `null` → `Ok(None)`（都是「没配」）；
+/// 语法错、或顶层是 `false`/`[]`/`"oops"`/`5` → 带路径的 `Err`。
+/// 顶层形状守在这里，所以 claude / kimi 两家以后新增的每个 JSON 入口自动带上这条，
+/// 不必各家再写一遍（codex 读 TOML，不走这里）。
 pub(crate) fn read_json_if_present(path: &Path) -> anyhow::Result<Option<Value>> {
+    let Some(value) = read_json_value_if_present(path)? else {
+        return Ok(None);
+    };
+    if value.is_object() {
+        Ok(Some(value))
+    } else if value.is_null() {
+        Ok(None)
+    } else {
+        Err(shape_fault(&value, path, "top level", "an object"))
+    }
+}
+
+/// 纯解析半边（不存在 → `Ok(None)`，语法错 → 带路径的 Err），不校验顶层形状。
+/// 拆成两步是为了让「顶层必须是对象」和「JSON 解析失败」成为两条可分别看守的故障。
+fn read_json_value_if_present(path: &Path) -> anyhow::Result<Option<Value>> {
     match std::fs::read_to_string(path) {
         Ok(text) => {
             let v = serde_json::from_str(&text)
@@ -3916,8 +3997,22 @@ git commit -m "feat: claude-code read_state（MCP 读自 ~/.claude.json 而非 s
 > **照 Task 9 的「形状故障也是故障」那条写**（Task 9 里 `2ee0b8c` 契约旁边、评审补的 Critical 块）。
 > 本节下面示例里的 `let Some(x) = root.get(..).and_then(toml::Value::as_table) else { .. }`
 > 在「键存在但类型不对」时同样会交出空结果——TOML 侧的对应输入是 `[mcp_servers]` 写成了
-> `mcp_servers = "..."`。已落地的 `src/adapters/claude_code.rs` 就是照这一条改过的样板，
-> 遇到冲突**以代码为准**并把它写回本节。
+> `mcp_servers = "..."`。
+>
+> **一个本节一定会撞上的事实，先说清：Task 9 那六个原语复用到这里全部失效。**
+> `expect_object` / `optional_array` 等收的是 `serde_json::Value`，codex 读的是 `toml::Value`，
+> 两个不同类型系统。**这里自己写一套 TOML 版的同形原语是正确做法，不算违反「别另建一套」**——
+> 那条规则针对的是同一类型下的复制粘贴。为免歧义：写 `toml_expect_table` /
+> `toml_optional_string` 这一族，报错格式沿用 claude 的
+> `invalid shape in {file}: {position} must be {expected}, found {type name}`，
+> 同样**只报类型不报值**（`~/.codex/config.toml` 里可能有密钥）。
+> `read_json_if_present` / `mcp_capability` 也都不适用（前者是 JSON 专用，后者收 `serde_json::Value`），
+> 所以 codex 的 `read_state` 要自己走完整形状检查，本节示例里 `command` / `args` / `enabled` 的
+> `.unwrap_or(..)` 三处**照抄就是 Task 9 判为 Critical 的塌缩**。
+>
+> 语义裁决与 claude 保持一致：缺键或值为「无」→ 正常空结果；类型不对 → 故障上抛；
+> 数组元素里的坏值 → 故障。TOML 没有 `null` 字面量，所以容器层 `null` 那条在 codex 侧不可达——
+> **不要**为此造兜底分支，写成注释说明不可达即可。
 
 **Files:**
 - Modify: `src/adapters/codex.rs`
@@ -4331,26 +4426,29 @@ git commit -m "feat: codex read_state（config.toml 动态导航，对未知字�
 
 ### Task 11: kimi-code read_state
 
-> **照 Task 9 的「形状故障也是故障」那条写**（Task 9 里 `2ee0b8c` 契约旁边、评审补的 Critical 块）。
-> 本节下面示例**逐字**复现了那个被判定为 Critical 的形状：`let Some(list) =
-> root.get("plugins").and_then(Value::as_array) else { return Ok(Vec::new()) }`，以及
-> `p.get("id").and_then(Value::as_str) else { continue }`。kimi 的 `installed.json` 是数组、
-> 身份在 `id` 里，所以这两处一旦遇到类型写坏（`plugins` 不是数组、某条记录没有字符串 `id`）
-> 就会把「配置坏了」报成「没装任何东西」。**落地时必须按 Task 9 已改过的样板处理**：
-> 键缺失 → 空；键在但类型不对 → `bail!` 带路径 + 键名（不带值）。
-> `mcp_capability` / `read_json_if_present` 直接从 `claude_code.rs` 复用，不要另写一份。
-> Task 9 修复轮之后它们的签名是 `read_json_if_present(&Path) -> Result<Option<Value>>`
-> （返回的文档保证是对象）和 `mcp_capability(name, cfg, harness, file) -> Result<Capability>`，
-> 所以本节示例里的 `mcp_capability(name, cfg, KIMI_CODE)` 落地时要写成
-> `mcp_capability(name, cfg, KIMI_CODE, &self.home.kimi_mcp())?`；第四个参数只用于报错里
-> 带出**是哪家 harness 的哪个文件**读坏了。`env` / `args` 的形状故障 helper 已经管了，
-> 但 `root.get("mcpServers")` 这一层仍要按上面的三态自己处理。
+> **本节示例已按 Task 9 的落地形态改过**（`形状故障也是故障` 那块 + `2ee0b8c` 失败隔离契约 +
+> `eab428e` 的容器层 `null` 裁决）。先前这里逐字复现 Critical 形状的 `plugins` 塌缩、
+> `id` 的 `else { continue }`、`mcpServers` 的 `and_then(as_object)` 都已换成
+> `optional_array` / `expect_object` + `expect_string` / `optional_object`。
+> **但示例里有两处我替不了你，代码上带着 ⚠️ 标记**：
+> 1. `enabled` 需要第七个原语 `expect_bool`（claude 侧同类判定用的是模块私有的 `gate_enabled` +
+>    `type_name`，import 不到）。补法见 Task 9 `Produces` 末尾。
+> 2. `github` 那条嵌套 `and_then` 链是**可选深路径**，故意不用 `expect_*`；代价是 `github` 存在但
+>    类型不对时静默变 `None`。**这是你必须显式裁决的点**——保持现状并注释说明，或先
+>    `optional_object(github, ...)` 再把 owner/repo 当必填。两种都行，不许不裁决。
+>
+> 复用面（`fee8dd3` 核过可见性）：`read_json_if_present`、`mcp_capability` 和六个形状原语都是
+> `pub(crate)`；`gate_enabled` / `type_name` / `shape_fault` / `read_json_value_if_present`
+> 是 claude 模块私有，**拿不到也不需要拿**。`mcp_capability` 现在是
+> `(name, cfg, harness, file) -> Result<Capability>`，第四个参数让报错带出是哪家哪个文件读坏了。
 
 **Files:**
 - Modify: `src/adapters/kimi_code.rs`
 
 **Interfaces:**
-- Consumes: `Home::{kimi_mcp, kimi_installed_plugins}`、`adapters::claude_code::{read_json_if_present, mcp_capability}`、`skills_dir::try_read_skill_entries`、`capability::*`
+- Consumes: `Home::{kimi_mcp, kimi_installed_plugins}`、
+  `adapters::claude_code::{read_json_if_present, mcp_capability, expect_object, expect_string,
+  optional_object, optional_array, optional_string}`、`skills_dir::try_read_skill_entries`、`capability::*`
 - Produces: `KimiCode::read_state()`
 
 实测 `~/.kimi-code/mcp.json`：
@@ -4601,9 +4699,12 @@ Expected: FAIL —`read_state` 仍返回空 Vec。
 
 ```rust
 use crate::adapters::claude_code::{
-    expect_array, expect_object, expect_string, mcp_capability, optional_string,
-    read_json_if_present,
+    expect_object, expect_string, mcp_capability, optional_array, optional_object,
+    optional_string, read_json_if_present,
 };
+// 注意：`gate_enabled` / `type_name` / `shape_fault` 是 claude 模块私有的，import 不到，
+// 也不需要——它们藏在上面这些原语背后。kimi 的 `enabled` 布尔判定缺一个 `expect_bool`，
+// 见 Task 9 `Produces` 那节末尾的说明，补上后连同 import 一起改。
 use crate::adapters::{HarnessAdapter, KIMI_CODE};
 use crate::capability::{CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets};
 use crate::home::Home;
@@ -4622,9 +4723,11 @@ impl KimiCode {
             return Ok(Vec::new());
         };
         let mut out = Vec::new();
-        // 「没这个键」→ 空；「有键但不是对象」→ 故障（见 Task 9「形状故障也是故障」那条）。
-        if let Some(servers) = root.get("mcpServers") {
-            for (name, cfg) in expect_object(servers, &file, "key `mcpServers`")? {
+        // 「没这个键」或「值是显式 null」→ 空（正常，没配 MCP）；「有键、值既非 null 也非对象」→ 故障。
+        // 与 claude 侧同形：`optional_object` 而不是 `root.get(..).and_then(as_object)`，
+        // 也不是 `expect_object(root.get(..))`——后者收的是 `&Value`，缺失根本到不了调用方。
+        if let Some(servers) = optional_object(root.get("mcpServers"), &file, "key `mcpServers`")? {
+            for (name, cfg) in servers {
                 out.push(mcp_capability(name, cfg, KIMI_CODE, &file)?);
             }
         }
@@ -4632,24 +4735,48 @@ impl KimiCode {
     }
 
     fn read_plugins(&self) -> anyhow::Result<Vec<InstalledPlugin>> {
-        let Some(root) = read_json_if_present(&self.home.kimi_installed_plugins())? else {
+        let file = self.home.kimi_installed_plugins();
+        let Some(root) = read_json_if_present(&file)? else {
             return Ok(Vec::new());
         };
-        // kimi 的 plugins 是数组，claude 的是对象——形状差异压平在这里
-        let Some(list) = root.get("plugins").and_then(Value::as_array) else {
+        // kimi 的 plugins 是数组，claude 的是对象——形状差异压平在这里。
+        // `optional_array`：缺键或显式 `null` = 「一个都没装」（正常）；键在有非数组的值上 = 故障。
+        // 不要写 `root.get("plugins").and_then(Value::as_array) else { return Ok(..) }`——
+        // 那等于把 `{"plugins": "oops"}` 报成「什么都没装」，就是 Task 9 判为 Critical 的塌缩。
+        let Some(list) = optional_array(root.get("plugins"), &file, "key `plugins`")? else {
             return Ok(Vec::new());
         };
 
         let mut out = Vec::new();
-        for p in list {
-            let Some(id) = p.get("id").and_then(Value::as_str) else {
-                continue;
+        for (i, p) in list.iter().enumerate() {
+            // 数组元素没有「缺失」这层含义：一条记录必须是对象。
+            let record = expect_object(p, &file, &format!("plugins[{i}]"))?;
+            // `id` 是这条记录的身份，缺了或非字符串都认不出来——按「坏值」处理，
+            // 绝不 `continue` 丢条目（丢条目 = 漏报，只读工具最坏的方向）。
+            let Some(id_value) = record.get("id") else {
+                anyhow::bail!(
+                    "invalid shape in {}: plugins[{i}] has no `id`",
+                    file.display()
+                );
             };
-            let github = p.get("github");
+            let id = expect_string(id_value, &file, &format!("plugins[{i}] field `id`"))?;
+            let github = record.get("github");
             out.push(InstalledPlugin {
                 id: id.to_string(),
-                root: p.get("root").and_then(Value::as_str).map(PathBuf::from),
-                enabled: p.get("enabled").and_then(Value::as_bool).unwrap_or(true),
+                root: optional_string(record, "root", &file, &format!("plugins[{i}]"))?
+                    .map(PathBuf::from),
+                // ⚠️ 这一行需要第七个原语 `expect_bool`（Task 9 的 `Produces` 末尾说明了为什么
+                // `.and_then(as_bool).unwrap_or(true)` 不行）。没有它之前，本行**照抄就是 bug**。
+                enabled: record
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true),
+                // ⚠️ 下面这段嵌套 `and_then` 链是一条**可选深路径**：任何一层缺失都得是 `None`，
+                // 所以它**故意**不用 expect_*（那样 `github` 缺失就成故障了）。
+                // 代价：`github` 存在但类型不对时同样静默变 `None`。
+                // **这是 Task 11 必须显式裁决的点**——要么保持现状并加注释说明「github 形状坏了
+                // 与没装 marketplace 信息」不可区分，要么先 `optional_object(github, ...)` 再把
+                // owner/repo 当必填。二者都行，**不许不裁决**。
                 marketplace: github
                     .and_then(|g| g.get("owner"))
                     .and_then(Value::as_str)
