@@ -962,6 +962,27 @@ mod tests {
     /// 配置文件顶层不是对象时，`root.get(..)` 只会给 `None`，于是坏文件长得和
     /// 「一个键都没写」一模一样。守卫在 `read_json_if_present` 里，三个文件共用一处，
     /// 所以这里三家都点一遍（少一家就是少一次看守）。
+    /// 门禁表本身也是同一个形状的一层：`"enabledPlugins": true` 过去走 `and_then(as_object)`
+    /// 得到「一条门禁都没有」= 全部按 enabled 处理，正是被裁定为 Critical 的那种塌缩。
+    #[test]
+    fn enabled_plugins_that_is_not_an_object_is_an_error_naming_the_key() {
+        let t = TempHome::new();
+        t.write(
+            ".claude/plugins/installed_plugins.json",
+            r#"{ "version": 2, "plugins": { "p@mp": [ { "version": "1.0" } ] } }"#,
+        );
+        t.write(".claude/settings.json", r#"{ "enabledPlugins": true }"#);
+        assert_eq!(
+            read_state_err(&t),
+            shape_msg(
+                &t.path(".claude/settings.json"),
+                "key `enabledPlugins`",
+                "an object",
+                "a boolean"
+            )
+        );
+    }
+
     #[test]
     fn a_config_file_whose_top_level_is_not_an_object_is_an_error() {
         for rel in [
@@ -1114,6 +1135,26 @@ mod tests {
                 "plugins entry `p@mp` field `version`",
                 "a string",
                 "a number"
+            )
+        );
+    }
+
+    /// 三个 locator 字段各是一个独立站点（`version` / `gitCommitSha` / `installPath`），
+    /// 只测其中一个的话另外两个换回 `.and_then(Value::as_str)` 照样全绿。
+    #[test]
+    fn a_non_string_plugin_sha_is_an_error_naming_the_field() {
+        let t = TempHome::new();
+        t.write(
+            ".claude/plugins/installed_plugins.json",
+            r#"{ "version": 2, "plugins": { "p@mp": [ { "gitCommitSha": ["b36e082"] } ] } }"#,
+        );
+        assert_eq!(
+            read_state_err(&t),
+            shape_msg(
+                &t.path(".claude/plugins/installed_plugins.json"),
+                "plugins entry `p@mp` field `gitCommitSha`",
+                "a string",
+                "an array"
             )
         );
     }
