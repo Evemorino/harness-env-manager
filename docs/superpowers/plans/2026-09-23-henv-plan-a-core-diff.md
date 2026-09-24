@@ -5446,8 +5446,8 @@ mod tests {
         let order: Vec<String> = hp.entries.iter().map(|e| e.id.label()).collect();
         assert_eq!(
             order,
-            vec!["mcp/new-one", "hook/h", "mcp/aaa-drift", "mcp/zzz-drift"],
-            "install → undeliverable → drift，组内按 label: {order:?}"
+            vec!["mcp/new-one", "hook/h", "mcp/aaa-drift", "mcp/zzz-drift", "mcp/synced"],
+            "install → undeliverable → drift → in-sync，组内按 label: {order:?}"
         );
     }
 
