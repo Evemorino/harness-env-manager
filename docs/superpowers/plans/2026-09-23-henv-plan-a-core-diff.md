@@ -153,7 +153,7 @@ pub trait HarnessAdapter {
     fn supports(&self, cap: &Capability) -> Support;
 }
 pub fn registry(home: &Home) -> Vec<Box<dyn HarnessAdapter>>;   // 顺序: claude-code, codex, kimi-code
-pub fn lookup<'a>(reg: &'a [Box<dyn HarnessAdapter>], name: &str) -> Option<&'a Box<dyn HarnessAdapter>>;
+pub fn lookup<'a>(reg: &'a [Box<dyn HarnessAdapter>], name: &str) -> Option<&'a dyn HarnessAdapter>;  // 返回 &dyn 而非 &Box：clippy::borrowed_box 在 -D warnings 门禁下拒绝后者，不要改回去
 
 // src/diff.rs
 pub struct HarnessState { pub name: String, pub detected: bool, pub actual: Vec<Capability> }
@@ -2596,7 +2596,9 @@ git commit -m "feat: skills 目录扫描，识别多跳链接/断链/来源分�
 **先修计划本身。** Step 3 写的 `classify` 用**字面前缀**比较，`d293e11` 已把它改成
 `canonical_prefix()` 归一化后再比——那是正确的偏离（`Home` 只归一化 root，中间层软链没解，
 字面前缀永远配不上 `fs::canonicalize` 的结果）。**评审明确警告：计划文本不更新，Task 9/10/11 与
-13 再照 brief 转写就会把这个 bug 装回去。** 所以下面 D0 先把 Step 3 的语义钉住。
+13 再照 brief 转写就会把这个 bug 装回去。
+**Step 3 的示例代码块本身仍是修前的形态**（`classify(r, home)` + 字面 `starts_with`），只靠本追加
+条目与接口契约块纠正。改这段示例请连同 `HomePrefixes` 一起改，不要只换签名。** 所以下面 D0 先把 Step 3 的语义钉住。
 
 **D0 — 在 Step 3 的 `classify` 处记录已生效的偏离**（不改行为，只让转写者照新形态写）：
 两侧前缀都必须先经 `canonical_prefix()` 归一化，且**只在该层目录不存在（`NotFound`）时才退回字面
@@ -3089,7 +3091,7 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
 - Modify: `src/adapters/claude_code.rs`
 
 **Interfaces:**
-- Consumes: `Home::{claude_skills, claude_json, claude_installed_plugins, claude_settings}`、`skills_dir::{read_skill_entries, plugin_from_path, SkillStore}`、`capability::*`
+- Consumes: `Home::{claude_skills, claude_json, claude_installed_plugins, claude_settings}`、`skills_dir::{try_read_skill_entries, plugin_from_path, SkillStore}`、`capability::*`
 - Produces: `ClaudeCode::read_state()`；以及三个 `pub(crate)` 工具 `read_json_if_present`、
   `split_plugin_key`、`mcp_capability`。Task 11 的 kimi adapter 复用 `read_json_if_present`
   与 `mcp_capability`；`split_plugin_key` 只 claude 用（kimi 的 `installed.json` 是数组、
@@ -3410,7 +3412,7 @@ Expected: FAIL —`read_state` 仍返回空 Vec。
 use crate::adapters::{HarnessAdapter, CLAUDE_CODE};
 use crate::capability::{CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets};
 use crate::home::Home;
-use crate::skills_dir::{plugin_from_path, read_skill_entries, SkillStore};
+use crate::skills_dir::{plugin_from_path, try_read_skill_entries, SkillStore};
 use anyhow::Context;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -3423,7 +3425,7 @@ use std::path::{Path, PathBuf};
 impl ClaudeCode {
     fn read_skills(&self) -> Vec<Capability> {
         let mut out = Vec::new();
-        for e in read_skill_entries(&self.home.claude_skills(), &self.home) {
+        for e in try_read_skill_entries(&self.home.claude_skills(), &self.home) {
             let source = match e.store {
                 SkillStore::Shared => SkillSource::AgentsDir,
                 SkillStore::PluginCache => {
@@ -3851,7 +3853,7 @@ Expected: FAIL —`read_state` 仍返回空 Vec。
 use crate::adapters::{HarnessAdapter, CODEX};
 use crate::capability::{CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets};
 use crate::home::Home;
-use crate::skills_dir::{plugin_from_path, read_skill_entries, SkillStore};
+use crate::skills_dir::{plugin_from_path, try_read_skill_entries, SkillStore};
 use anyhow::Context;
 use std::collections::BTreeMap;
 ```
@@ -3862,7 +3864,7 @@ use std::collections::BTreeMap;
 impl Codex {
     fn read_skills(&self) -> Vec<Capability> {
         let mut out = Vec::new();
-        for e in read_skill_entries(&self.home.codex_skills(), &self.home) {
+        for e in try_read_skill_entries(&self.home.codex_skills(), &self.home) {
             let source = match e.store {
                 SkillStore::Shared => SkillSource::AgentsDir,
                 SkillStore::PluginCache => {
@@ -4011,7 +4013,7 @@ git commit -m "feat: codex read_state（config.toml 动态导航，对未知字�
 - Modify: `src/adapters/kimi_code.rs`
 
 **Interfaces:**
-- Consumes: `Home::{kimi_mcp, kimi_installed_plugins}`、`adapters::claude_code::{read_json_if_present, mcp_capability}`、`skills_dir::read_skill_entries`、`capability::*`
+- Consumes: `Home::{kimi_mcp, kimi_installed_plugins}`、`adapters::claude_code::{read_json_if_present, mcp_capability}`、`skills_dir::try_read_skill_entries`、`capability::*`
 - Produces: `KimiCode::read_state()`
 
 实测 `~/.kimi-code/mcp.json`：
@@ -4265,7 +4267,7 @@ use crate::adapters::claude_code::{mcp_capability, read_json_if_present};
 use crate::adapters::{HarnessAdapter, KIMI_CODE};
 use crate::capability::{CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets};
 use crate::home::Home;
-use crate::skills_dir::read_skill_entries;
+use crate::skills_dir::try_read_skill_entries;
 use serde_json::Value;
 use std::path::PathBuf;
 ```
@@ -4335,7 +4337,7 @@ impl KimiCode {
                 continue;
             }
             let Some(root) = &p.root else { continue };
-            for e in read_skill_entries(&root.join("skills"), &self.home) {
+            for e in try_read_skill_entries(&root.join("skills"), &self.home) {
                 out.push(Capability {
                     id: CapId::new(Kind::Skill, e.name),
                     origin: Origin::Plugin { name: p.id.clone() },
@@ -6097,6 +6099,39 @@ fn plan_a_source_has_no_write_api_outside_testutil() {
         all.is_empty(),
         "Plan A 必须只读，发现写 API：\n{}\n（若确需写入，说明你在做 Plan B 的活）",
         all.join("\n")
+    );
+}
+
+/// D4 的机械闸门：生产路径一律走 `try_read_skill_entries`；便利包装是 lossy 的，
+/// 会把「目录读不了」吞成「这个 harness 没装 skills」。没有这条检查时，D4 只靠注释约束。
+#[test]
+fn production_code_never_calls_the_lossy_skill_scanner() {
+    let mut hits = Vec::new();
+    for f in src_files() {
+        let name = f.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        if name == "testutil.rs" || name == "skills_dir.rs" {
+            continue; // 前者是测试件，后者定义并包装（自身测试也会用）
+        }
+        for (i, line) in std::fs::read_to_string(&f)
+            .expect("read src")
+            .lines()
+            .enumerate()
+        {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            if let Some(pos) = line.find("read_skill_entries(") {
+                // try_read_skill_entries( 也含这个子串，按前缀排除
+                if pos == 0 || !line[..pos].ends_with("try_") {
+                    hits.push(format!("{}:{}: lossy read_skill_entries", f.display(), i + 1));
+                }
+            }
+        }
+    }
+    assert!(
+        hits.is_empty(),
+        "生产路径必须用 try_read_skill_entries，否则读不了的目录会被报成没装：\n{}",
+        hits.join("\n")
     );
 }
 
