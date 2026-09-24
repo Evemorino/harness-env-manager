@@ -1,3 +1,4 @@
+pub mod adapters;
 pub mod capability;
 pub mod home;
 pub mod lower;
