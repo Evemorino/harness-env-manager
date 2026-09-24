@@ -6,6 +6,10 @@
 use std::path::{Path, PathBuf};
 
 /// 带 `(` 的模式避免误伤 `fs::symlink_metadata` 这类只读 API。
+///
+/// `Command::new(` 今天在生产代码里**一个都匹配不上**，收在这里是防将来：Plan B 的真实写
+/// 路径就是 shell out 到 `claude mcp add-json`，那是 Plan A 这个只读承诺的第一次破口。
+/// 先把模式立好，Plan B 的第一行 shell out 会直接撞红一条测试，而不是悄悄溜进产物。
 const FORBIDDEN: &[&str] = &[
     "fs::write(",
     "File::create(",
@@ -18,6 +22,7 @@ const FORBIDDEN: &[&str] = &[
     "fs::symlink(",
     "fs::hard_link(",
     "fs::set_permissions(",
+    "Command::new(",
 ];
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -47,8 +52,10 @@ fn offenders(path: &Path) -> Vec<String> {
         let closes = line.matches('}').count();
 
         if test_depth > 0 {
-            // 还在测试块内：只记账括号，不报写 API。
-            test_depth = test_depth + opens - closes;
+            // 还在测试块内：只记账括号，不报写 API。saturating：未来某个 fixture 里多一个
+            // 不配对的 `}` 时，`usize` 下溢在 debug 下 panic、在 release 下静默回绕成天文数字，
+            // 于是扫描器把整个文件当成测试块——守卫就这样哑掉，而且失败方向是「静默放过」。
+            test_depth = test_depth.saturating_add(opens).saturating_sub(closes);
             continue;
         }
         if line.trim() == "#[cfg(test)]" {
@@ -60,7 +67,7 @@ fn offenders(path: &Path) -> Vec<String> {
             // `#[cfg(test)] mod tests {` 才开门控块；`use …;` / `mod testutil;` 不产生块
             // （use 的花括号在同一行成对），这类行本身不含写 API，跳过即可。
             if opens > closes {
-                test_depth += opens - closes;
+                test_depth = test_depth.saturating_add(opens - closes);
             }
             continue;
         }

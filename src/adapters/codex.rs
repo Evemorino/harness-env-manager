@@ -457,6 +457,41 @@ mod tests {
         );
     }
 
+    /// `SkillStore::PluginCache` arm 里 `plugin_from_path(..) => None` 这一支**今天不可达**，
+    /// 所以这条测试不假装覆盖它，而是把围住它的恒等式钉在 codex 的入口上：
+    /// `classify` 判 `PluginCache` 的判据就是 `plugin_from_path(path).is_some()`
+    /// （`skills_dir::is_in_plugin_cache` 的定义），于是「归了缓存却没有 plugin 身份」这个
+    /// 输入构造不出来——两条臂里只有 `Some` → `PluginBundle` 可达。下面两半是那条恒等式的
+    /// 两个方向：缓存形态 ⇒ 拿得出身份；拿不出身份 ⇒ 根本不是缓存（落 `HarnessLocal`，不是
+    /// `Unknown`）。谁把缓存判定放宽成「任意位置出现 `cache`」（skills_dir 文档里记的那次 D1
+    /// 回归），第二半立刻红，而那也正是那条 `None` 臂变成真 Unknown 通道的时刻。
+    #[test]
+    fn a_plugin_cache_path_always_carries_a_plugin_identity() {
+        // 方向一：`plugins` 在 `cache` **之前** ⇒ 身份拿得出来。
+        let t = TempHome::new();
+        let cache = ".claude/plugins/cache/mp/superpowers/b36e0829/skills/brainstorming";
+        t.mkdir(cache);
+        assert_eq!(
+            plugin_from_path(&t.path(cache)).as_deref(),
+            Some("superpowers")
+        );
+
+        // 方向二：同样的 `cache/<mp>/<name>/<version>/skills/<skill>` 尾巴，但**没有**
+        // `plugins` 段 ⇒ `plugin_from_path` 给 `None`，它也就不再是 PluginCache 臂的输入。
+        let t = TempHome::new();
+        let lookalike = ".codex/skills/mine/cache/mp/superpowers/b36e0829/skills/leaf";
+        t.mkdir(lookalike);
+        assert_eq!(plugin_from_path(&t.path(lookalike)), None);
+        let caps = Codex::new(t.home.clone()).read_state().unwrap();
+        match &find(&caps, Kind::Skill, "mine").unwrap().spec {
+            Spec::Skill {
+                source: SkillSource::Local { .. },
+                ..
+            } => {}
+            other => panic!("无 `plugins` 段的 cache 尾巴必须落 HarnessLocal，不是 {other:?}"),
+        }
+    }
+
     /// 失败隔离契约在 codex 这一侧的另一半：skills 目录**读不出**（这里 `.codex/skills`
     /// 是个普通文件 → `read_dir` 报 ENOTDIR）必须是 `Err`，不是空表。
     #[test]

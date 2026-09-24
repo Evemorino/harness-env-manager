@@ -170,7 +170,10 @@ impl HarnessAdapter for ClaudeCode {
     }
 
     fn detect(&self) -> bool {
-        self.home.claude_dir().is_dir()
+        // `is_file()` 而非 `exists()`：普通文件/断链仍然不算「装了」，沿用 adapters/mod.rs
+        // 那条 detect 契约。但 claude 的 MCP 落点是 `~/.claude.json`（design §2.1 条 1），
+        // 只有它、没有 `.claude/` 目录的用户同样装了 claude，不该被 skip。
+        self.home.claude_dir().is_dir() || self.home.claude_json().is_file()
     }
 
     fn read_state(&self) -> anyhow::Result<Vec<Capability>> {
@@ -1895,6 +1898,22 @@ mod tests {
             ),
             other => panic!("{other:?}"),
         }
+    }
+
+    /// 用户级 MCP 的落点是 `~/.claude.json`（design §2.1 条 1），而 detect 过去只查
+    /// `.claude/` 目录：只写了 `~/.claude.json` 的 home 被判成「没装 claude」，整家 skip，
+    /// 于是 `read_mcps` 永远拿不到输入——一家装了 MCP 的 claude 被静默漏报。
+    #[test]
+    fn detect_accepts_a_home_with_only_claude_json() {
+        let t = TempHome::new();
+        t.write(
+            ".claude.json",
+            r#"{ "mcpServers": { "m": { "command": "c" } } }"#,
+        );
+        assert!(
+            ClaudeCode::new(t.home.clone()).detect(),
+            "只有 ~/.claude.json、没有 .claude/ 的 home 同样装了 claude"
+        );
     }
 
     /// claude-code 对六种 kind 全部原生接纳（spec §2.1 矩阵）。`Spec::Command` 只是

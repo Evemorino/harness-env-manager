@@ -275,6 +275,40 @@ mod tests {
         );
     }
 
+    /// `entries` 全是 `InSync`（而非空表）时，那行 `pending` 过滤器必须把汇总行显出来。
+    /// **删掉过滤器这条测试是不是还绿？不是**：不过滤时走的是「有待办」分支，逐条打印
+    /// 时六个 arm 里 `InSync` 那一臂什么都不写，汇总行 `✓ in-sync` 连同实有数量一起消失，
+    /// 于是「全同步」在报告里表现为**什么都没有**——正是本工具要回答的那句话。
+    /// 空 entries 的那两条（`empty_harness_says_nothing_installed` 等）拦不住它：
+    /// 空表本来就走 `pending.is_empty()` 分支，删掉过滤器照样绿。
+    #[test]
+    fn in_sync_entries_render_only_the_summary_line() {
+        let plan = Plan {
+            harnesses: vec![hp(
+                "claude-code",
+                true,
+                vec![
+                    pe(Kind::Skill, "dingtalk-mail", Action::InSync),
+                    pe(Kind::Mcp, "context7", Action::InSync),
+                ],
+                vec![(Kind::Skill, 2), (Kind::Mcp, 1)],
+            )],
+        };
+        let out = render(&plan);
+        assert!(
+            out.contains("claude-code   ✓ in-sync  skills:2 mcps:1\n"),
+            "全同步必须出汇总行：{out}"
+        );
+        for prefix in ["+ install", "~ update", "! undeliverable", "- drift"] {
+            assert!(!out.contains(prefix), "全同步不该有动作行：{out}");
+        }
+        assert_eq!(
+            out.lines().filter(|l| l.starts_with("claude-code")).count(),
+            1,
+            "这一行的唯一来源是汇总行；过滤器没了就一条都不剩：{out}"
+        );
+    }
+
     #[test]
     fn empty_harness_says_nothing_installed() {
         let plan = Plan {

@@ -217,12 +217,16 @@ mod tests {
             "{:#}",
             run_diff(&t.path("env.yaml"), &t.home, &mut out).unwrap_err()
         );
-        assert!(err.contains("env.yaml"), "{err}");
-        assert!(err.contains("mcps.c"), "{err}");
-        // 密钥门禁：错误里不许回显值
-        assert!(
-            !err.contains("sk-live-abc123"),
-            "错误信息不得回显密钥值：{err}"
+        // 密钥门禁：本计划要求回声断言按**整串**相等，不用 `contains`——`contains` 挡不住
+        // 「只回显了值的前缀」的实现（`secrets::validate_env` 的
+        // `validate_env_message_is_pinned_and_never_carries_the_value` 同一条规矩）。
+        // 路径由 tempdir 派生，所以用 `format!` 拼出期望值，本机与 CI 都对得上。
+        assert_eq!(
+            err,
+            format!(
+                "invalid manifest: {}: env.yaml invalid:\n  - mcps.c: env `K` must be a bare ${{VAR}} reference (value not shown)",
+                t.path("env.yaml").display()
+            )
         );
         assert!(out.is_empty(), "出错时不输出半截报告");
     }

@@ -74,8 +74,13 @@ pub fn registry(home: &Home) -> Vec<Box<dyn HarnessAdapter>> {
     ]
 }
 
-/// 按 `name()` 精确匹配查一家；未注册的名字返回 `None`（调用方据此报
-/// 「未知 harness」，见 Task 15）。
+/// 按 `name()` 精确匹配查一家；未注册的名字返回 `None`，大小写敏感且不做前缀匹配
+/// （与 `manifest` 侧的 `targets:` 校验同一套判据，测试逐条钉着）。
+///
+/// **消费者尚未落地**：这里的文档曾经承诺它撑着 Task 15 的「未知 harness」报错路径，
+/// 那条路径最终没接上——`lib.rs::run_diff` 直接遍历 `registry()`，`lookup` 在生产代码里
+/// **零调用点**，目前只有它自己的测试在用。留着它是给后续接线（Plan C / 新一轮 manifest
+/// 校验）一个现成入口，不是「有人在用」的声明。
 ///
 /// 返回 `&dyn HarnessAdapter` 而不是计划里写的 `&Box<dyn HarnessAdapter>`：
 /// `&Box<T>` 是多余的一层间接，`clippy::borrowed_box` 在 `-D warnings` 下直接

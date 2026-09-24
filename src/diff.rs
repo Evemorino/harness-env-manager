@@ -144,6 +144,10 @@ pub fn compute(desired: &[Capability], inputs: &[HarnessInput], degrade: &Degrad
             }
             match input.adapter.supports(cap) {
                 Support::Unsupported { reason } => {
+                    // 这条 arm **不**写 `matched`（下面那个循环据此把 actual 里多出来的东西
+                    // 报成 Drift）。前提假设：报 Unsupported 的 adapter 不会同时把这个能力列在
+                    // `actual` 里。真有自相矛盾的 adapter 时，最坏结果是同一条能力出现两行
+                    // （undeliverable + drift），而不是静默的假 in-sync。
                     if degrade.action(cap) == DegradeAction::Report {
                         entries.push(PlanEntry {
                             id: cap.id.clone(),
@@ -155,10 +159,18 @@ pub fn compute(desired: &[Capability], inputs: &[HarnessInput], degrade: &Degrad
                     matched.insert(cap.id.clone());
                     let action = match state.actual.iter().find(|a| a.id == cap.id) {
                         None => Action::Install,
-                        Some(a) => match compare_versions(&cap.spec, &a.spec) {
-                            // Unknown 按 in-sync：只读工具不该误报（spec §2.1 第 3 条）
-                            VersionMatch::Same | VersionMatch::Unknown => Action::InSync,
-                            VersionMatch::Different { from, to } => Action::Update { from, to },
+                        Some(a) => match &a.spec {
+                            // 装了但被禁用：plugin 的 skills/hooks/commands 一个都不生效，报 in-sync
+                            // 等于把「切 harness 会失效」反过来念。这里用 Undeliverable + reason，与
+                            // `Support::Unsupported`（harness 支持不了）区分开：这条是用户自己关的。
+                            Spec::Plugin { enabled: false, .. } => Action::Undeliverable {
+                                reason: "plugin 已安装但未启用".to_string(),
+                            },
+                            _ => match compare_versions(&cap.spec, &a.spec) {
+                                // Unknown 按 in-sync：只读工具不该误报（spec §2.1 第 3 条）
+                                VersionMatch::Same | VersionMatch::Unknown => Action::InSync,
+                                VersionMatch::Different { from, to } => Action::Update { from, to },
+                            },
                         },
                     };
                     entries.push(PlanEntry {
@@ -350,6 +362,80 @@ mod tests {
         assert_eq!(
             labels(&hp),
             vec![("plugin/superpowers".to_string(), "in-sync".to_string())]
+        );
+    }
+
+    /// 用户显式关掉的 plugin **不能**报 in-sync。`Spec::Plugin.enabled` 三家 adapter 都读，
+    /// 而在 `compute()` 里被丢掉；codex 的 plugin 没有 version/sha → `compare_versions` 给
+    /// `Unknown` → 旧实现按 in-sync 处理。那就是把本工具的核心问题反过来回答：
+    /// 「切 harness 会失效吗」对一条**现在就失效**的能力说了「不会」。
+    #[test]
+    fn a_disabled_actual_plugin_is_undeliverable_not_in_sync() {
+        let d = desired(
+            Kind::Plugin,
+            "p",
+            Spec::Plugin {
+                marketplace: None,
+                entry: "p".into(),
+                version: Some("v1.0.0".into()),
+                sha: None,
+                install_path: None,
+                enabled: true,
+            },
+        );
+        let actual = FakeAdapter::cap(
+            Kind::Plugin,
+            "p",
+            Spec::Plugin {
+                marketplace: None,
+                entry: "p".into(),
+                version: None,
+                sha: None,
+                install_path: None,
+                enabled: false,
+            },
+        );
+        let hp = run(&[d], FakeAdapter::native("codex").with_caps(vec![actual]));
+
+        assert_eq!(hp.entries.len(), 1, "{:?}", labels(&hp));
+        assert_ne!(
+            hp.entries[0].action,
+            Action::InSync,
+            "禁用 ≠ 已同步：这条断言就是本测试的全部意义"
+        );
+        match &hp.entries[0].action {
+            Action::Undeliverable { reason } => assert_eq!(reason, "plugin 已安装但未启用"),
+            other => panic!("禁用 plugin 必须报 undeliverable，得到 {other:?}"),
+        }
+    }
+
+    /// 上一条的反方向守卫：新 arm 只认 `enabled: false`，正常启用的 plugin 仍走比较逻辑，
+    /// 版本相同就是 in-sync（不许被新 arm 连坐成 undeliverable）。
+    #[test]
+    fn an_enabled_actual_plugin_with_a_matching_version_is_still_in_sync() {
+        let d = desired(
+            Kind::Plugin,
+            "p",
+            Spec::Plugin {
+                marketplace: None,
+                entry: "p".into(),
+                version: Some("v1.0.0".into()),
+                sha: None,
+                install_path: None,
+                enabled: true,
+            },
+        );
+        let hp = run(
+            &[d],
+            FakeAdapter::native("codex").with_caps(vec![FakeAdapter::plugin(
+                "p",
+                Some("v1.0.0"),
+                None,
+            )]),
+        );
+        assert_eq!(
+            labels(&hp),
+            vec![("plugin/p".to_string(), "in-sync".to_string())]
         );
     }
 
