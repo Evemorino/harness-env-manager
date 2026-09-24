@@ -134,8 +134,14 @@ pub enum SkillStore { Shared, HarnessLocal, PluginCache, Other }
 pub struct SkillEntry { pub name: String, pub path: PathBuf, pub link_target: Option<PathBuf>,
                         pub resolved: Option<PathBuf>, pub store: SkillStore }
 impl SkillEntry { pub fn is_broken(&self) -> bool; }
+pub struct HomePrefixes /* 一次算好的归一化前缀；见 Task 7 追加「落地后的最终契约」 */
+impl HomePrefixes { pub fn new(home: &Home) -> anyhow::Result<Self>; }
+// 生产入口：Task 9/10/11 与 Task 13 **必须**用它，否则「读不了」会被吞成空表。
+pub fn try_read_skill_entries(dir: &Path, home: &Home) -> anyhow::Result<Vec<SkillEntry>>;
+// 便利版 = try_ 版 + unwrap_or_default，只给测试与不关心错误的调用方。
 pub fn read_skill_entries(dir: &Path, home: &Home) -> Vec<SkillEntry>;   // 按 name 排序
-pub fn classify(resolved: &Path, home: &Home) -> SkillStore;
+// 纯函数、零 IO；第二参数**不再是 &Home**（照旧签名转写会编译失败并绕过 D2/D4 的修复）。
+pub fn classify(resolved: &Path, prefixes: &HomePrefixes) -> SkillStore;
 pub fn plugin_from_path(path: &Path) -> Option<String>;
 
 // src/adapters/mod.rs
