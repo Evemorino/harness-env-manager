@@ -1047,6 +1047,12 @@ plugins:
                 "version: \"invalid type: sk-live-9f3a2b7c\"\n",
                 "failed to parse env.yaml: version: invalid type: a string, expected u32 at line 1 column 10",
             ),
+            // 值里自带的是**另一种**标记词：取标记必须按最靠前的算，取到值里那个会把值的
+            // 前半截留在消息头上（`… string "invalid value: a …`）。
+            (
+                "version: \"invalid value: sk-live-9f3a2b7c\"\n",
+                "failed to parse env.yaml: version: invalid type: a string, expected u32 at line 1 column 10",
+            ),
             // 值里自带 `, expected `：必须按**最后一次**出现切，否则值的后半截会留在消息里。
             (
                 "version: \"a, expected sk-live-9f3a2b7c\"\n",
