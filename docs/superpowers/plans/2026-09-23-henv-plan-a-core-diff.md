@@ -6835,6 +6835,69 @@ Task 14 的 `in_sync_summary_kinds_follow_kind_all_order` 按此顺序断言。
    **要求**：(a) `lower.rs` 里那句「只作用于实际侧」的注释是错的，实际两侧都不生效，改成
    上述准确表述；(b) `henv diff` 的输出或文档要让用户知道 `degrade` 目前只是声明性占位，
    不要让人以为写了 `skip` 就生效。真正生效点在 Plan B 拆解落地时。要门禁语义就加 `doctor --check`，别改 `diff`。
-   **进度（residual 轮）**：(a) 已落地——`lower.rs` 的 `DegradeTable` 文档现在写的是「两侧都是
-   惰性的」，并注明惰性是设计后果、不许在 `lower` 里“顺手修”。(b) **仍未做**，落在 Task 14
-   （render）：`henv diff` 的输出或文档必须让用户知道 `degrade` 目前是声明性占位。
+   **进度**：(a) 已落地——`lower.rs` 的 `DegradeTable` 文档现在写的是「两侧都是
+   惰性的」，并注明惰性是设计后果、不许在 `lower` 里“顺手修”。(b) **已落地**，落在 `src/main.rs`
+   的 `Cli::long_about`（`henv --help` 长帮助）：逐字说明 `degrade:` 在 Plan A 只是声明性占位、
+   Plan B 拆解落地后才生效，并同时写明了只读承诺。
+   **注意落地位置**：刻意没放进 `render()` 的输出——那会改动已冻结的 insta 金标
+   （`src/snapshots/henv__render__tests__spec_example_matches_design_doc.snap`），
+   为一条文档需求改动输出格式不划算。`henv diff --help`（子命令短帮助）仍不含该披露，
+   这是已知取舍：披露在长帮助里。
+
+---
+
+## Plan A 收尾移交清单（整分支终审后）
+
+本节的每一条都经过整分支终审 + 一次修复轮 + 一次 scoped 复审。**记在这里而不是留在
+`.superpowers/sdd/` 工作区里，是因为那个目录是 gitignored、分支收尾时会删——留在那里等于丢掉。**
+每条都写明「为什么现在不做」和「什么条件下必须做」，不要重新讨论已经裁定的部分。
+
+### 必须在 Plan B 做，且已有明确触发点
+
+1. **`optional_bool`（第 8 个形状原语）——kimi 的 `enabled: null`。**
+   现状：`optional_string` / `optional_object` / `optional_array` 都把「叶子上的 null」当作缺键，
+   但 `enabled` 走 `expect_bool`，`null` 是**硬报错**。行为本身是 fail-closed（不会给人错误答案），
+   缺陷只是与另外三个原语约定不一致——联合评审裁过一次「约定优先」，但那一轮没有修复轮可依附。
+   **触发条件**：Plan B 第一次碰 kimi 的 `installed.json` 解析时一并做（单文件改动）。
+   做的时候要同时想清楚：`enabled: null` 到底该表示「没写」还是「坏了」——如果 Plan B 认为
+   它该是故障，那就不是补原语，而是把另外三个原语的对齐性论证反过来。
+
+2. **`marketplace` 定位符未归一化——需要一个设计裁决，不是代码修复。**
+   `{"owner":"", "repo":"r"}` 会归一成 `Some("/r")`，与 claude 侧 `split_plugin_key("p@")` →
+   `Some("")` 是同一类取舍。两侧都没有测试钉住。
+   **触发条件**：spec 明确「空 owner 表示什么」之后。在那之前**不要**动手——先写测试会把一个
+   没人裁决过的行为固化成契约。
+
+### 已知建模限制（已裁定接受，不要当 bug 修）
+
+3. **远程 MCP（只有 `type`/`url`、无 command）归一成同一个空 `Spec::Mcp`**，两个不同的远程
+   server 会撞成同一个身份。`supports()` 对 `Kind::Mcp` 一律返回 `Native`（三家都原生支持远程
+   MCP，报 `Unsupported` 才是错误建模）。这条限制逐字记在 `src/diff.rs` 的模块文档里。
+   **触发条件**：真正要写远程 MCP 时才需要给 `Spec::Mcp` 加字段——Plan A 不写，所以不建模。
+
+4. **`installed_plugins.json` 里同一 plugin 有多条 install 记录时，「第一条胜」。**
+   只钉了行为，没有钉「哪条**应该**胜」。实测该文件的实际形状如此。
+   **触发条件**：见到真实的反例数据再定。
+
+5. **codex 侧 `plugin_from_path(..) => None` → `SkillSource::Unknown` 这个 arm 不可达。**
+   `is_in_plugin_cache(p)` 的定义就是 `plugin_from_path(p).is_some()`，扫描器永远打不到 `None`。
+   这不是「忘了测」，是构造上即死。已用测试把两者的恒等关系双向钉住（`src/adapters/codex.rs`）。
+   **触发条件**：Plan B 若重定义 `is_in_plugin_cache` 与 `plugin_from_path` 的关系，届时该 arm
+   要么变成可达（补测试）、要么删掉。
+
+6. **`read_skills` 里 `e.resolved…unwrap_or_default()`**：断链会解析成一个被**上报为** `Other`
+   的值。只影响 `resolved` 这个便利字段，不参与 diff 判定。
+
+7. **codex 不记录 plugin 的 version/SHA**，故其 plugin 版本比较恒为 `Unknown` → in-sync
+   （见上文交接项 4）。
+
+### 验证方式的取舍（记录，不是待办）
+
+8. **`tests/smoke_real_home.rs` 是 `#[ignore]` 的手动门**，只读性的持续证据是静态守卫
+   `tests/read_only_guard.rs`，不是那个冒烟测试。
+9. **只读守卫看不见 `std::process::Command`**。本轮已把 `"Command::new("` 加进 `FORBIDDEN`
+   作为绊线（今天零匹配，加了不会红）。**Plan B 落地 `claude mcp add-json` shell out 时，
+   必须重新审视这条守卫**：Plan B 的写机制正是 shell out，届时的正确做法不是把 `Command::new(`
+   从 `FORBIDDEN` 里删掉，而是给写路径单独圈定一个允许它的、范围明确的位置。
+10. **`src/adapters/*.rs` 的 rustfmt-1.9.0 折行漂移**：整分支终审确认为纯格式、无语义影响，
+    但**是否提交由用户决定**（跑 `cargo fmt --all` / 固定工具链 / 保持现状）。不要替用户决定。
