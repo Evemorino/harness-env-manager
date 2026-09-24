@@ -1,4 +1,4 @@
-//! Plan A 只读守卫：`src/` 里除 `testutil.rs` 外不得出现任何文件写 API。
+//! Plan A 只读守卫：`src/` 里除 `testutil.rs` 及 `#[cfg(test)]` 测试模块外，不得出现任何文件写 API。
 //!
 //! 写路径（`.bak` + temp + rename、`claude mcp add-json` shell out）属 Plan B。
 //! 在 Plan B 落地前，这个测试是「henv diff 绝不改我的配置」这句承诺的唯一证据。
@@ -38,7 +38,32 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
 fn offenders(path: &Path) -> Vec<String> {
     let text = std::fs::read_to_string(path).expect("read src");
     let mut hits = Vec::new();
+    // `#[cfg(test)]` 代码不进产物二进制，测试夹具对 TempDir 的写不是生产写路径。
+    // 逐行扫时按括号深度跳过 `#[cfg(test)]` 门控的块，只对生产（非测试）代码报写 API。
+    let mut test_depth = 0usize;
+    let mut pending_cfg_test = false;
     for (i, line) in text.lines().enumerate() {
+        let opens = line.matches('{').count();
+        let closes = line.matches('}').count();
+
+        if test_depth > 0 {
+            // 还在测试块内：只记账括号，不报写 API。
+            test_depth = test_depth + opens - closes;
+            continue;
+        }
+        if line.trim() == "#[cfg(test)]" {
+            pending_cfg_test = true;
+            continue;
+        }
+        if pending_cfg_test {
+            pending_cfg_test = false;
+            // `#[cfg(test)] mod tests {` 才开门控块；`use …;` / `mod testutil;` 不产生块
+            // （use 的花括号在同一行成对），这类行本身不含写 API，跳过即可。
+            if opens > closes {
+                test_depth += opens - closes;
+            }
+            continue;
+        }
         // 文档与说明性注释里提到这些词是正常的，只看代码行
         if line.trim_start().starts_with("//") {
             continue;
