@@ -655,6 +655,39 @@ env = {}
         );
     }
 
+    /// `toml_type_name` 的 7 条 arm 里，`a float` 与 `a datetime` 没有别的测试走到，
+    /// 所以这两条专门钉它们：其余形状测试只覆盖了 string / integer / boolean / array / table。
+    /// 少一条就是一个未被执行的 arm（Task 7/8 那轮就是为此补的四条）。
+    #[test]
+    fn a_float_mcp_command_is_an_error_naming_its_type() {
+        let t = TempHome::new();
+        write_config(&t, "[mcp_servers.m]\ncommand = 1.5\n");
+        assert_eq!(
+            read_state_err(&t),
+            shape_msg(
+                &config_file(&t),
+                "mcp server `m` field `command`",
+                "a string",
+                "a float"
+            )
+        );
+    }
+
+    #[test]
+    fn a_datetime_mcp_command_is_an_error_naming_its_type() {
+        let t = TempHome::new();
+        write_config(&t, "[mcp_servers.m]\ncommand = 1979-05-27T07:32:00Z\n");
+        assert_eq!(
+            read_state_err(&t),
+            shape_msg(
+                &config_file(&t),
+                "mcp server `m` field `command`",
+                "a string",
+                "a datetime"
+            )
+        );
+    }
+
     #[test]
     fn a_non_array_mcp_args_is_an_error_naming_the_server_and_field() {
         let t = TempHome::new();
