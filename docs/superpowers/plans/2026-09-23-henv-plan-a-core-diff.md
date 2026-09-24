@@ -3340,15 +3340,20 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
 
 **Interfaces:**
 - Consumes: `Home::{claude_skills, claude_json, claude_installed_plugins, claude_settings}`、`skills_dir::{try_read_skill_entries, plugin_from_path, SkillStore}`、`capability::*`
-- Produces: `ClaudeCode::read_state()`。跨 adapter 复用的 `pub(crate)` 面（**可见性已按 `fee8dd3`
-  逐个核过，别再照记忆写**）：`read_json_if_present`、`split_plugin_key`、`mcp_capability`，
-  以及**六个**形状原语 `expect_object` / `expect_array` / `expect_string` /
-  `optional_string` / `optional_object` / `optional_array`。
+- Produces: `ClaudeCode::read_state()`。跨 adapter 复用的面（**可见性已按 `361b9bf` 逐个重核，
+  别再照 `fee8dd3` 的记忆写——那一版本节已被 T11a 推翻三处**）：`read_json_if_present`、
+  `split_plugin_key`、`mcp_capability` 三个 `pub(crate)`，加**七个**形状原语
+  `expect_object` / `expect_array` / `expect_string` / `optional_string` / `optional_object` /
+  `optional_array`（均 `pub(crate)`）与 `expect_bool`。
+  **`expect_bool` 目前是 `pub` 而不是 `pub(crate)`**，这是 clippy 逼出来的偏离：还没有调用方时，
+  未被调用的 `pub(crate)` fn 在 lib target 里算 dead code，`-D warnings` 直接报错，而本计划禁止
+  `#[allow]`。**Task 11 一旦有真实调用方就应当收回 `pub(crate)`**，别把这个面留成永久扩宽。
+  `split_plugin_key` 由 **claude 与 codex 共用这一份**（它收 `&str`、返回 owned 对，不碰 `Value`，
+  所以能跨 JSON/TOML 两家）；kimi 不需要拆——它的 `installed.json` 是数组、身份在 `id` 字段里。
   **模块私有、拿不到的**：`gate_enabled`、`type_name`、`shape_fault`、`read_json_value_if_present`
   ——它们是 claude 自己的门禁与报错细节；原语内部会调用它们，所以外部只用原语就够，
   **不要**试图 import 这四个。
-  `split_plugin_key` 只 claude 用（kimi 的 `installed.json` 是数组、身份在 `id` 字段里，
-  不需要拆 `name@marketplace`）。
+  （`split_plugin_key` 的共用范围见本节开头那句：claude + codex 两家同一份，只有 kimi 不需要拆。）
 
   六个原语的精确签名（`fee8dd3`，照这个写调用，别猜）：
 
@@ -3372,7 +3377,8 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
 
   **签名**（本节下面的示例已按 `fee8dd3` 的落地形态逐字改过，两者应当一致；若不一致以源码为准并回报差异）：
   `read_json_if_present(&Path) -> Result<Option<Value>>` 保证返回的文档**是对象**（顶层不是对象 =
-  形状故障）；只有 claude 与 kimi 两家走 JSON，**codex 读 TOML，这些 helper 一个都不复用**。
+  形状故障）；只有 claude 与 kimi 两家走 JSON，**codex 不复用任何 JSON helper**——它与 claude 之间
+  唯一跨模块共享的是与格式无关的 `&str` 级 `split_plugin_key`。
   `mcp_capability(name, cfg, harness, file) -> Result<Capability>` 是**可失败的**，第四个参数只用于
   报错定位（调用方自己的那个 JSON 文件）。
 
@@ -3386,8 +3392,14 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
   **Task 11 会撞上的一个空洞（现在就说明，别让它自己发现）**：kimi 的每条记录带 `enabled` 布尔，
   而 claude 那边同类判定用的是私有的 `gate_enabled` + `type_name`，`expect_*` 里**没有布尔版**。
   直接写 `.and_then(Value::as_bool).unwrap_or(true)` 就是本计划刚判定为 Critical 的那个塌缩。
-  正确做法：给这六个原语补第七个 `expect_bool`（同样 `pub(crate)`、同样只报类型不报值），
-  在 Task 11 的 commit 里一并落地并写回本节。
+  **本条已经落地，不再是 Task 11 的欠债**（原计划要求"在 Task 11 的 commit 里一并落地"，T11a 提前
+  做掉了）：`pub fn expect_bool(value: &Value, file: &Path, what: &str) -> anyhow::Result<bool>`
+  在 `claude_code.rs:430`。注意它**是 `pub` 不是 `pub(crate)`**——没有调用方时 `pub(crate)` 会被
+  `dead_code` 在 `-D warnings` 下判错，而本计划禁止抑制注解；**Task 11 接上调用方后应把它收回
+  `pub(crate)`**。调用形状：
+  `match record.get("enabled") { Some(v) => expect_bool(v, &file, "...")?, None => true }`
+  （未列 = 未表态，与 claude 的门禁语义一致）。**Task 11 仍欠的只有一条 ⚠️：`github` 嵌套
+  `and_then` 深路径必须显式裁决**——那件事 T11a 没有替它决定。
 
 实测数据形状（本机 2026-09-23 盘点，即测试 fixture 的依据）：
 
@@ -3872,7 +3884,7 @@ impl ClaudeCode {
 ```
 
 在同文件末尾追加下面这些工具。`pub(crate)` 的复用面共 **9 个**：`read_json_if_present`、
-`split_plugin_key`（只 claude 用）、`mcp_capability`，加六个形状原语。
+`split_plugin_key`（claude 与 codex 共用）、`mcp_capability`，加七个形状原语。
 **保持模块私有**的有 `read_json_value_if_present` / `gate_enabled` / `type_name` / `shape_fault`——
 它们是实现细节，原语内部会调用，外部拿到也用不上。
 
@@ -4439,15 +4451,18 @@ git commit -m "feat: codex read_state（config.toml 动态导航，对未知字�
 > `eab428e` 的容器层 `null` 裁决）。先前这里逐字复现 Critical 形状的 `plugins` 塌缩、
 > `id` 的 `else { continue }`、`mcpServers` 的 `and_then(as_object)` 都已换成
 > `optional_array` / `expect_object` + `expect_string` / `optional_object`。
-> **但示例里有两处我替不了你，代码上带着 ⚠️ 标记**：
-> 1. `enabled` 需要第七个原语 `expect_bool`（claude 侧同类判定用的是模块私有的 `gate_enabled` +
->    `type_name`，import 不到）。补法见 Task 9 `Produces` 末尾。
+> **原先前两件事，第一件已经在 `361b9bf` 替你做完，只剩一件你还欠着**：
+> 1. ~~`enabled` 缺 `expect_bool`~~ —— **已落地**，`claude_code.rs:430` 有
+>    `pub fn expect_bool(value: &Value, file: &Path, what: &str) -> anyhow::Result<bool>`，
+>    直接 import 调用即可（调用形状见 Task 9 `Produces` 那节）。**它现在是 `pub` 而不是
+>    `pub(crate)`，你接上调用方之后要顺手收回**——那是 clippy `dead_code` 当时的妥协，不该永久留着。
 > 2. `github` 那条嵌套 `and_then` 链是**可选深路径**，故意不用 `expect_*`；代价是 `github` 存在但
 >    类型不对时静默变 `None`。**这是你必须显式裁决的点**——保持现状并注释说明，或先
 >    `optional_object(github, ...)` 再把 owner/repo 当必填。两种都行，不许不裁决。
 >
-> 复用面（`fee8dd3` 核过可见性）：`read_json_if_present`、`mcp_capability` 和六个形状原语都是
-> `pub(crate)`；`gate_enabled` / `type_name` / `shape_fault` / `read_json_value_if_present`
+> 复用面（`361b9bf` 重核过可见性，`fee8dd3` 那版已被推翻）：`read_json_if_present`、
+> `mcp_capability` 和七个形状原语都可复用（`expect_bool` 目前 `pub`，接上调用方后收回
+> `pub(crate)`）；`gate_enabled` / `type_name` / `shape_fault` / `read_json_value_if_present`
 > 是 claude 模块私有，**拿不到也不需要拿**。`mcp_capability` 现在是
 > `(name, cfg, harness, file) -> Result<Capability>`，第四个参数让报错带出是哪家哪个文件读坏了。
 
@@ -4709,11 +4724,11 @@ Expected: FAIL —`read_state` 仍返回空 Vec。
 ```rust
 use crate::adapters::claude_code::{
     expect_object, expect_string, mcp_capability, optional_array, optional_object,
-    optional_string, read_json_if_present,
+    expect_bool, optional_string, read_json_if_present,
 };
 // 注意：`gate_enabled` / `type_name` / `shape_fault` 是 claude 模块私有的，import 不到，
-// 也不需要——它们藏在上面这些原语背后。kimi 的 `enabled` 布尔判定缺一个 `expect_bool`，
-// 见 Task 9 `Produces` 那节末尾的说明，补上后连同 import 一起改。
+// 也不需要——它们藏在上面这些原语背后。`expect_bool` 自 `361b9bf` 起可用（目前 `pub`，
+// 你接上调用方后收回 `pub(crate)`）。
 use crate::adapters::{HarnessAdapter, KIMI_CODE};
 use crate::capability::{CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets};
 use crate::home::Home;
@@ -4774,12 +4789,13 @@ impl KimiCode {
                 id: id.to_string(),
                 root: optional_string(record, "root", &file, &format!("plugins[{i}]"))?
                     .map(PathBuf::from),
-                // ⚠️ 这一行需要第七个原语 `expect_bool`（Task 9 的 `Produces` 末尾说明了为什么
-                // `.and_then(as_bool).unwrap_or(true)` 不行）。没有它之前，本行**照抄就是 bug**。
-                enabled: record
-                    .get("enabled")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true),
+                // `enabled` 用第七个原语 `expect_bool`：未列 = 未表态 = 启用；
+                // 键在但不是布尔 = 故障。写成 `.and_then(as_bool).unwrap_or(true)`
+                // 就是 Task 9 判为 Critical 的那类塌缩。
+                enabled: match record.get("enabled") {
+                    Some(v) => expect_bool(v, &file, &format!("plugins[{i}] field `enabled`"))?,
+                    None => true, // 未列 = 未表态 = 启用，与 claude 门禁同语义
+                },
                 // ⚠️ 下面这段嵌套 `and_then` 链是一条**可选深路径**：任何一层缺失都得是 `None`，
                 // 所以它**故意**不用 expect_*（那样 `github` 缺失就成故障了）。
                 // 代价：`github` 存在但类型不对时同样静默变 `None`。
