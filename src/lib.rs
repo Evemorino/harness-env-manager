@@ -1,5 +1,6 @@
 pub mod adapters;
 pub mod capability;
+pub mod diff;
 pub mod home;
 pub mod lower;
 pub mod manifest;
