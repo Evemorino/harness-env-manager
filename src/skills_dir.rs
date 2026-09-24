@@ -166,13 +166,21 @@ impl HomePrefixes {
 /// 判定一个已解析的真实路径归属哪个库（纯函数：前缀已由 [`HomePrefixes`] 归一化好）。
 ///
 /// **下面的裁决顺序本身是契约**（D2）：`Shared` → `PluginCache` → `HarnessLocal` → `Other`。
+/// 每一对相邻 arm 都有一个「两边同时命中」的 fixture，顺序才是可观察的。实测的看守者：
 ///
-/// - `Shared` 必须排在 `HarnessLocal` 之前：一个 harness 目录被整个软链进共享库时两侧
-///   **同时**命中（实测：`.agents` 与 `.codex` 指向同一真实目录）。共享库是单一真源、三家
-///   从它分发，所以归属应当是 `Shared`——内容改了是一处改动。反过来判 `HarnessLocal` 会把
-///   同一份字节报成三家的独立差异，drift 语义正好相反。
-/// - `PluginCache` 必须夹在这两者之间：claude 的插件缓存物理上就在 `~/.claude` 之内，先判
-///   `HarnessLocal` 会把它误分类。
+/// - `Shared` 先于 `PluginCache` → `a_shared_store_skill_with_a_plugin_cache_tail_is_still_shared`
+///   （缓存判定不锚定 harness 根，所以共享库里一个带缓存尾巴的目录两条 arm 全中）。把
+///   `PluginCache` arm 挪到最前面，整套 120 个测试里**只有**这一条会红。
+/// - `Shared` 先于 `HarnessLocal` → `a_harness_dir_that_is_the_shared_store_is_classified_shared`
+///   （实测 `.agents` 与 `.codex` 指向同一真实目录，两侧前缀同时命中）。共享库是单一真源、
+///   三家从它分发，所以归属应当是 `Shared`——内容改了是一处改动；判 `HarnessLocal` 会把同一份
+///   字节报成三家的独立差异，drift 语义正好相反。
+/// - `PluginCache` 先于 `HarnessLocal` → `symlink_into_plugin_cache_is_plugin_cache_and_yields_plugin_name`
+///   与 `classify_requires_plugins_before_the_cache_segment`（claude 的插件缓存物理上就在
+///   `~/.claude` 之内，把缓存 arm 挪到 `HarnessLocal` 之后，红的就是这两条）。
+///
+/// `Other` 是三条都不命中的兜底位，不参与排序裁决。
+/// 判成 `PluginCache` 不是换个标签：它是 Task 13 的 drift **豁免位**，排错序的方向是漏报。
 pub fn classify(resolved: &Path, prefixes: &HomePrefixes) -> SkillStore {
     if resolved.starts_with(&prefixes.agents_skills) {
         return SkillStore::Shared;
@@ -509,6 +517,52 @@ mod tests {
             "两侧前缀现在都等于这个真实目录，才有裁决可谈"
         );
         assert_eq!(got[0].store, SkillStore::Shared, "冲突时归共享库");
+    }
+
+    /// 裁决顺序契约的另一半：`Shared` 也必须排在 `PluginCache` 之前。
+    ///
+    /// 上面那条只钉住了 `Shared` vs `HarnessLocal`——实测把 `PluginCache` arm 挪到
+    /// `classify` 最前面，整套（119 个）测试全绿。这里造出**两条 arm 同时命中**的形态：
+    /// `is_in_plugin_cache` 只看段序列、不锚定 harness 根（`is_in_plugin_cache` 的文档里
+    /// 记着这条残留），所以共享库里一个带 `plugins/cache/<mp>/<name>/<sha>/skills/<s>`
+    /// 尾巴的目录**既**在共享库之下**又**长得像缓存。
+    ///
+    /// 结论必须是 `Shared`：判成 `PluginCache` 不是换个标签，而是把它交给 Task 13 的
+    /// drift **豁免位**——共享库里真被改动的 skill 就此静默免检，方向正好是漏报。
+    #[test]
+    fn a_shared_store_skill_with_a_plugin_cache_tail_is_still_shared() {
+        let t = TempHome::new();
+        let entry = ".agents/skills/plugins/cache/claude-plugins-official/superpowers/b36e0829c6d0/skills/brainstorming";
+        let scanned =
+            ".agents/skills/plugins/cache/claude-plugins-official/superpowers/b36e0829c6d0/skills";
+        t.mkdir(entry);
+        let got = read_skill_entries(&t.path(scanned), &t.home);
+        assert_eq!(got.len(), 1);
+        assert_eq!(
+            got[0].path,
+            t.path(entry),
+            "path 是扫描到的位置，必须仍在共享库内"
+        );
+        let resolved = got[0].resolved.clone().expect("resolves");
+
+        // 两条 setup 断言是**前提**不是结论：它们不成立时这里就没有「两个 arm 同时命中」
+        // 可谈，裁决顺序也无从观察——那种 fixture 会一路绿到底，所以前提必须能报红。
+        let prefixes = HomePrefixes::new(&t.home).expect("prefixes");
+        assert!(
+            resolved.starts_with(&prefixes.agents_skills),
+            "前提 1：解析结果必须落在共享库内（`Shared` arm 命中），实际 {resolved:?}"
+        );
+        assert_eq!(
+            plugin_from_path(&resolved).as_deref(),
+            Some("superpowers"),
+            "前提 2：同一串必须同时报得出 plugin 身份（`PluginCache` arm 也命中）"
+        );
+
+        assert_eq!(
+            got[0].store,
+            SkillStore::Shared,
+            "两条 arm 同时命中时归共享库：Shared 必须排在 PluginCache 之前"
+        );
     }
 
     #[test]

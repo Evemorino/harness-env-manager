@@ -2703,8 +2703,16 @@ git commit -m "feat: skills 目录扫描，识别多跳链接/断链/来源分�
   纯函数、零 IO。前缀由 `HomePrefixes::new(&Home) -> anyhow::Result<Self>` 一次算好，整次扫描
   共用一份（→ 分类结论不再依赖「问的时机」，每条 entry 也不重复 canonicalize 四个前缀）。
   裁决顺序 `Shared` → `PluginCache` → `HarnessLocal` → `Other` **是契约**，理由是共享库为单一
-  真源、claude 插件缓存物理上在 `~/.claude` 之内；由
-  `a_harness_dir_that_is_the_shared_store_is_classified_shared` 钉住（D2）。
+  真源、claude 插件缓存物理上在 `~/.claude` 之内。**每一对相邻 arm 各有看守者**（residual 轮
+  实测，转写 Task 13 时按这一节抄）：
+  `Shared` 先于 `HarnessLocal` 由 `a_harness_dir_that_is_the_shared_store_is_classified_shared`
+  钉住；`Shared` 先于 `PluginCache` 由
+  `a_shared_store_skill_with_a_plugin_cache_tail_is_still_shared` 钉住（把 `PluginCache` arm
+  挪到最前面时，120 个测试里**只有**这一条会红——在此之前那对顺序无人看守）；
+  `PluginCache` 先于 `HarnessLocal` 由
+  `symlink_into_plugin_cache_is_plugin_cache_and_yields_plugin_name` 与
+  `classify_requires_plugins_before_the_cache_segment` 钉住。
+  这条顺序对 Task 13 有实际后果：`PluginCache` 是 drift **豁免位**，排错序的方向是漏报。
 - **豁免位 == 身份位**（D1）：`is_in_plugin_cache(p) == plugin_from_path(p).is_some()`，
   `plugins` 必须在缓存段之前。Task 13 可以放心把 `PluginCache` 当 drift 豁免位用——它不会再
   豁免掉一个报不出 plugin 身份的路径。残留：判定只看段序列、不锚定 harness 根，所以
