@@ -940,6 +940,33 @@ enabled = false
         assert_eq!(labels.len(), dedup.len(), "duplicate ids: {labels:?}");
     }
 
+    /// 身份是 `kind + name` 两半，不只是名字：同名的一条 skill 和一条 MCP 必须**都**留下。
+    /// 本条存在的理由是那条 `dedup_by(|a, b| a.id == b.id)`——把判据换成只看名字的
+    /// `a.id.name == b.id.name` 时，只有本条会红（`output_is_sorted_and_deduplicated` 的
+    /// fixture 名字互不相同，另两条测试的 skill/MCP 不落在相邻位置），所以「去重按 id 而不是
+    /// 按名字」这件事必须有这一条来钉，否则派单的 id 语义在 codex 侧无人看守。
+    #[test]
+    fn a_skill_and_an_mcp_sharing_a_name_are_both_reported() {
+        let t = TempHome::new();
+        t.mkdir(".codex/skills/dup");
+        write_config(&t, "[mcp_servers.dup]\ncommand = \"c\"\n");
+        let caps = Codex::new(t.home.clone()).read_state().unwrap();
+        let labels: Vec<String> = caps.iter().map(|c| c.id.label()).collect();
+        assert_eq!(
+            labels,
+            ["mcp/dup".to_string(), "skill/dup".to_string()],
+            "{labels:?}"
+        );
+        assert_eq!(
+            find(&caps, Kind::Skill, "dup").map(|c| c.id.kind),
+            Some(Kind::Skill)
+        );
+        assert_eq!(
+            find(&caps, Kind::Mcp, "dup").map(|c| c.id.kind),
+            Some(Kind::Mcp)
+        );
+    }
+
     /// 同名 plugin 来自两个 marketplace 时，两个键归一化成同一个 `CapId`，派单要求的
     /// dedup 于是**丢掉一条**。这条钉住「确实只剩一条、而且留下的是哪一条」：
     /// `output_is_sorted_and_deduplicated` 的 fixture 四条 id 互不相等，删掉 `dedup_by`
