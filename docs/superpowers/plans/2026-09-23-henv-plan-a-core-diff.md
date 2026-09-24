@@ -2581,6 +2581,63 @@ git commit -m "feat: skills 目录扫描，识别多跳链接/断链/来源分�
 
 ---
 
+#### Task 7 追加（评审后补：4 项 Important + 一处计划文本落后于代码）
+
+**先修计划本身。** Step 3 写的 `classify` 用**字面前缀**比较，`d293e11` 已把它改成
+`canonical_prefix()` 归一化后再比——那是正确的偏离（`Home` 只归一化 root，中间层软链没解，
+字面前缀永远配不上 `fs::canonicalize` 的结果）。**评审明确警告：计划文本不更新，Task 9/10/11 与
+13 再照 brief 转写就会把这个 bug 装回去。** 所以下面 D0 先把 Step 3 的语义钉住。
+
+**D0 — 在 Step 3 的 `classify` 处记录已生效的偏离**（不改行为，只让转写者照新形态写）：
+两侧前缀都必须先经 `canonical_prefix()` 归一化，且**只在该层目录不存在（`NotFound`）时才退回字面
+路径**，其余错误 kind 不得静默吞掉。
+
+**D1 — `is_in_plugin_cache` 顺序盲，会静默豁免真实 drift（评审实测，比原报告更严重）。**
+现实现是 `comps.any("plugins") && comps.any("cache"|"managed")`，任意顺序、任意深度都命中。
+探针实测 `~/.claude/skills/my-skill/plugins/cache/x` 被判 `PluginCache`（应为 `HarnessLocal`）。
+因为 `PluginCache` 正是 drift 豁免位（模块文档 `:11-12`），这就是把真 drift 藏掉，还会向 Task 13
+吐出「有 plugin 缓存形态却没有 plugin 身份」的能力。而且它与 `plugin_from_path`（要求 `plugins`
+在缓存段**之前**）自相矛盾。修：两处合一，`is_in_plugin_cache(p) == plugin_from_path(p).is_some()`
+或共用同一个位置守卫；并给 `classify_requires_a_plugins_segment_...` 补一个「cache 在 plugins 之上」
+的反例——现有 fixture 只变动 `plugins` 的**有无**，没变动顺序。
+
+**D2 — `Shared` 先于 `HarnessLocal` 的裁决顺序无人钉住，而 `d293e11` 之后它才可观察。**
+归一化之后，一个被软链进共享库的 harness 目录会**同时**命中两侧。探针实测：`.agents` 与 `.codex`
+指向同一真实目录时，当前顺序给 `Shared`、交换顺序给 `HarnessLocal`——两者 drift 语义相反。
+变异「交换两个 arm」17/17 全绿。修：加一条两条软链指向同一目录、断言 `Shared` 的 fixture，并把裁决
+理由写进 `classify` 文档。
+
+**D3 — `canonical_prefix` 吞掉所有错误 kind，而它的文档注释说自己不吞。**（控制器与实施者各自独立
+发现，评审确认。）`unwrap_or_else(|_| to_path_buf())` 在 `PermissionDenied`/`ELOOP`/`ENOTDIR` 上同样
+退回字面值，于是本 commit 要消除的「静默 `Other`」换个触发条件复活。注释声称对齐 `Home::try_new`
+的 NotFound-only 规则，实际对齐的是 `Home::new`——而 `Home::new` 的文档明写「会吞错……生产入口不要
+用这里」，等于挑了项目已经否决的那个样板。修：`io::Result<PathBuf>`，只有 `NotFound` 返回
+`Ok(原值)`，其余上抛；**更推荐**把这段逻辑做成 `Home` 上的一个归一化辅助，让 `Home::try_new` 与
+`classify` 共用——目前同一语义存在两份、两套契约。
+
+**D4 — 存在但读不了的 skills 目录，与「这个 harness 没有 skills」无法区分。**
+实测：`chmod 000` 的目录 `read_dir` 返回 `Some(PermissionDenied)`，`read_skill_entries` 交出 0 条；
+非目录返回 `ENOTDIR`，同样 0 条。把两条吞没都换成 `panic!` 仍是 17/17 全绿。计划的
+「配置文件缺失不是错误」只覆盖**不存在**，不覆盖读不了，而漏报方向对只读工具最坏。
+修：`NotFound` 保持返回空 `Vec`，其余 kind 上抛（按 `Home::try_new` 先例加
+`try_read_skill_entries(...) -> anyhow::Result<Vec<SkillEntry>>`）；`:51` 的 `read.flatten()` 与
+`:61` 的 `file_type` 失败跳过同理，要么上抛要么加注释说明为何可以逐条丢失。
+
+**D5 — 顺手补三条便宜的钉死（评审实测「删了也不红」）。**
+`SkillEntry.path` 目前无人固定，改成 canonical 后的 `resolved` 仍 17/17 全绿，而 adapters/doctor 要
+按它显示磁盘位置、也必须保持原样才可 diff；加
+`assert_eq!(got[0].path, t.path(".claude/skills/x"))`。再加一条**两跳链**测试（多跳解析是本模块标题
+能力，现在只测了一跳，改成单跳「优化」不会被发现）。
+
+评审另指八处冗余断言（`:182 :184 :200 :218 :229 :241 :334 :352`，逐条删除均不红），其中 `:218`
+`:229` 是本 fix commit 自己加的；处理方向不是删掉，而是按报告建议改成断言 `resolved` 的**具体值**。
+`classify` 每条 entry 重复 canonicalize 至多 4 个前缀、无记忆化：建议扫一次造一个 `HomePrefixes`
+再传进 `classify`，顺带让 `classify` 恢复纯函数、也让 D2 的裁决显式化。
+
+做完 D0-D5 后 `cargo test --lib skills_dir::` 期望 **21 tests**（现 17 + D1/D2/D4/D5 各 1）。
+
+---
+
 ### Task 8: Adapter trait 与注册表
 
 **Files:**
