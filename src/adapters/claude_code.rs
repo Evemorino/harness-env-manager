@@ -156,6 +156,9 @@ impl HarnessAdapter for ClaudeCode {
         let mut caps = self.read_skills()?;
         caps.extend(self.read_mcps()?);
         caps.extend(self.read_plugins()?);
+        caps.sort_by_key(|a| a.id.label());
+        // dedup_by 只去重相邻项，所以必须先 sort
+        caps.dedup_by(|a, b| a.id == b.id);
         Ok(caps)
     }
 
@@ -613,6 +616,84 @@ mod tests {
             Spec::Plugin { version, sha, .. } => {
                 assert_eq!(*sha, None, "空串不是定位符");
                 assert_eq!(*version, None, "`unknown` 不是版本号");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn missing_files_are_not_errors() {
+        let t = TempHome::new();
+        t.mkdir(".claude");
+        let caps = ClaudeCode::new(t.home.clone())
+            .read_state()
+            .expect("no config != error");
+        assert!(caps.is_empty());
+    }
+
+    #[test]
+    fn malformed_json_is_an_error_naming_the_file() {
+        let t = TempHome::new();
+        t.write(".claude.json", "{ not json");
+        let err = ClaudeCode::new(t.home.clone())
+            .read_state()
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains(".claude.json"), "{err}");
+    }
+
+    #[test]
+    fn output_is_sorted_and_deduplicated_by_id() {
+        let t = TempHome::new();
+        t.mkdir(".claude/skills/zzz")
+            .mkdir(".claude/skills/aaa")
+            .write(
+                ".claude.json",
+                r#"{ "mcpServers": { "z": { "command": "c" }, "a": { "command": "c" } } }"#,
+            );
+        let caps = ClaudeCode::new(t.home.clone()).read_state().unwrap();
+        let labels: Vec<String> = caps.iter().map(|c| c.id.label()).collect();
+        let mut sorted = labels.clone();
+        sorted.sort();
+        assert_eq!(labels, sorted, "{labels:?}");
+        let mut dedup = labels.clone();
+        dedup.dedup();
+        assert_eq!(labels.len(), dedup.len(), "duplicate ids: {labels:?}");
+    }
+
+    /// 同名 plugin 来自两个 marketplace 时，`installed_plugins.json` 的两个键归一化成同一个
+    /// `CapId`，派单要求的 dedup 于是**丢掉一条**。这条测试是钉住「确实只剩一条」这个事实，
+    /// 不是认可合并是对的：合并留下哪条由 serde_json `Map` 的键序（BTreeMap，未开
+    /// `preserve_order`）+ 稳定排序决定，所以是可复现的。真要区分两个 marketplace 得把
+    /// 它纳入 `CapId`，那是 Task 13/14 的裁决，不在 Task 9。
+    /// 变异实测：删掉 `dedup_by` 那行，红的只有这一条（`dups.len()` 变成 2）。
+    #[test]
+    fn same_entry_name_from_two_marketplaces_collapses_to_one_capability() {
+        let t = TempHome::new();
+        t.write(
+            ".claude/plugins/installed_plugins.json",
+            r#"{ "version": 2, "plugins": {
+                 "dup@mp-b": [ { "version": "2.0" } ],
+                 "dup@mp-a": [ { "version": "1.0" } ] } }"#,
+        );
+        let caps = ClaudeCode::new(t.home.clone()).read_state().unwrap();
+        let dups: Vec<&Capability> = caps
+            .iter()
+            .filter(|c| c.id.kind == Kind::Plugin && c.id.name == "dup")
+            .collect();
+        assert_eq!(dups.len(), 1, "id 相同的多条会被 dedup 合并成一条");
+        match &dups[0].spec {
+            Spec::Plugin {
+                marketplace,
+                version,
+                ..
+            } => {
+                assert_eq!(
+                    marketplace.as_deref(),
+                    Some("mp-a"),
+                    "留下的是键序在前的那条"
+                );
+                assert_eq!(version.as_deref(), Some("1.0"));
             }
             other => panic!("{other:?}"),
         }
