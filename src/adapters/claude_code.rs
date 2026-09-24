@@ -738,6 +738,40 @@ mod tests {
         assert!(find(&caps, Kind::Plugin, "ghost").is_none());
     }
 
+    /// 一条键多条安装时 v1 **只取第一条，其余整条丢掉**——这是「丢数据」的形状，所以钉住
+    /// 「丢的是后面的那些」：换成 `.last()` / 逐条 push，本条要红。
+    /// 残余：多条安装到底该取哪一条（越新越优先？）没在这里裁定，那是 Task 13/14 的裁决，
+    /// 和「同名不同 marketplace 被 dedup 合并留哪条」是同一族问题。
+    #[test]
+    fn only_the_first_install_record_is_read_and_the_rest_are_dropped() {
+        let t = TempHome::new();
+        t.write(
+            ".claude/plugins/installed_plugins.json",
+            r#"{ "version": 2, "plugins": { "p@mp": [
+                  { "version": "1.0", "gitCommitSha": "aaa" },
+                  { "version": "2.0", "gitCommitSha": "bbb" } ] } }"#,
+        );
+        let caps = ClaudeCode::new(t.home.clone()).read_state().unwrap();
+        let same_id: Vec<&Capability> = caps
+            .iter()
+            .filter(|c| c.id == CapId::new(Kind::Plugin, "p"))
+            .collect();
+        assert_eq!(same_id.len(), 1, "一个 plugin 键只产出一条能力");
+        match &same_id[0].spec {
+            Spec::Plugin {
+                version,
+                sha,
+                enabled,
+                ..
+            } => {
+                assert_eq!(version.as_deref(), Some("1.0"), "取的是第一条");
+                assert_eq!(sha.as_deref(), Some("aaa"), "locator 也来自第一条");
+                assert!(*enabled);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// 派单字面代码在 `read_plugins` 里写的是
     /// `self.read_enabled_plugins().unwrap_or_default()`（注释：「读失败不该拖垮 plugin
     /// 扫描，退化成全部视为 enabled」）。那正是失败隔离契约禁止的形状：一个语法坏掉的
