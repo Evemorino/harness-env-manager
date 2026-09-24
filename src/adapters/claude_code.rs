@@ -406,7 +406,7 @@ pub(crate) fn expect_string<'a>(
 /// 而 claude 侧同类判定用的是本模块私有的 `gate_enabled` + `type_name`，import 不到。
 /// 直接写 `.and_then(Value::as_bool).unwrap_or(true)` 就是计划里判为 Critical 的塌缩——
 /// `enabled: "yes"` 会被读成「已启用」，diff 于是把用户关掉的 plugin 念成已同步。
-/// 所以调用方（Task 11）写成：
+/// 所以调用方（`adapters::kimi_code::read_plugins`，已落地）写成：
 ///
 /// ```text
 /// let enabled = match record.get("enabled") {
@@ -421,13 +421,12 @@ pub(crate) fn expect_string<'a>(
 /// （`toml::Value` 与本函数收的 `serde_json::Value` 类型域不通，合并不了；
 /// 与 `split_plugin_key` 那个能合并的 `&str` 情形不同）。
 ///
-/// **可见性是这一族里唯一的例外，写成 `pub` 而不是 `pub(crate)`**：它现在还没有生产调用方
-/// （Task 11 才接上），而 `pub(crate)` + 只有 `#[cfg(test)]` 用 = 在 lib 目标里是死代码，
-/// `cargo clippy --all-targets -- -D warnings` 直接报 `expect_bool is never used`。
-/// 本计划不许用 `#[allow]`/`#[expect]` 消 lint，放宽成 `pub` 是不改任何已评审行为的那条路
-/// （另一条路是把 claude 私有的那处布尔判定改成调用它，那会改掉 Task 9 已钉死的报错文本，
-/// 超出本次范围）。Task 11 落地调用方之后，协调方如愿意可把它收紧回 `pub(crate)`。
-pub fn expect_bool(value: &Value, file: &Path, what: &str) -> anyhow::Result<bool> {
+/// 它**曾经**是这一族里唯一写成 `pub` 的成员：那时还没有生产调用方，而
+/// `pub(crate)` + 只有 `#[cfg(test)]` 用 = 在 lib 目标里是死代码，
+/// `cargo clippy --all-targets -- -D warnings` 直接报 `expect_bool is never used`，
+/// 而本计划不许用 `#[allow]`/`#[expect]` 消 lint。kimi 接上调用方之后已收回
+/// `pub(crate)`，与其余六个原语同一可见性——这一族对外没有 `pub` 成员。
+pub(crate) fn expect_bool(value: &Value, file: &Path, what: &str) -> anyhow::Result<bool> {
     value
         .as_bool()
         .ok_or_else(|| shape_fault(value, file, what, "a boolean"))
@@ -464,9 +463,9 @@ pub(crate) fn optional_string<'a>(
 ///
 /// 形状原语这一族**七条**（`expect_object` / `expect_array` / `expect_string` /
 /// [`expect_bool`] / `optional_string` / 本函数 / `optional_array`）：
-/// **走 JSON 的调用方**（claude 自己 + Task 11 的 kimi）复用它们，不许另写一份。
-/// 第七条 `expect_bool` 是 Task 9 `Produces` 末尾点出的那个空洞补上的（kimi 的 `enabled`）；
-/// 它暂时是 `pub` 而不是 `pub(crate)`，理由（死代码 lint，不是签名变更）写在它自己的文档里。
+/// **走 JSON 的调用方**（claude 自己 + `adapters::kimi_code`）复用它们，不许另写一份。
+/// 第七条 `expect_bool` 是 Task 9 `Produces` 末尾点出的那个空洞补上的（kimi 的 `enabled`），
+/// kimi 落地调用方后它已与其他六条同为 `pub(crate)`（曾经的 `pub` 妥协见它自己的文档）。
 /// 这里也曾经写着「Task 10/11 复用它们」，那是错的：codex 手里是 `toml::Value`，与本族收的
 /// `serde_json::Value` 类型域不通，一个都喂不进去，所以它另写了 `toml_expect_*` /
 /// `toml_optional_*` 那一套。两套只能各自被自己的测试钉住，改形状规则时**两处都要改**。
