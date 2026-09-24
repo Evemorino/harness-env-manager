@@ -191,13 +191,18 @@ impl HarnessAdapter for ClaudeCode {
 /// 读 JSON；文件不存在返回 `Ok(None)`，语法错误返回带路径的 Err。
 ///
 /// 「没有这个文件」和「文件在但读不出/解析不了」必须是两种返回——前者是正常状态，
-/// 后者按计划里的失败隔离契约整次 diff 失败。Task 10/11 共用。
+/// 后者按计划里的失败隔离契约整次 diff 失败。
 ///
-/// 返回的文档还保证是**对象**：三家 harness 的这几个配置文件都是「顶层一个 map」的
-/// 形状，而调用方一律用 `root.get("...")` 取键。顶层不是对象时 `get` 只会给 `None`，
+/// **共用范围是「走 JSON 的两家」：claude 自己 + Task 11 的 kimi。**
+/// 说「Task 10/11 共用」是错的（Task 9 期间的旧措辞，Task 10 落地后一直没改）：
+/// codex 读 TOML，`adapters::codex::read_config` 是它自己那份，这两个函数它一个都不用。
+///
+/// 返回的文档还保证是**对象**：走 JSON 的这几家 harness 的配置文件都是「顶层一个 map」
+/// 的形状，而调用方一律用 `root.get("...")` 取键。顶层不是对象时 `get` 只会给 `None`，
 /// 于是 `[]` / `"oops"` / `5` 这类坏文件会被读成「一个键都没有」= 「这个 harness 没配
-/// 任何能力」，正是「形状故障也是故障」那块禁止的塌缩。守卫放在这里，Task 10/11 复用
-/// 本函数就自动带上，不必各家再写一遍。
+/// 任何能力」，正是「形状故障也是故障」那块禁止的塌缩。守卫放在这里，复用本函数的调用方
+/// （claude 与 kimi）自动带上，不必各家再写一遍；codex 不需要这条守卫——TOML 文档本身就是
+/// 一个键值表，`toml::from_str::<TomlTable>` 给不出 `"oops"` 那种顶层（见 `read_config`）。
 ///
 /// 唯一的例外是整个文档就是一个 `null`：那是容器层的「无」，与「没有这个文件」同义
 /// （计划里 `null` 裁决那条：容器层 `null` = 没配，叶子层 `optional_string` 早已这么读），
@@ -238,7 +243,14 @@ fn read_json_value_if_present(path: &Path) -> anyhow::Result<Option<Value>> {
 
 /// `"superpowers@claude-plugins-official"` → `("superpowers", Some("claude-plugins-official"))`
 ///
-/// 只有 claude 需要拆：kimi 的 `installed.json` 是数组、身份直接躺在 `id` 字段里（Task 11）。
+/// **claude 与 codex 两家的安装记录键都是 `name@marketplace`，都用这一个函数。**
+/// 此前这里的文档写着「只有 claude 需要拆」，而 codex 侧因此另写了一份逐字相同的私有
+/// `split_key`（Task 10 的派单边界，它当时不许改本文件）——两份无同步守卫的孪生实现是
+/// 真实的漂移风险（拆分规则一改，一侧忘改就是 marketplace 静默变 `None`），所以现在合并成
+/// 这一份，`adapters::codex::read_plugins` 直接调用它。
+/// 签名与配置文件格式无关：收 `&str`、返回 owned 对，**不**碰 `serde_json::Value`，
+/// 这也是它能同时服务 JSON 与 TOML 两家的原因（上面那两个 JSON helper 就做不到）。
+/// kimi 不需要拆：它的 `installed.json` 是数组、身份直接躺在 `id` 字段里（Task 11）。
 pub(crate) fn split_plugin_key(key: &str) -> (String, Option<String>) {
     match key.split_once('@') {
         Some((entry, mp)) => (entry.to_string(), Some(mp.to_string())),
@@ -275,7 +287,10 @@ fn gate_enabled(enabled_map: &BTreeMap<String, bool>, key: &str, entry: &str) ->
 /// 把一个 MCP 配置对象归一化。env 值保持 `${VAR}` 引用形态，绝不展开。
 ///
 /// 只搬 `command` / `args` / `env` 三样：`type` 之类先不进 `Spec`（Task 3 的 `Spec::Mcp`
-/// 里没有承载它的字段）。Task 10/11 共用。
+/// 里没有承载它的字段）。
+/// **共用范围同 `read_json_if_present`：走 JSON 的两家（claude + Task 11 的 kimi）。**
+/// codex 不复用它——它的 MCP 在 `config.toml` 里，`adapters::codex::read_mcps` 用
+/// `toml::Value` 那一套原语读，类型域与这里的 `serde_json::Value` 不通。
 ///
 /// 三样各自的「没配」和「配坏了」都不可合并，所以本函数是 `Result`：
 /// `command` 缺键（或显式 `null`）才是 `""`——`Spec::Mcp.command` 是 `String`，
@@ -411,8 +426,12 @@ pub(crate) fn optional_string<'a>(
 /// `mcpServers` 里一个已具名 server 的配置。那些位置的 `null` 是坏值，不是「没配」，
 /// 所以 `type_name` 的 `"null"` 分支必须仍然可达。
 ///
-/// 六个形状原语（`expect_object` / `expect_array` / `expect_string` / `optional_string` /
-/// 本函数 / `optional_array`）都是 `pub(crate)`：Task 10/11 复用它们，不许另写一份。
+/// 形状原语这一族（`expect_object` / `expect_array` / `expect_string` / `optional_string` /
+/// 本函数 / `optional_array`）都是 `pub(crate)`：**走 JSON 的调用方**（claude 自己 +
+/// Task 11 的 kimi）复用它们，不许另写一份。
+/// 这里也曾经写着「Task 10/11 复用它们」，那是错的：codex 手里是 `toml::Value`，与本族收的
+/// `serde_json::Value` 类型域不通，一个都喂不进去，所以它另写了 `toml_expect_*` /
+/// `toml_optional_*` 那一套。两套只能各自被自己的测试钉住，改形状规则时**两处都要改**。
 /// 「看见缺键」的那三个是 `optional_*`，它们收 `Option<&Value>`；`expect_*` 只收 `&Value`。
 pub(crate) fn optional_object<'a>(
     value: Option<&'a Value>,
@@ -1678,6 +1697,36 @@ mod tests {
                 "an object",
                 "a string"
             )
+        );
+    }
+
+    /// 合并成一份实现之后（codex 那个逐字相同的私有 `split_key` 已删），这条把**两家共用**
+    /// 的拆分语义钉住：按**第一个** `@` 拆，多出来的 `@` 留在 marketplace 段里。
+    /// 派单点名的孪生风险是「一侧改了另一侧没改」，合并本身已经消掉它；但两侧原有 fixture
+    /// 只有「单 `@`」与「无 `@`」两种，都判不出 `split_once` 与 `rsplit_once` 的差别。
+    #[test]
+    fn split_plugin_key_splits_on_the_first_at_sign_only() {
+        assert_eq!(
+            split_plugin_key("superpowers@claude-plugins-official"),
+            (
+                "superpowers".to_string(),
+                Some("claude-plugins-official".to_string())
+            )
+        );
+        assert_eq!(
+            split_plugin_key("bare"),
+            ("bare".to_string(), None),
+            "没有 `@` 时 marketplace 是 None，不是空串"
+        );
+        assert_eq!(
+            split_plugin_key("p@a@b"),
+            ("p".to_string(), Some("a@b".to_string())),
+            "两个 `@`：第一个是分隔符，其余算 marketplace 的一部分"
+        );
+        assert_eq!(
+            split_plugin_key("@mp"),
+            (String::new(), Some("mp".to_string())),
+            "本函数不校验名字：空 entry 原样返回，裁决不在这里"
         );
     }
 

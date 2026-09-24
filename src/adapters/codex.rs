@@ -1,3 +1,4 @@
+use crate::adapters::claude_code::split_plugin_key;
 use crate::adapters::{CODEX, HarnessAdapter};
 use crate::capability::{CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets};
 use crate::home::Home;
@@ -127,7 +128,14 @@ impl Codex {
             // 「值不是表」和「表确实为空」是两种事实：`plugins = { p = true }` 是键写了却没给
             // 记录（坏值），而 `[plugins.p]`（空表）才是「装了但一条配置都没写」。
             let cfg = toml_expect_table(cfg, file, &context)?;
-            let (entry, marketplace) = split_key(key);
+            // 安装记录键的拆分复用 claude 那一份：`name@marketplace` 这个形状两家都有，
+            // 而 `split_plugin_key` 只碰 `&str`，与 TOML/JSON 的值类型无关，所以能共用。
+            // 本文件**曾经**为此另写过一个逐字相同的私有 `split_key`（Task 10 的派单边界，
+            // 当时 `claude_code.rs` 的文档还写着「只有 claude 需要拆」）——两份无同步守卫的
+            // 实现是真实的漂移风险，边界解除后合并成现在这一处。
+            // 除它以外本文件不从 `claude_code` 拿任何东西：那批 helper 收
+            // `serde_json::Value`，与本文件的 `toml::Value` 类型域不通。
+            let (entry, marketplace) = split_plugin_key(key);
             out.push(Capability {
                 id: CapId::new(Kind::Plugin, entry.clone()),
                 origin: Origin::Adopted {
@@ -343,19 +351,6 @@ fn toml_optional_bool(
         return Ok(None);
     };
     toml_expect_bool(value, file, &format!("{context} field `{key}`")).map(Some)
-}
-
-/// `"superpowers@openai-api-curated"` → `("superpowers", Some("openai-api-curated"))`
-///
-/// 与 claude 的 `split_plugin_key` 逐字同形，这里是第二份而不是复用，是派单划的边界：
-/// Task 10 不得改 `claude_code.rs`，而那份的文档目前写着「只有 claude 需要拆」——实测
-/// codex 的 plugin 键同样是 `name@marketplace`（Task 10 评审要向计划提的修正点）。
-/// **拆分规则若变动，两处必须同步改。**
-fn split_key(key: &str) -> (String, Option<String>) {
-    match key.split_once('@') {
-        Some((entry, mp)) => (entry.to_string(), Some(mp.to_string())),
-        None => (key.to_string(), None),
-    }
 }
 
 #[cfg(test)]
