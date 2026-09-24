@@ -17,6 +17,10 @@
 - `rust-version = "1.85"`，edition `2024`。
 - **HOME 必须可注入。** 任何模块都不得直接调用 `std::env::home_dir` / `dirs::home_dir`；一律经 `Home`。`Home::resolve()` 优先 `$HENV_HOME`，其次 `$HOME`。
 - harness 名常量只有三个：`"claude-code"`、`"codex"`、`"kimi-code"`。
+- **每个 Task 结尾写的 `Expected: PASS（N tests）` 是写下那一刻的快照，不是验收目标。** 评审追加的
+  钉死测试会让它偏小（Task 9 Step 0 一次就把全量从 121 抬到 124）。验收只看两件事：
+  `0 failed`，以及计数**单调不减**。既不要为了让数字对齐而删测试或改期望值，也不要把「比 N 多」
+  当成有人在乱加测试的证据——去 `git log` 找那条追加的 commit 即可。
 - **密钥语法即门禁**（spec §4 决策 2）：`mcps.*.env` 的值必须严格匹配 `${VAR}`，任何字面量在 `Manifest::parse` 阶段报错。密钥永不展开进任何产物，错误信息不得回显值。
 - **回显断言用整串相等，不用 `contains`。** 「值没出现在消息里」这类断言若靠 `contains` 实现，会被
   消息自带的词或值的前缀绕过：Task 4 最初的 `!err.contains("sk-live-123")` 挡不住只回显前缀 `sk-` 的
@@ -3220,7 +3224,7 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
     #[test]
     fn skeleton_supports_is_native_for_every_harness() {
         let t = TempHome::new();
-        let cap = crate::testutil::cap(
+        let cap = FakeAdapter::cap(
             Kind::Skill,
             "pin-me",
             Spec::Skill {
@@ -3239,8 +3243,10 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
     }
 ```
 
-  `testutil::cap` 已经存在（返回 `Origin::Adopted` + `Targets::All`），**不要**新开 `testutil` 面。
-  按需在 tests 模块的 `use` 里补 `Kind`/`Spec`/`SkillSource`/`Support`。
+  造能力用 **`FakeAdapter::cap(Kind, name, Spec)`**（`src/testutil.rs`，关联函数，返回
+  `Origin::Adopted` + `Targets::All`）。**不存在** `crate::testutil::cap` 这个自由函数——本节先前
+  那么写是错的，照抄会编译不过。不要为此新开 `testutil` 面。
+  按需在 tests 模块的 `use` 里补 `Kind`/`Spec`/`SkillSource`/`Support` 与 `FakeAdapter`。
 
 - [ ] **Step 0.2: 钉住 `detect()` 用的是 `is_dir()` 而不是 `exists()`**（同一 tests 模块追加）
 
@@ -3262,12 +3268,23 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
 ```
 
 - [ ] **Step 0.3: 钉住 `lookup` 不做前缀匹配**（现有 `lookup_finds_registered_and_rejects_unknown`
-  里追加一行即可，不要新开测试）
+  里追加**两行**即可，不要新开测试）
 
 ```rust
-        // 变异实测：`starts_with` 让 lookup("code") 命中 codex，而 manifest 侧是精确串比较。
+        // 变异实测：`a.name().starts_with(name)` 让 lookup("code") 命中 codex。
         assert!(lookup(&reg, "code").is_none(), "lookup 不允许前缀匹配");
+        // 反方向同一类（变异实测，Step 0 落地时才发现）：`name.starts_with(a.name())` 逃得过上面
+        // 那行——"code" 不是任何注册名的前缀——却让 lookup("codex-plus") 命中 codex。
+        // 两个方向都是前缀匹配，只钉一条等于没钉；精确匹配要求两侧一律 None。
+        assert!(
+            lookup(&reg, "codex-plus").is_none(),
+            "lookup 不允许前缀匹配（反方向：注册名是入参的前缀）"
+        );
 ```
+
+  **为什么是两条而不是一条**：本节先前只给了 `"code"` 那一行，而它**杀不掉自己点名的那个变异体**
+  （`name.starts_with(a.name())`）。这是本计划反复出现的「断言比它命名的规则弱」的形状，这次出现在
+  计划文本里而不是代码里。落地版（`260bed5`）已经是两行；只抄一行的话 Step 0.3 白做。
 
 - [ ] **Step 0.4: 钉住 `read_link` 失败上抛**（`src/skills_dir.rs` 的 tests 里追加）
 
@@ -3283,7 +3300,8 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
         // 把被扫描目录的路径字符串用 "/." 垫到接近 read_dir 的上限，
         // 此时 DirEntry::path() 拼出的条目路径超过上限，fs::read_link 确定地返回 InvalidFilename。
         // 2026-09-24 实测：dirlen=999 时 read_dir 仍成功（上限附近是 1015），
-        // 而 40 字符条目名拼出的 entrylen=1038 已经让 read_link 失败；file_type() 仍是 Ok(true)。
+        // 而条目名 `skill-with-a-deliberately-long-name-40`（**38** 个字符，末尾的 40 是字面量
+        // 不是长度）拼出的 entrylen=1038 > PATH_MAX(1024) 已让 read_link 失败；file_type() 仍是 Ok。
         let long = "skill-with-a-deliberately-long-name-40";
         let t = TempHome::new();
         t.mkdir(".claude/skills/realdir")
