@@ -1000,14 +1000,20 @@ mod tests {
         assert_eq!(labels.len(), dedup.len(), "duplicate ids: {labels:?}");
     }
 
-    /// 身份是 `kind + name` 两半：同名的一条 bundle skill 和一条 MCP 必须**都**留下。
-    /// 本条存在的理由是 `dedup_by(|a, b| a.id == b.id)` 那一行——判据换成只看名字的
-    /// `a.id.name == b.id.name` 时只有本条会红（上面那条排序测试的 fixture id 互不相等）。
+    /// 身份是 `kind + name` 两半，不只是名字：同一个名字作为 MCP、plugin `id` 和 bundle
+    /// 内的 skill 各出现一次时，三条**都**要留下（`CapId` 的 kind 不同 → 三个不同身份）。
+    ///
+    /// **这条的 fixture 是变异实测改出来的**，不是顺手写的：第一版只让 MCP 与 skill 同名、
+    /// plugin 叫别的名字，结果 `dedup_by(|a, b| a.id.name == b.id.name)` 这个变异体**存活**
+    /// （36 条全绿）。原因是 `dedup_by` 只合并**相邻**项，而 `"mcp/" < "plugin/" < "skill/"`
+    /// 对任意 label 恒成立——列表里只要有一条 plugin 能力，`mcp/x` 与 `skill/x` 之间就永远
+    /// 隔着它，按名字的错判据根本不触发。要让三种 kind 的同名能力两两相邻，唯一办法就是
+    /// 让它们**共用同一个名字**，于是这里 MCP / plugin / skill 三条全叫 `dup`。
     #[test]
-    fn a_skill_and_an_mcp_sharing_a_name_are_both_reported() {
+    fn three_kinds_sharing_one_name_are_all_reported() {
         let t = TempHome::new();
-        let root = t.path(".kimi-code/plugins/managed/superpowers");
-        t.mkdir(".kimi-code/plugins/managed/superpowers/skills/dup");
+        let root = t.path(".kimi-code/plugins/managed/dup");
+        t.mkdir(".kimi-code/plugins/managed/dup/skills/dup");
         t.write(
             ".kimi-code/mcp.json",
             r#"{ "mcpServers": { "dup": { "command": "c" } } }"#,
@@ -1016,7 +1022,7 @@ mod tests {
             &t,
             &format!(
                 r#"{{ "version": 1, "plugins": [
-                     {{ "id": "superpowers", "root": "{}", "source": "github" }}
+                     {{ "id": "dup", "root": "{}", "source": "github" }}
                    ] }}"#,
                 root.display()
             ),
@@ -1027,10 +1033,22 @@ mod tests {
             labels,
             [
                 "mcp/dup".to_string(),
-                "plugin/superpowers".to_string(),
+                "plugin/dup".to_string(),
                 "skill/dup".to_string()
             ],
             "{labels:?}"
+        );
+        assert_eq!(
+            find(&caps, Kind::Skill, "dup").map(|c| c.id.kind),
+            Some(Kind::Skill)
+        );
+        assert_eq!(
+            find(&caps, Kind::Mcp, "dup").map(|c| c.id.kind),
+            Some(Kind::Mcp)
+        );
+        assert_eq!(
+            find(&caps, Kind::Plugin, "dup").map(|c| c.id.kind),
+            Some(Kind::Plugin)
         );
     }
 
