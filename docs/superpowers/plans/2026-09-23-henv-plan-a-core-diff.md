@@ -6899,5 +6899,8 @@ Task 14 的 `in_sync_summary_kinds_follow_kind_all_order` 按此顺序断言。
    作为绊线（今天零匹配，加了不会红）。**Plan B 落地 `claude mcp add-json` shell out 时，
    必须重新审视这条守卫**：Plan B 的写机制正是 shell out，届时的正确做法不是把 `Command::new(`
    从 `FORBIDDEN` 里删掉，而是给写路径单独圈定一个允许它的、范围明确的位置。
-10. **`src/adapters/*.rs` 的 rustfmt-1.9.0 折行漂移**：整分支终审确认为纯格式、无语义影响，
-    但**是否提交由用户决定**（跑 `cargo fmt --all` / 固定工具链 / 保持现状）。不要替用户决定。
+10. **`src/adapters/*.rs` 的 rustfmt-1.9.0 折行漂移——已裁决并提交（`4662c93`）。**
+    漂移只在四个 adapter（`claude_code.rs` / `codex.rs` / `kimi_code.rs` / `mod.rs`）的
+    `#[cfg(test)] mod tests` 内，纯折行、无语义影响；跑过 `cargo fmt --all` 后整分支基线
+    是 fmt-clean 的。**Plan B 注意**：从此再出现 fmt 漂移就是新引入的，不再是这份历史欠账，
+    直接跑 `cargo fmt --all` 单独提交即可，不必再走一次同样的裁决。
