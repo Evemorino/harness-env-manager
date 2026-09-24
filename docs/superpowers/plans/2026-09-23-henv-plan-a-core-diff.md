@@ -3994,6 +3994,15 @@ git commit -m "feat: claude-code read_state（MCP 读自 ~/.claude.json 而非 s
 
 ### Task 10: codex read_state
 
+> **本节已执行完毕（`2e2f212..b5c0240`），下面的示例代码不再是给谁照抄的指令，只是历史记录。**
+> 权威形态是 `src/adapters/codex.rs`。已知本节示例里有 5 处与落地不符且**故意不回改**：
+> Step 3 的 4 处 `and_then(toml::Value::as_table)` 塌缩（其中 1 处正是本节开头判定为 Critical 的形状），
+> 以及 Step 1 的 fixture `[plugins.bare@mp]` —— 它**不是合法 TOML**（裸键不能带 `@`；
+> 独立用 Python 3.13 `tomllib` 复测：`Expected ']' at the end of a table declaration (line 1, column 14)`，
+> 写成 `[plugins."bare@mp"]` 才合法）。
+> 之所以不再手抄一遍：本 Task 已完成，抄准了也没有读者；而它给 Task 11 的复用指引在
+> `### Task 9` 的 `Produces` 一节，那一节是活的、已单独改正。
+
 > **照 Task 9 的「形状故障也是故障」那条写**（Task 9 里 `2ee0b8c` 契约旁边、评审补的 Critical 块）。
 > 本节下面示例里的 `let Some(x) = root.get(..).and_then(toml::Value::as_table) else { .. }`
 > 在「键存在但类型不对」时同样会交出空结果——TOML 侧的对应输入是 `[mcp_servers]` 写成了
