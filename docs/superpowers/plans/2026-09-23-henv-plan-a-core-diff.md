@@ -1763,6 +1763,8 @@ impl Manifest {
 
         for (name, s) in &self.skills {
             let at = format!("skills.{name}");
+            reject_blank(&at, "repo", s.repo.as_deref(), &mut e);
+            reject_blank(&at, "path", s.path.as_deref(), &mut e);
             match s.source {
                 SkillSourceKind::AgentsDir => {
                     if s.repo.is_some() || s.git_ref.is_some() {
@@ -1787,9 +1789,9 @@ impl Manifest {
 
         for (name, m) in &self.mcps {
             let at = format!("mcps.{name}");
-            if m.command.trim().is_empty() {
-                e.push(format!("{at}: `command` must not be empty"));
-            }
+            // `command` 是 serde 必填字段，所以这里永远是 `Some`：缺失由反序列化挡，
+            // 空白由这条挡（与 skills/plugins 两处同一个规则、同一个消息形状）。
+            reject_blank(&at, "command", Some(&m.command), &mut e);
             for (k, v) in &m.env {
                 if let Err(msg) = secrets::validate_env(k, v) {
                     e.push(format!("{at}: {msg}"));
@@ -1799,6 +1801,9 @@ impl Manifest {
 
         for (name, p) in &self.plugins {
             let at = format!("plugins.{name}");
+            reject_blank(&at, "marketplace", p.marketplace.as_deref(), &mut e);
+            reject_blank(&at, "entry", p.entry.as_deref(), &mut e);
+            reject_blank(&at, "repo", p.repo.as_deref(), &mut e);
             match p.source {
                 PluginSourceKind::ClaudeMarketplace => {
                     if p.marketplace.is_none() {
@@ -1821,6 +1826,26 @@ impl Manifest {
     }
 }
 ```
+
+`reject_blank` 是这轮（residual 轮）补上的**一条**规则，`impl Manifest` 之前的私有函数：
+
+```rust
+fn reject_blank(at: &str, field: &str, value: Option<&str>, e: &mut Vec<String>) {
+    if value.is_some_and(|v| v.trim().is_empty()) {
+        e.push(format!("{at}.{field}: must not be empty"));
+    }
+}
+```
+
+要点（后来者不要“顺手”改掉）：
+
+- **`trim()` 之后判空**，不是判 `is_empty()`：`command: "   "` 原来那条规则就带了 `trim()`，
+  新规则把它推广到全部五个位置字段，两者是同一个想法、同一个消息形状，不是两条规则。
+- **不看 `source`**：可选位置字段（git 源的 `path`、github 源的 `entry`……）写成空白时任何
+  `requires` 规则都不报，而 `entry: "  "` 仍会喂给 `plugin_identity`。空白检查放在
+  `match s.source` **之前**。
+- **消息只有 `路径.字段`**，被拒的值一律不回显（这些串与 `env` 同文件相邻）。
+- `lower.rs` 不加兜底：上游拒掉空白才是修法，`unwrap_or_default()` 那几处保持原样。
 
 - [ ] **Step 4: 在 `src/lib.rs` 声明模块**
 
@@ -1923,6 +1948,24 @@ git commit -m "feat: env.yaml 类型化解析与聚合校验"
 + C2/C3/C4/C5/C6/C7 各 1）。四条 Important 级 Minor（`env` 内重复 key 后者静默覆盖前者、serde 类型错误
 打掉聚合、untagged `Repr` 把内部枚举名露给用户、`source: zip-url` 无位置字段）不进本轮，已记入台账
 留给最终评审与 Plan B/C。
+
+**R1（residual 轮补）— 空白位置字段：`validate` 此前只查「在不在」，不查「是不是空白」。**
+`repo: ""`、`path: ""`、`entry: ""`、`marketplace: ""`、`command: "   "` 全部过关；实测
+`entry: ""` 会一路走到 `lower`，降出 `CapId{Plugin, ""}`（label 就是 `plugin/`），并且把
+degrade 表键到 `""`——于是一个报不出 plugin 身份、名字恰为空的路径会吃到该条目的
+`hooks: skip`。同时旧规则 `` `command` must not be empty `` 是**死规则**：整条删掉 117 个测试
+全绿，无人看守。
+
+修法（已落进上面 Step 3 的代码块）：五个字符串字段（`repo` / `path` / `entry` / `marketplace`
+/ `command`）**只要写了**就必须 `trim()` 后非空，违规按 `plugins.a.entry` 式**点分路径**经既有
+聚合报出；被拒的值绝不进消息。**旧命令规则的消息形状因此变了**——从
+`` mcps.a: `command` must not be empty `` 变成 `mcps.a.command: must not be empty`，与新规则
+同一个形状；它原先没有任何测试或 golden 引用，Task 14 若渲染校验消息请按新形状取。
+`lower.rs` 一侧**不加**兜底（拒在上游才是修法）。钉住它的两条测试：
+`blank_location_fields_are_rejected_by_dotted_path`（六个落点 × 空串/纯空白/真值三态，整条消息
+逐字相等）与 `blank_is_rejected_even_in_fields_the_source_does_not_require`（空白检查不看
+`source`；把检查挪进 `match s.source` 只有这条会红）。做完后 `cargo test --lib manifest::`
+期望 **29 tests**。
 
 ---
 

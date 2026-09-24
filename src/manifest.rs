@@ -247,6 +247,19 @@ where
     Ok(out)
 }
 
+/// 「字段在但空白」与「字段缺失」是两种不同的失败：`requires_x` 那条管缺失，这里管空白。
+/// 两者都必须拦下来，因为空白值会原样进 `lower`：`entry: ""` 降出 `CapId{Plugin, ""}`
+/// （label `plugin/`）、并把 degrade 表键到 `""`——于是任何报不出 plugin 身份的东西都会
+/// 吃到这个条目的策略。`None`（没写）在这里放过，交给各 source 的 requires 规则。
+///
+/// **消息里只有 `路径.字段` 这一串**，被拒的值绝不出现：这些是用户写的自由文本，而且
+/// 与 `env` 相邻（同一个文件里可能就有密钥），回显等于把它们打进终端与日志。
+fn reject_blank(at: &str, field: &str, value: Option<&str>, e: &mut Vec<String>) {
+    if value.is_some_and(|v| v.trim().is_empty()) {
+        e.push(format!("{at}.{field}: must not be empty"));
+    }
+}
+
 impl Manifest {
     /// 解析 + 校验。校验错误聚合成单个 anyhow 错误，每条带 `skills.a` 式路径。
     pub fn parse(text: &str) -> anyhow::Result<Manifest> {
@@ -281,6 +294,8 @@ impl Manifest {
 
         for (name, s) in &self.skills {
             let at = format!("skills.{name}");
+            reject_blank(&at, "repo", s.repo.as_deref(), &mut e);
+            reject_blank(&at, "path", s.path.as_deref(), &mut e);
             match s.source {
                 SkillSourceKind::AgentsDir => {
                     if s.repo.is_some() || s.git_ref.is_some() {
@@ -305,9 +320,9 @@ impl Manifest {
 
         for (name, m) in &self.mcps {
             let at = format!("mcps.{name}");
-            if m.command.trim().is_empty() {
-                e.push(format!("{at}: `command` must not be empty"));
-            }
+            // `command` 是 serde 必填字段，所以这里永远是 `Some`：缺失由反序列化挡，
+            // 空白由这条挡（与上面两条同一个规则、同一个消息形状）。
+            reject_blank(&at, "command", Some(&m.command), &mut e);
             for (k, v) in &m.env {
                 if let Err(msg) = secrets::validate_env(k, v) {
                     e.push(format!("{at}: {msg}"));
@@ -317,6 +332,9 @@ impl Manifest {
 
         for (name, p) in &self.plugins {
             let at = format!("plugins.{name}");
+            reject_blank(&at, "marketplace", p.marketplace.as_deref(), &mut e);
+            reject_blank(&at, "entry", p.entry.as_deref(), &mut e);
+            reject_blank(&at, "repo", p.repo.as_deref(), &mut e);
             match p.source {
                 PluginSourceKind::ClaudeMarketplace => {
                     if p.marketplace.is_none() {
@@ -639,6 +657,98 @@ plugins:
         .to_string();
         assert!(err.contains("requires `ref`"), "{err}");
         assert!(!err.contains("requires `repo`"), "{err}");
+    }
+
+    /// 位置字段写成空白（`""` / `"   "`）与写成真值不是一回事，而**两者都不许当成真值**：
+    /// `entry: ""` 会降出 `CapId{Plugin, ""}`、并把 degrade 表键到 `""`（实测：一个
+    /// `Origin::Plugin{name: ""}` 的 hook 会吃到那个条目的 `hooks: skip`）。
+    ///
+    /// 每行只把**被测字段**换成空白，其余保持合法；同一行的正例（真值）必须通过——
+    /// 否则「只要写了就拒」的变异体（`value.is_some()`）照样全绿。空串与纯空白是两个
+    /// 变异体：前者盯「只查 in_none」，后者专盯 `.trim()` 被删。
+    ///
+    /// 断言用**整条消息逐字相等**：路径写错、字段名写错、多出一条兄弟消息、或把用户写的
+    /// 值回显出来（这些字段与 `env` 同文件相邻），都会立刻不等。
+    #[test]
+    fn blank_location_fields_are_rejected_by_dotted_path() {
+        for (template, path) in [
+            (
+                "version: 1\nskills:\n  a:\n    source: git\n    repo: {v}\n    ref: v1\n",
+                "skills.a.repo",
+            ),
+            (
+                "version: 1\nskills:\n  a:\n    source: local\n    path: {v}\n",
+                "skills.a.path",
+            ),
+            (
+                "version: 1\nmcps:\n  a:\n    command: {v}\n",
+                "mcps.a.command",
+            ),
+            (
+                "version: 1\nplugins:\n  a:\n    source: claude-marketplace\n    marketplace: {v}\n    entry: e\n",
+                "plugins.a.marketplace",
+            ),
+            (
+                "version: 1\nplugins:\n  a:\n    source: claude-marketplace\n    marketplace: m\n    entry: {v}\n",
+                "plugins.a.entry",
+            ),
+            (
+                "version: 1\nplugins:\n  a:\n    source: github\n    repo: {v}\n",
+                "plugins.a.repo",
+            ),
+        ] {
+            for blank in ["\"\"", "\"   \""] {
+                let yaml = template.replace("{v}", blank);
+                let Err(err) = Manifest::parse(&yaml) else {
+                    panic!("{path} 写成空白必须被拒，实际被接受");
+                };
+                let err = err.to_string();
+                assert_eq!(
+                    err,
+                    format!("env.yaml invalid:\n  - {path}: must not be empty"),
+                    "唯一的错误必须是这一条，并且不回显用户写的值"
+                );
+            }
+            let yaml = template.replace("{v}", "real-value");
+            Manifest::parse(&yaml).unwrap_or_else(|e| panic!("{path}：真值不该报错，实际：{e}"));
+        }
+    }
+
+    /// 空白检查**不看 source**：可选位置字段写成空白时，任何 `requires` 规则都不会报，
+    /// 于是只有这条规则挡得住——`entry` 是 plugin 身份的来源，github 源上一个
+    /// `entry: "  "` 就足以让 `lower` 发出一条 `CapId{Plugin, "  "}`。
+    ///
+    /// 上面那组的 fixture 每个字段都恰好是「该源必填」的那一个，所以「把空白检查挪进
+    /// `match s.source` 里、只查该源必填字段」的写法在那一组里全绿。这一组就是它的对照。
+    #[test]
+    fn blank_is_rejected_even_in_fields_the_source_does_not_require() {
+        for (yaml, path) in [
+            (
+                "version: 1\nskills:\n  a:\n    source: git\n    repo: x/y\n    ref: v1\n    path: \"  \"\n",
+                "skills.a.path",
+            ),
+            (
+                "version: 1\nskills:\n  a:\n    source: local\n    path: p\n    repo: \"\"\n",
+                "skills.a.repo",
+            ),
+            (
+                "version: 1\nplugins:\n  a:\n    source: github\n    repo: x/y\n    entry: \"  \"\n",
+                "plugins.a.entry",
+            ),
+            (
+                "version: 1\nplugins:\n  a:\n    source: claude-marketplace\n    marketplace: m\n    entry: e\n    repo: \"\"\n",
+                "plugins.a.repo",
+            ),
+        ] {
+            let Err(err) = Manifest::parse(yaml) else {
+                panic!("{path} 写成空白必须被拒，实际被接受");
+            };
+            assert_eq!(
+                err.to_string(),
+                format!("env.yaml invalid:\n  - {path}: must not be empty"),
+                "{path}：唯一的错误必须是这一条"
+            );
+        }
     }
 
     #[test]
