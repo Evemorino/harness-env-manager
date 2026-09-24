@@ -4889,6 +4889,28 @@ git commit -m "feat: kimi-code read_state（installedSha 进 sha 位，skill 仅
 - Consumes: `Capability`、`Kind`、`Origin`、`Support`
 - Produces: 三家 adapter 的 `supports(&Capability) -> Support`
 
+> **开工前必读两件事，都是本 Task 特有的。**
+>
+> **一、你会踩红一条被刻意钉住的占位测试，正确处置是「替换」，不是「删」。**
+> Task 9 Step 0 加了 `skeleton_supports_is_native_for_every_harness`（`src/adapters/mod.rs` 的 tests），
+> 断言三家骨架都返回 `Support::Native`，当时的理由是「Task 12 之前它必须是 Native」。
+> 本矩阵把 kimi 的 `Skill` / `Hook` / `Command` / `Agent` 判成 `Unsupported`，**这条测试必然转红**——
+> 那是预期信号，不是回归。要求：把它**改写**成矩阵版（逐格断言 kind × harness 的结果，至少覆盖
+> 表里四个非 Native 格），而不是放宽成 `assert!(matches!(.., Native | Unsupported { .. }))`，
+> 也不是整条删掉。删掉或放宽等于把 Task 7/8 花一整轮钉住的那类缺陷重新打开。
+>
+> **二、`Files` 覆盖三家 adapter，所以本 Task 必须独占 writer 槽。**
+> T10（codex）与 T11（kimi）任一在跑时都不许动本 Task，否则两边改同一批文件、共享一个 git index。
+>
+> **三、有一件事本 Task 要「裁定或明确移交」，不要默认它不属于自己：**
+> 远程 MCP（`type: "sse"` / 只有 `url` 没有 `command`）目前在 adapter 侧归一化成
+> `Spec::Mcp { command: "", args: [], env: {} }`，于是**两台不同的远程 server 在 diff 里长得完全一样**。
+> 那是 Task 3 的 `Spec::Mcp` 缺字段（建模缺口，不是形状缺口）。`supports()` 只回答「这家能不能接纳某
+> capability」，严格说管不着它——但 Task 12 是这套矩阵第一次让「接纳度」变成可观察行为的地方，
+> 也是最自然的位置去决定：要么在 `Support` 侧给它一个理由（例如 `Unsupported { reason: "远程 MCP 待建模" }`
+> 之一类），要么把它作为已知限制写进交接清单，指名由 T13/T14 还是 Plan B 处理。
+> **二者都行，沉默不行。**
+
 矩阵（依据 spec §2.1 实测）：
 
 | Kind | claude-code | codex | kimi-code |
