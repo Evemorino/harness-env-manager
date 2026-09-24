@@ -95,6 +95,7 @@ mod tests {
     use crate::capability::{Kind, SkillSource, Spec};
     use crate::manifest::KNOWN_HARNESSES;
     use crate::testutil::{FakeAdapter, TempHome};
+    use std::path::PathBuf;
 
     /// 三个常量的**字面拼写**必须在 registry 之外再钉一遍。少了这条，把
     /// `CLAUDE_CODE`/`CODEX` 的串值互换是一个能让上面所有 detect/lookup 测试
@@ -201,28 +202,75 @@ mod tests {
         );
     }
 
-    /// 三个骨架的 `supports()` 目前都只是占位 `Support::Native`，而 Task 13 通过
-    /// `registry()` 实际消费的就是这一个 produced 行为（Task 8 评审的 M26/M27 全存活）。
-    /// 它若悄悄变成别的值，`henv diff` 会声称「什么都能交付给谁」，而三个骨架同时错的
-    /// 情况下没有任何一条现有测试会红。这里逐家断言，互换某一家的返回值也能定位到是谁。
-    #[test]
-    fn skeleton_supports_is_native_for_every_harness() {
-        let t = TempHome::new();
-        let cap = FakeAdapter::cap(
-            Kind::Skill,
-            "pin-me",
-            Spec::Skill {
+    /// 逐 kind 造一条**非 Plugin origin** 的能力（`FakeAdapter::cap` = `Origin::Adopted`）。
+    /// `supports` 只看 `kind` 与 `origin`，不看 `spec` 内容，所以载荷按 kind 一一对应填即可。
+    fn cap_of_kind(kind: Kind) -> Capability {
+        let spec = match kind {
+            Kind::Skill => Spec::Skill {
                 source: SkillSource::AgentsDir,
                 path: None,
             },
-        );
-        for a in registry(&t.home) {
-            assert_eq!(
-                a.supports(&cap),
-                Support::Native,
-                "{} 的骨架占位被改动了；Task 12 之前它必须是 Native",
-                a.name()
-            );
+            Kind::Mcp => Spec::Mcp {
+                command: String::new(),
+                args: Vec::new(),
+                env: Default::default(),
+            },
+            Kind::Plugin => Spec::Plugin {
+                marketplace: None,
+                entry: "x".into(),
+                version: None,
+                sha: None,
+                install_path: None,
+                enabled: true,
+            },
+            Kind::Hook => Spec::Hook {
+                event: "E".into(),
+                command: "c".into(),
+            },
+            Kind::Command => Spec::Command {
+                path: PathBuf::from("/x"),
+            },
+            Kind::Agent => Spec::Agent {
+                path: PathBuf::from("/x"),
+            },
+        };
+        FakeAdapter::cap(kind, "x", spec)
+    }
+
+    /// Task 12 把 `supports()` 从占位换成真实接纳度矩阵，这条把「kind × harness」的
+    /// **每一格**都钉死：唯一非 Native 的四个格是 kimi 对散装 Skill/Hook/Command/Agent
+    /// （无用户级目录/配置），其余 14 格全部 Native。能力一律用 `FakeAdapter::cap`
+    /// （`Origin::Adopted`）构造——若带 `Origin::Plugin`，kimi 的「bundle 随原生 plugin
+    /// 落地」例外会把那四个 Unsupported 格也判成 Native，整张矩阵就少钉了四格。
+    /// 逐格断言（而非一刀切 `matches!(.., Native | Unsupported { .. })`）正是为了守住
+    /// 「kimi 吃不下散装 skill」这个 degrade-or-not 的判定点，谁把某一格改成别的值都能
+    /// 被定位到。
+    #[test]
+    fn supports_matrix_is_native_except_kimi_loose_skill_hook_command_agent() {
+        let t = TempHome::new();
+        let reg = registry(&t.home);
+        for kind in Kind::all() {
+            let cap = cap_of_kind(kind);
+            for a in &reg {
+                let is_kimi_loose = a.name() == KIMI_CODE
+                    && matches!(
+                        kind,
+                        Kind::Skill | Kind::Hook | Kind::Command | Kind::Agent
+                    );
+                if is_kimi_loose {
+                    assert!(
+                        matches!(a.supports(&cap), Support::Unsupported { .. }),
+                        "{kind:?} 在 kimi-code 上必须是 Unsupported"
+                    );
+                } else {
+                    assert_eq!(
+                        a.supports(&cap),
+                        Support::Native,
+                        "{} 对 {kind:?} 必须 Native",
+                        a.name()
+                    );
+                }
+            }
         }
     }
 

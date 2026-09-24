@@ -225,8 +225,28 @@ impl HarnessAdapter for KimiCode {
         Ok(caps)
     }
 
-    fn supports(&self, _cap: &Capability) -> Support {
-        Support::Native // Task 12 细化
+    fn supports(&self, cap: &Capability) -> Support {
+        // bundle 携带的能力随 kimi 原生 plugin 安装一起落地
+        // （实测 kimi 读 .kimi-plugin/plugin.json 的 skills / sessionStart）
+        if matches!(cap.origin, Origin::Plugin { .. }) {
+            return Support::Native;
+        }
+        match cap.id.kind {
+            Kind::Mcp | Kind::Plugin => Support::Native,
+            Kind::Skill => Support::Unsupported {
+                reason: "kimi-code 无用户级 skills 目录，散装 skill 只能随 plugin bundle 分发"
+                    .to_string(),
+            },
+            Kind::Hook => Support::Unsupported {
+                reason: "kimi-code 无用户级 hooks 配置".to_string(),
+            },
+            Kind::Command => Support::Unsupported {
+                reason: "kimi-code 无用户级 commands 目录".to_string(),
+            },
+            Kind::Agent => Support::Unsupported {
+                reason: "kimi-code 无用户级 agents 目录".to_string(),
+            },
+        }
     }
 }
 
@@ -1086,5 +1106,84 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    // ============ supports()：kimi 的接纳度矩阵（spec §2.1） ============
+
+    /// kimi 原生接纳 MCP 与 Plugin 两种 kind；Skill/Hook/Command/Agent 无用户级目录或
+    /// 配置，散装（非 Plugin origin）一律 Unsupported。`Spec::Mcp` 只是占位载荷。
+    #[test]
+    fn supports_mcp_and_plugin_natively() {
+        let t = TempHome::new();
+        let a = KimiCode::new(t.home.clone());
+        for kind in [Kind::Mcp, Kind::Plugin] {
+            let cap = Capability::new(
+                CapId::new(kind, "x"),
+                Spec::Mcp { command: "c".into(), args: vec![], env: Default::default() },
+            );
+            assert_eq!(a.supports(&cap), Support::Native, "{kind:?}");
+        }
+    }
+
+    /// 散装（非 Plugin origin）的 Skill/Hook/Command/Agent 四个 kind 全部 Unsupported，
+    /// 且 reason 非空、点名 harness 名（报告里的 `!` 行要能自解释）。
+    #[test]
+    fn refuses_loose_skill_hook_command_agent_with_reason() {
+        let t = TempHome::new();
+        let a = KimiCode::new(t.home.clone());
+        for kind in [Kind::Skill, Kind::Hook, Kind::Command, Kind::Agent] {
+            let cap = Capability::new(
+                CapId::new(kind, "x"),
+                Spec::Hook { event: "E".into(), command: "c".into() },
+            );
+            match a.supports(&cap) {
+                Support::Unsupported { reason } => {
+                    assert!(!reason.is_empty(), "{kind:?} needs a reason for the `!` line");
+                    assert!(reason.contains("kimi-code"), "{kind:?} reason names the harness: {reason}");
+                }
+                other => panic!("{kind:?} expected Unsupported, got {other:?}"),
+            }
+        }
+    }
+
+    /// 同一个 kind（Skill），散装判 Unsupported，bundle 携带（`Origin::Plugin`）判 Native——
+    /// kimi 原生装 plugin 时会随 bundle 一起落地 skills（实测读 `.kimi-plugin/plugin.json`）。
+    #[test]
+    fn loose_skill_is_refused_but_bundled_skill_is_native() {
+        let t = TempHome::new();
+        let a = KimiCode::new(t.home.clone());
+
+        let loose = Capability::new(
+            CapId::new(Kind::Skill, "my-draft"),
+            Spec::Skill { source: SkillSource::Local { path: PathBuf::from("/x") }, path: None },
+        );
+        assert!(matches!(a.supports(&loose), Support::Unsupported { .. }));
+
+        // 同一个 kind，但由 bundle 携带 → 随原生 plugin 安装一起落地
+        let bundled = Capability {
+            id: CapId::new(Kind::Skill, "brainstorming"),
+            origin: Origin::Plugin { name: "superpowers".into() },
+            spec: Spec::Skill {
+                source: SkillSource::PluginBundle { plugin: "superpowers".into() },
+                path: None,
+            },
+            targets: Targets::All,
+        };
+        assert_eq!(a.supports(&bundled), Support::Native);
+    }
+
+    /// bundle 携带的 Hook 同样判 Native（kimi 读 `.kimi-plugin/plugin.json` 的
+    /// `sessionStart` 那一类配置），与散装 Hook 的 Unsupported 相对。
+    #[test]
+    fn bundled_hook_is_native_too() {
+        let t = TempHome::new();
+        let a = KimiCode::new(t.home.clone());
+        let bundled_hook = Capability {
+            id: CapId::new(Kind::Hook, "superpowers:session-start"),
+            origin: Origin::Plugin { name: "superpowers".into() },
+            spec: Spec::Hook { event: "SessionStart".into(), command: "run-hook".into() },
+            targets: Targets::All,
+        };
+        assert_eq!(a.supports(&bundled_hook), Support::Native);
     }
 }

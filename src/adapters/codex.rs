@@ -223,7 +223,8 @@ impl HarnessAdapter for Codex {
     }
 
     fn supports(&self, _cap: &Capability) -> Support {
-        Support::Native // Task 12 细化
+        // codex 原生支持全部六种能力
+        Support::Native
     }
 }
 
@@ -1038,6 +1039,18 @@ enabled = false
                 );
             }
             other => panic!("{other:?}"),
+        }
+    }
+
+    /// codex 对六种 kind 全部原生接纳（spec §2.1 矩阵）。`Spec::Command` 只是占位载荷——
+    /// `supports` 只看 `kind` 与 `origin`，不看 `spec` 内容。
+    #[test]
+    fn supports_every_kind_natively() {
+        let t = TempHome::new();
+        let a = Codex::new(t.home.clone());
+        for kind in Kind::all() {
+            let cap = Capability::new(CapId::new(kind, "x"), Spec::Command { path: std::path::PathBuf::from("/x") });
+            assert_eq!(a.supports(&cap), Support::Native, "{kind:?}");
         }
     }
 }
