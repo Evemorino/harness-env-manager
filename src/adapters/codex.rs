@@ -2,7 +2,6 @@ use crate::adapters::{CODEX, HarnessAdapter};
 use crate::capability::{CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets};
 use crate::home::Home;
 use crate::skills_dir::{SkillStore, plugin_from_path, try_read_skill_entries};
-use anyhow::Context;
 use anyhow::anyhow;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -31,11 +30,18 @@ impl Codex {
     /// （`model_providers`、`projects`、`tui`、`hooks.state`），读侧必须对它们免疫。
     fn read_config(&self, file: &Path) -> anyhow::Result<Option<TomlTable>> {
         match std::fs::read_to_string(file) {
-            Ok(text) => {
-                let root: TomlTable = toml::from_str(&text)
-                    .with_context(|| format!("failed to parse {}", file.display()))?;
-                Ok(Some(root))
-            }
+            Ok(text) => match toml::from_str::<TomlTable>(&text) {
+                Ok(root) => Ok(Some(root)),
+                // **不**用 `.with_context(..)` 包住原 error：`toml::de::Error` 的 `Display`
+                // 逐字回显出错那一行的源码（`2 | TOKEN = "..."`），而 `main.rs` 打印的是整条
+                // cause 链——那行可能就是 `[mcp_servers.x.env]` 里的明文密钥。
+                // `Error::message()` 只给原因文本、不含源码，路径由我们自己带上。
+                Err(e) => Err(anyhow!(
+                    "failed to parse {}: {}",
+                    file.display(),
+                    e.message()
+                )),
+            },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => {
                 Err(anyhow::Error::new(e).context(format!("failed to read {}", file.display())))
@@ -102,6 +108,47 @@ impl Codex {
         Ok(out)
     }
 
+    /// plugin 记录就是 `config.toml` 里的 `[plugins."<entry>@<marketplace>"]`：键本身即身份。
+    ///
+    /// **已知局限**（Plan C 的 doctor 要报出来）：codex 的 `config.toml` 不记录 plugin 的
+    /// 版本或 SHA（缓存目录名可能是 semver、git sha 或字面量 `unknown`），所以 `version`
+    /// 与 `sha` 恒为 `None` → `compare_versions` 判 `Unknown` → diff 按 in-sync 处理，
+    /// 不误报 update。这也是本文件不 import `normalize_locator` 的原因：codex 一个 locator
+    /// 字段都不读，没有需要归一化的东西。
+    fn read_plugins(&self, root: &TomlTable, file: &Path) -> anyhow::Result<Vec<Capability>> {
+        let mut out = Vec::new();
+        // 与 `mcp_servers` 同一条分界：缺键 = 没配（正常）；`plugins = "oops"` = 写坏了，
+        // 报成「这家一个 plugin 都没装」就是假同步。
+        let Some(plugins) = toml_optional_table(root.get("plugins"), file, "key `plugins`")? else {
+            return Ok(out);
+        };
+        for (key, cfg) in plugins {
+            let context = format!("plugins entry `{key}`");
+            // 「值不是表」和「表确实为空」是两种事实：`plugins = { p = true }` 是键写了却没给
+            // 记录（坏值），而 `[plugins.p]`（空表）才是「装了但一条配置都没写」。
+            let cfg = toml_expect_table(cfg, file, &context)?;
+            let (entry, marketplace) = split_key(key);
+            out.push(Capability {
+                id: CapId::new(Kind::Plugin, entry.clone()),
+                origin: Origin::Adopted {
+                    harness: CODEX.into(),
+                },
+                spec: Spec::Plugin {
+                    marketplace,
+                    entry,
+                    version: None,
+                    sha: None,
+                    install_path: None,
+                    // 缺 `enabled` = 未表态 = 启用（与 claude 的门禁默认一致）；
+                    // `enabled = "yes"` 是坏值，由 `toml_optional_bool` 上抛而不是猜 true。
+                    enabled: toml_optional_bool(cfg, "enabled", file, &context)?.unwrap_or(true),
+                },
+                targets: Targets::All,
+            });
+        }
+        Ok(out)
+    }
+
     /// 扫 `~/.codex/skills`。**扫描失败一律上抛**：把「读不出这个目录」呈现成
     /// 「这家一个 skill 都没装」是只读对账工具最坏的漏报方向（失败隔离契约）。
     /// 只有「目录不存在」才是空的，那由 `try_read_skill_entries` 自己判。
@@ -159,6 +206,7 @@ impl HarnessAdapter for Codex {
         let file = self.home.codex_config();
         if let Some(root) = self.read_config(&file)? {
             caps.extend(self.read_mcps(&root, &file)?);
+            caps.extend(self.read_plugins(&root, &file)?);
         }
         caps.sort_by_key(|a| a.id.label());
         // dedup_by 只去重相邻项，所以必须先 sort
@@ -272,6 +320,42 @@ fn toml_optional_string<'a>(
         return Ok(None);
     };
     toml_expect_string(value, file, &format!("{context} field `{key}`")).map(Some)
+}
+
+/// 布尔门禁的强制版。claude 那六个原语里**没有**布尔版（Task 11 要补的 `expect_bool`
+/// 就是它），codex 侧 `enabled` 是这个形状唯一的读者，所以本文件自带一对。
+/// `.and_then(toml::Value::as_bool).unwrap_or(true)` 就是被裁定为 Critical 的塌缩：
+/// `enabled = "yes"` 会被读成「已启用」。
+fn toml_expect_bool(value: &TomlValue, file: &Path, what: &str) -> anyhow::Result<bool> {
+    value
+        .as_bool()
+        .ok_or_else(|| shape_fault(value, file, what, "a boolean"))
+}
+
+/// 可选布尔字段：键缺失 → `Ok(None)`（未表态，由调用方定默认值）；类型不对 → 故障。
+fn toml_optional_bool(
+    table: &TomlTable,
+    key: &str,
+    file: &Path,
+    context: &str,
+) -> anyhow::Result<Option<bool>> {
+    let Some(value) = table.get(key) else {
+        return Ok(None);
+    };
+    toml_expect_bool(value, file, &format!("{context} field `{key}`")).map(Some)
+}
+
+/// `"superpowers@openai-api-curated"` → `("superpowers", Some("openai-api-curated"))`
+///
+/// 与 claude 的 `split_plugin_key` 逐字同形，这里是第二份而不是复用，是派单划的边界：
+/// Task 10 不得改 `claude_code.rs`，而那份的文档目前写着「只有 claude 需要拆」——实测
+/// codex 的 plugin 键同样是 `name@marketplace`（Task 10 评审要向计划提的修正点）。
+/// **拆分规则若变动，两处必须同步改。**
+fn split_key(key: &str) -> (String, Option<String>) {
+    match key.split_once('@') {
+        Some((entry, mp)) => (entry.to_string(), Some(mp.to_string())),
+        None => (key.to_string(), None),
+    }
 }
 
 #[cfg(test)]
@@ -642,6 +726,41 @@ env = {}
         assert!(!err.contains("nested"), "报错不得带出容器内容：{err}");
     }
 
+    /// `toml::de::Error` 的 `Display` 会**逐字回显出错那一行的源码**（`2 | TOKEN = "..."`），
+    /// 而 main.rs 用 `{err:?}` 打印整条 cause 链——配坏的往往正是 `[mcp_servers.x.env]`
+    /// 里那行明文密钥。`with_context` 只包在顶层，管不住 cause 的渲染，所以解析失败只取
+    /// `Error::message()`（纯原因文本，不含源码）。
+    /// 断言用 `{err:?}`（= 真实打印形态）而不是 `to_string()`：只看首行会漏掉整条链。
+    #[test]
+    fn a_toml_parse_failure_never_echoes_the_offending_line() {
+        let t = TempHome::new();
+        write_config(
+            &t,
+            "[mcp_servers.x.env]\nTOKEN = \"sk-live-9f3a2b7c\ncontext = \n",
+        );
+        let err = Codex::new(t.home.clone())
+            .read_state()
+            .expect_err("语法错的 config.toml 必须是故障");
+        let rendered = format!("{err:?}");
+        assert!(
+            !rendered.contains("sk-live-9f3a2b7c"),
+            "整条报错链都不得带出原值：{rendered}"
+        );
+        // 路径与原因还得在——去掉回显不能把报错降级成一句「解析失败」
+        assert!(
+            rendered.contains(&config_file(&t).display().to_string()),
+            "报错必须点明是哪个文件：{rendered}"
+        );
+        assert!(
+            rendered.contains("invalid basic string"),
+            "报错必须留下解析器给的原因文本：{rendered}"
+        );
+    }
+
+    /// 整串钉死（不 `contains`）：这条消息**只有**「路径 + 解析器的原因文本」两段，
+    /// 没有第三个成分。`a_toml_parse_failure_never_echoes_the_offending_line` 管的是
+    /// 「不得回显源码」，本条管的是「也不得少说路径」。
+    /// 原因文本是 toml 1.1.6 的实测输出，换解析器版本会红——那是有意的锁。
     #[test]
     fn malformed_toml_is_an_error_naming_the_file() {
         let t = TempHome::new();
@@ -652,7 +771,10 @@ env = {}
             .to_string();
         assert_eq!(
             err,
-            format!("failed to parse {}", config_file(&t).display())
+            format!(
+                "failed to parse {}: string values must be quoted, expected literal string",
+                config_file(&t).display()
+            )
         );
     }
 
@@ -664,5 +786,201 @@ env = {}
             .read_state()
             .expect("no config != error");
         assert!(caps.is_empty());
+    }
+
+    // ============ config.toml：plugin ============
+
+    #[test]
+    fn reads_plugins_from_config_toml() {
+        let t = TempHome::new();
+        write_config(
+            &t,
+            r#"[plugins."superpowers@openai-api-curated"]
+enabled = true
+
+[plugins."coderabbit@openai-api-curated"]
+enabled = false
+"#,
+        );
+        let caps = Codex::new(t.home.clone()).read_state().unwrap();
+        let sp = find(&caps, Kind::Plugin, "superpowers").unwrap();
+        assert_eq!(
+            sp.spec,
+            Spec::Plugin {
+                marketplace: Some("openai-api-curated".into()),
+                entry: "superpowers".into(),
+                // codex 的 config.toml 不记录版本/SHA（Task 10「已知局限」），两家都是 None
+                version: None,
+                sha: None,
+                install_path: None,
+                enabled: true,
+            }
+        );
+        assert_eq!(
+            sp.origin,
+            Origin::Adopted {
+                harness: "codex".into()
+            }
+        );
+        assert_eq!(sp.targets, Targets::All);
+        match &find(&caps, Kind::Plugin, "coderabbit").unwrap().spec {
+            Spec::Plugin { enabled, .. } => assert!(!enabled),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_key_without_marketplace_still_parses() {
+        let t = TempHome::new();
+        write_config(&t, "[plugins.local-thing]\nenabled = true\n");
+        let caps = Codex::new(t.home.clone()).read_state().unwrap();
+        match &find(&caps, Kind::Plugin, "local-thing").unwrap().spec {
+            Spec::Plugin {
+                marketplace, entry, ..
+            } => {
+                assert_eq!(*marketplace, None);
+                assert_eq!(entry, "local-thing");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 计划示例这里写的是 `[plugins.bare@mp]`——**那不是合法 TOML**（裸键只允许
+    /// A-Za-z0-9`_`-，`@` 必须引号包起来），实测解析器直接报 `invalid unquoted key`。
+    /// 真实 config.toml 写的就是 `[plugins."superpowers@openai-api-curated"]，
+    /// 所以这里按真实形状加引号。
+    #[test]
+    fn plugin_enabled_defaults_true_when_field_absent() {
+        let t = TempHome::new();
+        write_config(&t, "[plugins.\"bare@mp\"]\n");
+        let caps = Codex::new(t.home.clone()).read_state().unwrap();
+        match &find(&caps, Kind::Plugin, "bare").unwrap().spec {
+            Spec::Plugin { enabled, .. } => assert!(*enabled),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `[plugins]` 写了头但一条没记：类型对且为空 = 合法空结果。
+    /// 与下面 `plugins_key_that_is_not_a_table_...` 一起把「空」和「坏」分开钉。
+    #[test]
+    fn an_empty_plugins_table_is_not_an_error() {
+        let t = TempHome::new();
+        write_config(&t, "plugins = {}\n");
+        let caps = Codex::new(t.home.clone())
+            .read_state()
+            .expect("空的 plugins 不是故障");
+        assert_eq!(caps.iter().filter(|c| c.id.kind == Kind::Plugin).count(), 0);
+    }
+
+    #[test]
+    fn plugins_key_that_is_not_a_table_is_an_error_naming_the_key() {
+        let t = TempHome::new();
+        write_config(&t, "plugins = \"oops\"\n");
+        assert_eq!(
+            read_state_err(&t),
+            shape_msg(&config_file(&t), "key `plugins`", "a table", "a string")
+        );
+    }
+
+    #[test]
+    fn a_plugin_entry_that_is_not_a_table_is_an_error_naming_the_key() {
+        let t = TempHome::new();
+        // `p = true` 而不是 `[plugins.p]`：键写了却没给记录，和 claude 侧
+        // `{"p@mp": "notarray"}` 同族，是坏值而不是「没配」。
+        write_config(&t, "plugins = { p = true }\n");
+        assert_eq!(
+            read_state_err(&t),
+            shape_msg(
+                &config_file(&t),
+                "plugins entry `p`",
+                "a table",
+                "a boolean"
+            )
+        );
+    }
+
+    /// `enabled = "yes"` 过去走 `.and_then(as_bool).unwrap_or(true)`：非布尔的门禁值
+    /// 被读成「已启用」，于是**用户关掉/写坏了的** plugin 报成 enabled，正是被裁定为
+    /// Critical 的那种塌缩。现在上抛，且整串相等证明报错没带值。
+    #[test]
+    fn a_non_boolean_plugin_enabled_is_an_error_naming_the_field() {
+        let t = TempHome::new();
+        write_config(&t, "[plugins.\"p@mp\"]\nenabled = \"yes\"\n");
+        let err = read_state_err(&t);
+        assert_eq!(
+            err,
+            shape_msg(
+                &config_file(&t),
+                "plugins entry `p@mp` field `enabled`",
+                "a boolean",
+                "a string"
+            )
+        );
+        assert!(!err.contains("yes"), "报错不得带出原值：{err}");
+    }
+
+    // ============ 汇总：排序 / 去重 ============
+
+    #[test]
+    fn output_is_sorted_and_deduplicated() {
+        let t = TempHome::new();
+        t.mkdir(".codex/skills/zzz")
+            .mkdir(".codex/skills/aaa")
+            .write(
+                ".codex/config.toml",
+                "[mcp_servers.z]\ncommand = \"c\"\n[mcp_servers.a]\ncommand = \"c\"\n",
+            );
+        let caps = Codex::new(t.home.clone()).read_state().unwrap();
+        let labels: Vec<String> = caps.iter().map(|c| c.id.label()).collect();
+        let mut sorted = labels.clone();
+        sorted.sort();
+        assert_eq!(labels, sorted, "{labels:?}");
+        let mut dedup = labels.clone();
+        dedup.dedup();
+        assert_eq!(labels.len(), dedup.len(), "duplicate ids: {labels:?}");
+    }
+
+    /// 同名 plugin 来自两个 marketplace 时，两个键归一化成同一个 `CapId`，派单要求的
+    /// dedup 于是**丢掉一条**。这条钉住「确实只剩一条、而且留下的是哪一条」：
+    /// `output_is_sorted_and_deduplicated` 的 fixture 四条 id 互不相等，删掉 `dedup_by`
+    /// 它照样绿，所以「去重真的发生了」只有本条在守。
+    /// 「留下的是哪条」按 `enabled` 这一**读取级**字段判，不按条数判：条数只由 dedup 那一步
+    /// 决定，读错了哪条它照样成立。
+    #[test]
+    fn same_entry_name_from_two_marketplaces_collapses_to_one_capability() {
+        let t = TempHome::new();
+        write_config(
+            &t,
+            r#"[plugins."dup@mp-a"]
+enabled = true
+
+[plugins."dup@mp-b"]
+enabled = false
+"#,
+        );
+        let caps = Codex::new(t.home.clone()).read_state().unwrap();
+        let dups: Vec<&Capability> = caps
+            .iter()
+            .filter(|c| c.id.kind == Kind::Plugin && c.id.name == "dup")
+            .collect();
+        assert_eq!(dups.len(), 1, "id 相同的多条会被 dedup 合并成一条");
+        match &dups[0].spec {
+            Spec::Plugin {
+                marketplace,
+                enabled,
+                ..
+            } => {
+                assert_eq!(
+                    marketplace.as_deref(),
+                    Some("mp-a"),
+                    "留下的是键序在前的那条"
+                );
+                assert!(
+                    *enabled,
+                    "留下必须是 mp-a 那条记录本身（enabled = true），不是 mp-b 的 false"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
     }
 }
