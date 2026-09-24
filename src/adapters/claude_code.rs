@@ -993,9 +993,9 @@ mod tests {
     /// 不是认可合并是对的：合并留下哪条由 serde_json `Map` 的键序（BTreeMap，未开
     /// `preserve_order`）+ 稳定排序决定，所以是可复现的。真要区分两个 marketplace 得把
     /// 它纳入 `CapId`，那是 Task 13/14 的裁决，不在 Task 9。
-    /// 变异实测（第二轮在 178 条套件上重跑 6 次，结果一致）：删掉 `dedup_by` 那行，红的只有
-    /// 这一条（`dups.len()` 变成 2）。`output_is_sorted_and_deduplicated_by_id` 不看守这一步：
-    /// 它的 fixture 四条 id 互不相等，删掉 dedup 它照样绿——所以「去重真的发生了」这件事
+    /// 变异实测（第二轮在 178 条套件上重跑 8 次，每次只红这一条）：删掉 `dedup_by` 那行，
+    /// 红的是本条（`dups.len()` 变成 2）。`output_is_sorted_and_deduplicated_by_id` 不看守
+    /// 这一步：它的 fixture 四条 id 互不相等，删掉 dedup 它照样绿——「去重真的发生了」
     /// 只有本条在钉。
     #[test]
     fn same_entry_name_from_two_marketplaces_collapses_to_one_capability() {
