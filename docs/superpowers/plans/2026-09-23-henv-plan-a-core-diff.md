@@ -2366,9 +2366,19 @@ mod tests {
         t.mkdir(".claude/skills/trim-cot-leakage");
         let got = read_skill_entries(&t.path(".claude/skills"), &t.home);
         assert_eq!(got[0].link_target, None);
-        assert!(got[0].resolved.is_some());
+        // resolved / path 都断**具体值**。`is_some()` 与 `!is_broken()` 曾被当作两条 pin
+        // 计入，它们是 store 断言的推论（store 只有在解得开时才可能不是 Other），逐条删除都不红。
+        assert_eq!(
+            got[0].resolved,
+            Some(t.path(".claude/skills/trim-cot-leakage")),
+            "真实目录必须原样解析到自己"
+        );
+        assert_eq!(
+            got[0].path,
+            t.path(".claude/skills/trim-cot-leakage"),
+            "path 是扫描到的位置，不能被换成 canonical 形态"
+        );
         assert_eq!(got[0].store, SkillStore::HarnessLocal);
-        assert!(!got[0].is_broken());
     }
 
     #[test]
@@ -2549,7 +2559,7 @@ pub fn read_skill_entries(dir: &Path, home: &Home) -> Vec<SkillEntry> {
         // canonicalize 一次性解多跳；断链与成环都返回 Err（OS 报 ELOOP）
         let resolved = fs::canonicalize(&path).ok();
         let store = match &resolved {
-            Some(r) if r.is_dir() => classify(r, home),
+            Some(r) if r.is_dir() => classify(r, &prefixes),
             _ => SkillStore::Other,
         };
 
@@ -2560,15 +2570,40 @@ pub fn read_skill_entries(dir: &Path, home: &Home) -> Vec<SkillEntry> {
     out
 }
 
-/// 判定一个已解析的真实路径归属哪个库。
-pub fn classify(resolved: &Path, home: &Home) -> SkillStore {
-    if resolved.starts_with(home.agents_skills()) {
+/// `Home` 的派生前缀，一次扫描算一次（`let prefixes = HomePrefixes::new(home)?;` 在循环之前）。
+/// 存在的理由见 D0/D3：`resolved` 每一段软链都已解掉，而 `Home` 只归一化了 root，
+/// 派生路径还留着未解析的中间段——字面比较会永远失配。
+pub struct HomePrefixes {
+    agents_skills: PathBuf,
+    harness_dirs: Vec<PathBuf>,
+}
+
+impl HomePrefixes {
+    pub fn new(home: &Home) -> anyhow::Result<Self> {
+        let mut harness_dirs = Vec::new();
+        for dir in home.harness_dirs() {
+            harness_dirs.push(Home::try_canonicalize(&dir)
+                .with_context(|| format!("failed to normalize home harness dir {}", dir.display()))?);
+        }
+        Ok(Self {
+            agents_skills: Home::try_canonicalize(&home.agents_skills())?,
+            harness_dirs,
+        })
+    }
+}
+
+/// 判定一个已解析的真实路径归属哪个库（纯函数：前缀已由 [`HomePrefixes`] 归一化好）。
+/// **下面的裁决顺序本身是契约**（D2）：`Shared` → `PluginCache` → `HarnessLocal` → `Other`，
+/// 每一对相邻 arm 都有一个「两边同时命中」的 fixture，顺序才可观察。判成 `PluginCache`
+/// 不是换个标签：它是 Task 13 的 drift **豁免位**，排错序的方向是漏报。
+pub fn classify(resolved: &Path, prefixes: &HomePrefixes) -> SkillStore {
+    if resolved.starts_with(&prefixes.agents_skills) {
         return SkillStore::Shared;
     }
     if is_in_plugin_cache(resolved) {
         return SkillStore::PluginCache;
     }
-    if home.harness_dirs().iter().any(|d| resolved.starts_with(d)) {
+    if prefixes.harness_dirs.iter().any(|d| resolved.starts_with(d)) {
         return SkillStore::HarnessLocal;
     }
     SkillStore::Other
@@ -2583,10 +2618,12 @@ fn normal_components(path: &Path) -> Vec<String> {
         .collect()
 }
 
+/// 「像 plugin 缓存」与「报得出 plugin 身份」是**同一个**判断（D1）：共用
+/// `plugin_from_path` 的位置守卫（`plugins` 必须在缓存段**之前**），恒等式即
+/// `is_in_plugin_cache(p) == plugin_from_path(p).is_some()`。旧的「任意顺序、任意深度」
+/// 命中会把豁免位放宽到真实 drift 上。
 fn is_in_plugin_cache(path: &Path) -> bool {
-    let comps = normal_components(path);
-    comps.iter().any(|c| c == "plugins")
-        && comps.iter().any(|c| c == "cache" || c == "managed")
+    plugin_from_path(path).is_some()
 }
 
 /// 从一个 skill 路径反推它所属的 plugin 名。覆盖两种实测布局：
@@ -2643,16 +2680,23 @@ git commit -m "feat: skills 目录扫描，识别多跳链接/断链/来源分�
 
 #### Task 7 追加（评审后补：4 项 Important + 一处计划文本落后于代码）
 
-**先修计划本身。** Step 3 写的 `classify` 用**字面前缀**比较，`d293e11` 已把它改成
-`canonical_prefix()` 归一化后再比——那是正确的偏离（`Home` 只归一化 root，中间层软链没解，
+**先修计划本身。** Step 3 写的 `classify` 用**字面前缀**比较，落地时已改成「两侧先归一化到
+`fs::canonicalize` 形态再比」——那是正确的偏离（`Home` 只归一化 root，中间层软链没解，
 字面前缀永远配不上 `fs::canonicalize` 的结果）。**评审明确警告：计划文本不更新，Task 9/10/11 与
-13 再照 brief 转写就会把这个 bug 装回去。
-**Step 3 的示例代码块本身仍是修前的形态**（`classify(r, home)` + 字面 `starts_with`），只靠本追加
-条目与接口契约块纠正。改这段示例请连同 `HomePrefixes` 一起改，不要只换签名。** 所以下面 D0 先把 Step 3 的语义钉住。
+13 再照 brief 转写就会把这个 bug 装回去。** Step 3 的示例代码块（`classify` / `is_in_plugin_cache` /
+调用点）已按落地形态改写；但**同一段里的 scanner 函数体仍是 D4 之前的形状**（`read_skill_entries`
+吞掉所有 `read_dir` 错误、`fs::read_link(...).ok()`），那一条以下面的「落地后的最终契约」为准，
+生产入口是 `try_read_skill_entries`。
+
+> **落地后的真实符号（转写时以此为准，不要再找 `canonical_prefix`——它不存在）**：归一化规则只有
+> 一处，即 `Home::try_canonicalize(&Path) -> std::io::Result<PathBuf>`（`src/home.rs`，`pub(crate)`，
+> NotFound-only）。`classify` 本身**不带 IO**，签名是
+> `classify(resolved: &Path, prefixes: &HomePrefixes) -> SkillStore`；四个前缀（agents/claude/codex/kimi）
+> 由 `HomePrefixes::new(&Home) -> anyhow::Result<Self>` 在扫描开始时**归一化一次**，再逐条复用。
 
 **D0 — 在 Step 3 的 `classify` 处记录已生效的偏离**（不改行为，只让转写者照新形态写）：
-两侧前缀都必须先经 `canonical_prefix()` 归一化，且**只在该层目录不存在（`NotFound`）时才退回字面
-路径**，其余错误 kind 不得静默吞掉。
+两侧前缀都必须先归一化到 `fs::canonicalize` 形态，且**只在该层目录不存在（`NotFound`）时才退回字面
+路径**，其余错误 kind 不得静默吞掉。归一化只发生在 `HomePrefixes::new` 这一层，不在每条 entry 上重复。
 
 **D1 — `is_in_plugin_cache` 顺序盲，会静默豁免真实 drift（评审实测，比原报告更严重）。**
 现实现是 `comps.any("plugins") && comps.any("cache"|"managed")`，任意顺序、任意深度都命中。
@@ -2669,13 +2713,16 @@ git commit -m "feat: skills 目录扫描，识别多跳链接/断链/来源分�
 变异「交换两个 arm」17/17 全绿。修：加一条两条软链指向同一目录、断言 `Shared` 的 fixture，并把裁决
 理由写进 `classify` 文档。
 
-**D3 — `canonical_prefix` 吞掉所有错误 kind，而它的文档注释说自己不吞。**（控制器与实施者各自独立
+**D3 — `canonical_prefix`（评审时的临时名字，落地后叫 `Home::try_canonicalize`）吞掉所有错误 kind，
+而它的文档注释说自己不吞。**（控制器与实施者各自独立
 发现，评审确认。）`unwrap_or_else(|_| to_path_buf())` 在 `PermissionDenied`/`ELOOP`/`ENOTDIR` 上同样
 退回字面值，于是本 commit 要消除的「静默 `Other`」换个触发条件复活。注释声称对齐 `Home::try_new`
 的 NotFound-only 规则，实际对齐的是 `Home::new`——而 `Home::new` 的文档明写「会吞错……生产入口不要
 用这里」，等于挑了项目已经否决的那个样板。修：`io::Result<PathBuf>`，只有 `NotFound` 返回
 `Ok(原值)`，其余上抛；**更推荐**把这段逻辑做成 `Home` 上的一个归一化辅助，让 `Home::try_new` 与
 `classify` 共用——目前同一语义存在两份、两套契约。
+**已按「更推荐」那条落地**：全 crate 只有 `Home::try_canonicalize`（`src/home.rs`，NotFound-only）
+一处该规则，`Home::try_new`、`Home::new`、`HomePrefixes::new` 都走它。不要再新增第二份归一化实现。
 
 **D4 — 存在但读不了的 skills 目录，与「这个 harness 没有 skills」无法区分。**
 实测：`chmod 000` 的目录 `read_dir` 返回 `Some(PermissionDenied)`，`read_skill_entries` 交出 0 条；
@@ -2733,8 +2780,17 @@ git commit -m "feat: skills 目录扫描，识别多跳链接/断链/来源分�
   `read_dir` 的其余 kind、逐条 list / `file_type` / `read_link` 失败、home 前缀归一化失败
   → 全部带着路径上抛（丢一条 = 漏报，对只读工具最坏）。断链（ENOENT）与软链成环（ELOOP）
   **仍是数据**，绝不上抛、绝不 panic：条目照常出现，`resolved: None` + `is_broken()`。
-  注：三处逐条上抛（list / stat / read_link）在本机**无法注入故障**，变异体实测存活——它们是
-  代码层面的正确形状，不是被测试钉住的规则，别当成已有覆盖，也别「顺手」改回 `continue`。
+  注：**两处**逐条上抛（list / `file_type`）在本机无法注入故障，变异体实测存活——它们是代码层面的
+  正确形状，不是被测试钉住的规则，别当成已有覆盖，也别「顺手」改回 `continue`。
+  - `file_type` 确实不可达：std 从 dirent 缓存的 `d_type` 直接回答，**不发 syscall**。实测在
+    下面那条能让 `read_link` 失败的同一路径上，`item.file_type()` 仍返回 `Ok(true)`。
+  - **`read_link` 可达，先前「三处都不可注入」的说法是错的**（2026-09-24 控制器与评审各自独立
+    复测）。可复现配方：把被扫描目录的路径**字符串**用 `/.` 段垫到 `read_dir` 仍接受的上限
+    （实测 `dirlen=1015` 可接受、再长即 `InvalidFilename`），此时 `DirEntry::path()` 拼出的
+    条目路径已到长度上限，`fs::read_link(&path)` **确定、无竞态地**返回 `InvalidFilename`
+    （实测 `entrylen=1021` 即失败；`fs::metadata` 同一路径同样失败，`file_type()` 却仍是 `Ok`）。
+    把这条 arm 换成 `.ok()` 变异体，就会把一根断链呈现成「真实目录」——所以它是
+    **可注入而未钉住**，缺一条测试，不是缺一个前提。补测试的责任记在 Task 9 的 Step 0。
 - **`SkillEntry.path` 不归一化**（D5）：它是扫描到的磁盘位置，adapters/doctor 按它显示，也必须
   保持原样才可 diff；两侧比较一律用 `resolved`（`path` 可能带着没解开的软链段，直接比会重新
   踩 `/var` vs `/private/var`）。多跳解析由 `fs::canonicalize` 一次完成，两跳链的回归测试是
@@ -2984,8 +3040,8 @@ pub fn registry(home: &Home) -> Vec<Box<dyn HarnessAdapter>> {
 pub fn lookup<'a>(
     reg: &'a [Box<dyn HarnessAdapter>],
     name: &str,
-) -> Option<&'a Box<dyn HarnessAdapter>> {
-    reg.iter().find(|a| a.name() == name)
+) -> Option<&'a dyn HarnessAdapter> {
+    reg.iter().map(|a| a.as_ref()).find(|a| a.name() == name)
 }
 ```
 
@@ -3146,7 +3202,123 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
 ### Task 9: claude-code read_state
 
 **Files:**
-- Modify: `src/adapters/claude_code.rs`
+- Create/Modify: `src/adapters/claude_code.rs`
+- Modify（仅 Step 0，只加测试、不改生产代码）: `src/adapters/mod.rs`、`src/skills_dir.rs`
+
+**Step 0 的存在理由：** Task 7/8 的评审各发现了一批「可注入而未钉住」的 arm，全部是**行为已经正确、
+但没有测试看守**的形状。后面 6 个 Task 都在这些函数上搭接口，一次回归不会红，只会让 `henv diff`
+吐出**看起来合理**的错报告——golden 判不出来。这一节把四条钉完再动 Task 9 的正题；四条都是加测试，
+任何一条改动生产代码都算越界。
+
+- [ ] **Step 0.1: 钉住 skeleton `supports()` 的返回值**（`src/adapters/mod.rs` 的 tests 里追加）
+
+  为什么必须有：`Support::Native` 是 Task 13 通过 `registry()` 实际消费的唯一 produced 行为，
+  Task 8 的变异体 M26/M27 全存活。它若悄悄变成别的值，`henv diff` 会声称「什么都能交付给谁」，
+  而三个骨架同时错的情况下没有任何一条现有测试会红。
+
+```rust
+    #[test]
+    fn skeleton_supports_is_native_for_every_harness() {
+        let t = TempHome::new();
+        let cap = crate::testutil::cap(
+            Kind::Skill,
+            "pin-me",
+            Spec::Skill {
+                source: SkillSource::AgentsDir,
+                path: None,
+            },
+        );
+        for a in registry(&t.home) {
+            assert_eq!(
+                a.supports(&cap),
+                Support::Native,
+                "{} 的骨架占位被改动了；Task 12 之前它必须是 Native",
+                a.name()
+            );
+        }
+    }
+```
+
+  `testutil::cap` 已经存在（返回 `Origin::Adopted` + `Targets::All`），**不要**新开 `testutil` 面。
+  按需在 tests 模块的 `use` 里补 `Kind`/`Spec`/`SkillSource`/`Support`。
+
+- [ ] **Step 0.2: 钉住 `detect()` 用的是 `is_dir()` 而不是 `exists()`**（同一 tests 模块追加）
+
+  为什么必须有：`.claude` 是一个**普通文件**或**断链**时，`exists()` 也返回 true，于是 detect 声称
+  「装了 claude」，紧接着 `read_state` 交出空表——「没装」和「装了但读不出」重新变得不可区分，
+  这正是 D4 在 scanner 侧刚消掉的形状。
+
+```rust
+    #[test]
+    fn detect_rejects_a_regular_file_at_the_harness_path() {
+        let t = TempHome::new();
+        t.write(".claude", "not a directory");
+        let reg = registry(&t.home);
+        assert!(
+            !lookup(&reg, CLAUDE_CODE).unwrap().detect(),
+            "detect 必须要求目录；换成 exists() 时普通文件也会被认成已安装"
+        );
+    }
+```
+
+- [ ] **Step 0.3: 钉住 `lookup` 不做前缀匹配**（现有 `lookup_finds_registered_and_rejects_unknown`
+  里追加一行即可，不要新开测试）
+
+```rust
+        // 变异实测：`starts_with` 让 lookup("code") 命中 codex，而 manifest 侧是精确串比较。
+        assert!(lookup(&reg, "code").is_none(), "lookup 不允许前缀匹配");
+```
+
+- [ ] **Step 0.4: 钉住 `read_link` 失败上抛**（`src/skills_dir.rs` 的 tests 里追加）
+
+  为什么必须有：Task 7 的最终契约先前声称「list / stat / read_link 三处都无法注入故障」，**这条是错的**，
+  2026-09-24 复测已修正——`read_link` 是唯一可注入的那一处，且可确定复现（配方见 Task 7 最终契约那一条）。
+  把这条 arm 换成 `.ok()` 会把一根**读不出向外的链接**呈现成 `link_target: None`，也就是伪装成正常
+  真实目录，而它是 Task 13 判断 `SkillStore` 的输入。`item.file_type()` 在同一路径下仍返回 `Ok`
+  （std 用 dirent 缓存的 `d_type`，不发 syscall），所以另两处维持「形状正确、无测试看守」。
+
+```rust
+    #[test]
+    fn an_unreadable_link_propagates_instead_of_looking_like_a_real_dir() {
+        // 把被扫描目录的路径字符串用 "/." 垫到接近 read_dir 的上限，
+        // 此时 DirEntry::path() 拼出的条目路径超过上限，fs::read_link 确定地返回 InvalidFilename。
+        // 2026-09-24 实测：dirlen=999 时 read_dir 仍成功（上限附近是 1015），
+        // 而 40 字符条目名拼出的 entrylen=1038 已经让 read_link 失败；file_type() 仍是 Ok(true)。
+        let long = "skill-with-a-deliberately-long-name-40";
+        let t = TempHome::new();
+        t.mkdir(".claude/skills/realdir")
+            .symlink(&format!(".claude/skills/{long}"), "realdir");
+        let mut padded = t.path(".claude/skills").to_string_lossy().into_owned();
+        while padded.len() + 2 <= 999 {
+            padded.push_str("/.");
+        }
+        let dir = PathBuf::from(&padded);
+        // 前提自证：垫完仍列得出目录，否则这条测试什么都没测（宁可红，不要静默通过）。
+        assert!(
+            fs::read_dir(&dir).is_ok(),
+            "前提失效：dirlen={} 已让 read_dir 失败",
+            padded.len()
+        );
+        let err = try_read_skill_entries(&dir, &t.home)
+            .expect_err("read_link 失败必须上抛，不能伪装成一条正常条目");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("failed to read link "),
+            "错误应由 read_link 那条 arm 产生，实际：{msg}"
+        );
+    }
+```
+
+  **注意**：错误前缀 `failed to read link ` 是 `skills_dir.rs` 里 `with_context` 拼的字面串，改它要
+  同步改这条断言；这里用 `starts_with` 而不是全等，因为后缀是被测代码自己拼的 `path.display()`，
+  把整条临时路径钉进断言会让测试和 fixture 布局耦合。**不要**改成断言消息里含条目名。
+
+  Step 0 完成判据：`cargo test --lib` 全绿；四条测试各自 **keep-one 可红**（把对应生产代码换成
+  描述里的变异体：`Support::Native`→`Support::Unsupported { reason: "x".into() }`、`is_dir()`→`exists()`、
+  `a.name() == name`→`name.starts_with(a.name())`、read_link 的 `?`→`.ok()`），换完只红这一条，
+  且注释里写明是哪个。四个变异体互不相同，任何一条测试红在两处以上都说明钉得不够准。
+
+---
 
 **Interfaces:**
 - Consumes: `Home::{claude_skills, claude_json, claude_installed_plugins, claude_settings}`、`skills_dir::{try_read_skill_entries, plugin_from_path, SkillStore}`、`capability::*`
