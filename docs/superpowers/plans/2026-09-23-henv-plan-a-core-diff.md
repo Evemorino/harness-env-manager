@@ -2259,7 +2259,7 @@ pub fn lower(m: &Manifest) -> Vec<Capability> {
         });
     }
 
-    out.sort_by(|a, b| a.id.label().cmp(&b.id.label()));
+    out.sort_by_key(|a| a.id.label());
     out
 }
 
@@ -3344,10 +3344,10 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
   别再照 `fee8dd3` 的记忆写——那一版本节已被 T11a 推翻三处**）：`read_json_if_present`、
   `split_plugin_key`、`mcp_capability` 三个 `pub(crate)`，加**七个**形状原语
   `expect_object` / `expect_array` / `expect_string` / `optional_string` / `optional_object` /
-  `optional_array`（均 `pub(crate)`）与 `expect_bool`。
-  **`expect_bool` 目前是 `pub` 而不是 `pub(crate)`**，这是 clippy 逼出来的偏离：还没有调用方时，
+  `optional_array`（均 `pub(crate)`）与 `expect_bool`（`pub(crate)`，`a762019` 已收回）。
+  `expect_bool` 曾是这一族里唯一写成 `pub` 的成员：那是 clippy 逼出来的偏离——还没有调用方时，
   未被调用的 `pub(crate)` fn 在 lib target 里算 dead code，`-D warnings` 直接报错，而本计划禁止
-  `#[allow]`。**Task 11 一旦有真实调用方就应当收回 `pub(crate)`**，别把这个面留成永久扩宽。
+  `#[allow]`。Task 11 接上 kimi 这个真实调用方后已收回 `pub(crate)`，这一族对外没有 `pub` 成员。
   `split_plugin_key` 由 **claude 与 codex 共用这一份**（它收 `&str`、返回 owned 对，不碰 `Value`，
   所以能跨 JSON/TOML 两家）；kimi 不需要拆——它的 `installed.json` 是数组、身份在 `id` 字段里。
   **模块私有、拿不到的**：`gate_enabled`、`type_name`、`shape_fault`、`read_json_value_if_present`
@@ -3393,13 +3393,21 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
   而 claude 那边同类判定用的是私有的 `gate_enabled` + `type_name`，`expect_*` 里**没有布尔版**。
   直接写 `.and_then(Value::as_bool).unwrap_or(true)` 就是本计划刚判定为 Critical 的那个塌缩。
   **本条已经落地，不再是 Task 11 的欠债**（原计划要求"在 Task 11 的 commit 里一并落地"，T11a 提前
-  做掉了）：`pub fn expect_bool(value: &Value, file: &Path, what: &str) -> anyhow::Result<bool>`
-  在 `claude_code.rs:430`。注意它**是 `pub` 不是 `pub(crate)`**——没有调用方时 `pub(crate)` 会被
-  `dead_code` 在 `-D warnings` 下判错，而本计划禁止抑制注解；**Task 11 接上调用方后应把它收回
-  `pub(crate)`**。调用形状：
+  做掉了）：`pub(crate) fn expect_bool(value: &Value, file: &Path, what: &str) -> anyhow::Result<bool>`
+  在 `claude_code.rs:429`（`a762019` 收回 `pub(crate)`，kimi 已是它的生产调用方；历史上曾因无调用方
+  暂写 `pub` 以过 `-D warnings` 的 `dead_code` 检查，现已归位）。调用形状：
   `match record.get("enabled") { Some(v) => expect_bool(v, &file, "...")?, None => true }`
   （未列 = 未表态，与 claude 的门禁语义一致）。**Task 11 仍欠的只有一条 ⚠️：`github` 嵌套
   `and_then` 深路径必须显式裁决**——那件事 T11a 没有替它决定。
+
+  **后续裁决（T11b 记录，`"enabled": null`）**：上面那个 `match` 让显式 `"enabled": null` 变成形状
+  故障（`Some(Null)` 进 `expect_bool` → `as_bool` 得 `None` → shape_fault），与本家族的
+  `leaf null ≡ absent` 约定（`optional_string`/`optional_object`/`optional_array`，`eab428e` 裁定）矛盾。
+  **裁决：约定胜出——给家族加第八个原语 `optional_bool`**（`None`-on-absent-or-null），用来读
+  `enabled`；`expect_bool` 保留给强制布尔位。理由：`null` 在 JSON 里是「无」的常见拼写，第八个
+  遵循家族形状的原语比「一个字段里 `null` 意味着坏、邻居都意味着缺」更便宜、更不惊讶。
+  这是小代码改动 + 一条测试，**不是** Task-11 重开——随 joint review 的 fix round 或作为独立
+  micro-commit 落地。
 
 实测数据形状（本机 2026-09-23 盘点，即测试 fixture 的依据）：
 
@@ -3980,7 +3988,7 @@ pub(crate) fn mcp_capability(
         let mut caps = self.read_skills();
         caps.extend(self.read_mcps()?);
         caps.extend(self.read_plugins()?);
-        caps.sort_by(|a, b| a.id.label().cmp(&b.id.label()));
+        caps.sort_by_key(|a| a.id.label());
         // dedup_by 只去重相邻项，所以必须先 sort
         caps.dedup_by(|a, b| a.id == b.id);
         Ok(caps)
@@ -4420,7 +4428,7 @@ fn split_key(key: &str) -> (String, Option<String>) {
             caps.extend(self.read_mcps(&root));
             caps.extend(self.read_plugins(&root));
         }
-        caps.sort_by(|a, b| a.id.label().cmp(&b.id.label()));
+        caps.sort_by_key(|a| a.id.label());
         caps.dedup_by(|a, b| a.id == b.id);
         Ok(caps)
     }
@@ -4453,21 +4461,21 @@ git commit -m "feat: codex read_state（config.toml 动态导航，对未知字�
 > `optional_array` / `expect_object` + `expect_string` / `optional_object`。
 > **原先前两件事，第一件已经在 `361b9bf` 替你做完，只剩一件你还欠着**：
 > 1. ~~`enabled` 缺 `expect_bool`~~ —— **已落地**，`claude_code.rs:430` 有
->    `pub fn expect_bool(value: &Value, file: &Path, what: &str) -> anyhow::Result<bool>`，
->    直接 import 调用即可（调用形状见 Task 9 `Produces` 那节）。**它现在是 `pub` 而不是
->    `pub(crate)`，你接上调用方之后要顺手收回**——那是 clippy `dead_code` 当时的妥协，不该永久留着。
+>    `pub(crate) fn expect_bool(value: &Value, file: &Path, what: &str) -> anyhow::Result<bool>`
+>    （`a762019` 已收回 `pub(crate)`，你直接 import 调用即可，无需再收回；调用形状见
+>    Task 9 `Produces` 那节）。
 > 2. `github` 那条嵌套 `and_then` 链是**可选深路径**，故意不用 `expect_*`；代价是 `github` 存在但
 >    类型不对时静默变 `None`。**这是你必须显式裁决的点**——保持现状并注释说明，或先
 >    `optional_object(github, ...)` 再把 owner/repo 当必填。两种都行，不许不裁决。
 >
 > 复用面（`361b9bf` 重核过可见性，`fee8dd3` 那版已被推翻）：`read_json_if_present`、
-> `mcp_capability` 和七个形状原语都可复用（`expect_bool` 目前 `pub`，接上调用方后收回
-> `pub(crate)`）；`gate_enabled` / `type_name` / `shape_fault` / `read_json_value_if_present`
+> `mcp_capability` 和七个形状原语都可复用（`expect_bool` 已是 `pub(crate)`，`a762019` 收回）；
+> `gate_enabled` / `type_name` / `shape_fault` / `read_json_value_if_present`
 > 是 claude 模块私有，**拿不到也不需要拿**。`mcp_capability` 现在是
 > `(name, cfg, harness, file) -> Result<Capability>`，第四个参数让报错带出是哪家哪个文件读坏了。
 
 **Files:**
-- Modify: `src/adapters/kimi_code.rs`
+- Modify: `src/adapters/kimi_code.rs`、`src/adapters/claude_code.rs`（`expect_bool` 可见性收紧到 `pub(crate)`）
 
 **Interfaces:**
 - Consumes: `Home::{kimi_mcp, kimi_installed_plugins}`、
@@ -4727,10 +4735,12 @@ use crate::adapters::claude_code::{
     expect_bool, optional_string, read_json_if_present,
 };
 // 注意：`gate_enabled` / `type_name` / `shape_fault` 是 claude 模块私有的，import 不到，
-// 也不需要——它们藏在上面这些原语背后。`expect_bool` 自 `361b9bf` 起可用（目前 `pub`，
-// 你接上调用方后收回 `pub(crate)`）。
+// 也不需要——它们藏在上面这些原语背后。`expect_bool` 自 `361b9bf` 起可用，`a762019` 已收回
+// `pub(crate)`。
 use crate::adapters::{HarnessAdapter, KIMI_CODE};
-use crate::capability::{CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets};
+use crate::capability::{
+    normalize_locator, CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets,
+};
 use crate::home::Home;
 use crate::skills_dir::try_read_skill_entries;
 use serde_json::Value;
@@ -4807,31 +4817,29 @@ impl KimiCode {
                     .and_then(Value::as_str)
                     .zip(github.and_then(|g| g.get("repo")).and_then(Value::as_str))
                     .map(|(owner, repo)| format!("{owner}/{repo}")),
-                version: github
+                version: normalize_locator(github
                     .and_then(|g| g.get("ref"))
                     .and_then(|r| r.get("value"))
-                    .and_then(Value::as_str)
-                    .map(String::from),
+                    .and_then(Value::as_str)),
                 // installedSha 与 claude 的 gitCommitSha 是同一个 SHA，
                 // 必须读进 sha 位，SHA 优先比较才成立（spec §2.1 第 3 条）
-                sha: github
+                sha: normalize_locator(github
                     .and_then(|g| g.get("installedSha"))
-                    .and_then(Value::as_str)
-                    .map(String::from),
+                    .and_then(Value::as_str)),
             });
         }
         Ok(out)
     }
 
     /// kimi 没有用户级 skills 目录：skill 只随 bundle 分发（spec §2.1 第 4 条）。
-    fn read_bundled_skills(&self, plugins: &[InstalledPlugin]) -> Vec<Capability> {
+    fn read_bundled_skills(&self, plugins: &[InstalledPlugin]) -> anyhow::Result<Vec<Capability>> {
         let mut out = Vec::new();
         for p in plugins {
             if !p.enabled {
                 continue;
             }
             let Some(root) = &p.root else { continue };
-            for e in try_read_skill_entries(&root.join("skills"), &self.home) {
+            for e in try_read_skill_entries(&root.join("skills"), &self.home)? {
                 out.push(Capability {
                     id: CapId::new(Kind::Skill, e.name),
                     origin: Origin::Plugin { name: p.id.clone() },
@@ -4843,7 +4851,7 @@ impl KimiCode {
                 });
             }
         }
-        out
+        Ok(out)
     }
 }
 
@@ -4864,7 +4872,7 @@ struct InstalledPlugin {
     fn read_state(&self) -> anyhow::Result<Vec<Capability>> {
         let plugins = self.read_plugins()?;
         let mut caps = self.read_mcps()?;
-        caps.extend(self.read_bundled_skills(&plugins));
+        caps.extend(self.read_bundled_skills(&plugins)?);
         for p in &plugins {
             caps.push(Capability {
                 id: CapId::new(Kind::Plugin, p.id.clone()),
@@ -4880,7 +4888,7 @@ struct InstalledPlugin {
                 targets: Targets::All,
             });
         }
-        caps.sort_by(|a, b| a.id.label().cmp(&b.id.label()));
+        caps.sort_by_key(|a| a.id.label());
         caps.dedup_by(|a, b| a.id == b.id);
         Ok(caps)
     }
