@@ -794,8 +794,12 @@ mod tests {
         assert!(find(&caps, Kind::Plugin, "ghost").is_none());
     }
 
-    /// 一条键多条安装时 v1 **只取第一条，其余整条丢掉**——这是「丢数据」的形状，所以钉住
-    /// 「丢的是后面的那些」：换成 `.last()` / 逐条 push，本条要红。
+    /// 一条键多条安装时 v1 **只取第一条，其余整条丢掉**，两件事分开钉。
+    /// 「取的是第一条」由本条钉：`installs.first()` 改成 `.last()`，实测只红本条。
+    /// 「其余整条丢掉」由 `a_second_install_record_never_reaches_the_capability_list` 在
+    /// dedup **之前**钉——本条看不出那个区别：`read_state` 的 `sort_by_key` + `dedup_by`
+    /// 会把「逐条 push」压回同一个输出（实测改成 push-all 后本条仍绿，全套件只红那一条新
+    /// 测试）。
     /// 残余：多条安装到底该取哪一条（越新越优先？）没在这里裁定，那是 Task 13/14 的裁决，
     /// 和「同名不同 marketplace 被 dedup 合并留哪条」是同一族问题。
     #[test]
@@ -828,15 +832,43 @@ mod tests {
         }
     }
 
+    /// 「其余整条丢掉」这件事只能在 dedup 之前看守：`read_state` 会把重复 id 压回一条，
+    /// 所以「每条安装都 push」和「只 push 第一条」在 `read_state` 的输出上**完全等价**
+    /// （实测 push-all 变异下 `only_the_first_install_record_is_read_and_the_rest_are_dropped`
+    /// 仍绿）。这里直接调 `read_plugins()`，多一条就红一条。
+    #[test]
+    fn a_second_install_record_never_reaches_the_capability_list() {
+        let t = TempHome::new();
+        t.write(
+            ".claude/plugins/installed_plugins.json",
+            r#"{ "version": 2, "plugins": { "p@mp": [
+                  { "version": "1.0", "gitCommitSha": "aaa" },
+                  { "version": "2.0", "gitCommitSha": "bbb" } ] } }"#,
+        );
+        let plugins = ClaudeCode::new(t.home.clone())
+            .read_plugins()
+            .expect("多条安装记录本身不是故障");
+        assert_eq!(
+            labels(&plugins),
+            vec!["plugin/p".to_string()],
+            "其余记录必须在进列表之前就被丢掉，而不是留给 read_state 的 dedup 合并"
+        );
+    }
+
     /// 派单字面代码在 `read_plugins` 里写的是
     /// `self.read_enabled_plugins().unwrap_or_default()`（注释：「读失败不该拖垮 plugin
     /// 扫描，退化成全部视为 enabled」）。那正是失败隔离契约禁止的形状：一个语法坏掉的
     /// settings.json 会把用户**关掉**的 plugin 报成 `enabled: true`，diff 于是把
     /// 「你禁用了它」念成「已同步」，而报告里没有任何地方说明 settings.json 没读成。
-    /// 所以这里上抛，并留测试看守。变异实测（评审修正过本注释原先的过度声明）：把 `?` 换回
-    /// `.unwrap_or_default()` 会红**两条**——下面这两条各自走的就是同一个 `?`：
-    /// `a_malformed_settings_json_is_an_error_not_a_silent_enable_all`（语法坏）与
-    /// `a_non_boolean_enable_gate_is_an_error_naming_the_plugin`（门禁值类型坏）。
+    /// 所以这里上抛，并留测试看守。变异实测（第二轮重跑：把 `?` 换回
+    /// `.unwrap_or_default()`，全套件 173 passed / **4 failed**）：红的是四条，不是本注释
+    /// 先前说的两条——
+    /// `a_malformed_settings_json_is_an_error_not_a_silent_enable_all`（语法坏）、
+    /// `a_non_boolean_enable_gate_is_an_error_naming_the_plugin`（门禁值类型坏）、
+    /// `enabled_plugins_that_is_not_an_object_is_an_error_naming_the_key`（门禁表自身类型坏）、
+    /// `a_config_file_whose_top_level_is_not_an_object_is_an_error`（三条文件里坏的是
+    /// settings.json 那一轮，实测报错里返回的正是那条 `enabled: true` 的 plugin）。
+    /// 四条都走同一个 `?`，所以「谁在看守这个 `?`」的答案就是这四条。
     #[test]
     fn a_malformed_settings_json_is_an_error_not_a_silent_enable_all() {
         let t = TempHome::new();
