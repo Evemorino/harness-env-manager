@@ -725,6 +725,44 @@ mod tests {
         );
     }
 
+    /// 把一条 symlink 的**读取**弄坏，和把一条链接**弄断**，是两件不同的事。
+    ///
+    /// 断链是数据（上面那条已钉）；`read_link` 失败是**故障**，必须上抛。把这条 arm 换成
+    /// `.ok()` 会把一根读不出向外的链接呈现成 `link_target: None`——也就是伪装成一条正常
+    /// 真实目录，而它是 Task 13 判断 `SkillStore` 的输入。`item.file_type()` 在同一路径下
+    /// 仍返回 `Ok`（std 用 dirent 缓存的 `d_type`，不发 syscall），所以 list/stat 两处维持
+    /// 「形状正确、无测试看守」。
+    /// 变异实测：`?`→`.ok()` 时本测试红在 `expect_err`（函数改而返回 Ok）。
+    #[test]
+    fn an_unreadable_link_propagates_instead_of_looking_like_a_real_dir() {
+        // 把被扫描目录的路径字符串用 "/." 垫到接近 read_dir 的上限，
+        // 此时 DirEntry::path() 拼出的条目路径超过上限，fs::read_link 确定地返回 InvalidFilename。
+        // 2026-09-24 实测：dirlen=999 时 read_dir 仍成功（上限附近是 1015），
+        // 而 40 字符条目名拼出的 entrylen=1038 已经让 read_link 失败；file_type() 仍是 Ok(true)。
+        let long = "skill-with-a-deliberately-long-name-40";
+        let t = TempHome::new();
+        t.mkdir(".claude/skills/realdir")
+            .symlink(&format!(".claude/skills/{long}"), "realdir");
+        let mut padded = t.path(".claude/skills").to_string_lossy().into_owned();
+        while padded.len() + 2 <= 999 {
+            padded.push_str("/.");
+        }
+        let dir = PathBuf::from(&padded);
+        // 前提自证：垫完仍列得出目录，否则这条测试什么都没测（宁可红，不要静默通过）。
+        assert!(
+            fs::read_dir(&dir).is_ok(),
+            "前提失效：dirlen={} 已让 read_dir 失败",
+            padded.len()
+        );
+        let err = try_read_skill_entries(&dir, &t.home)
+            .expect_err("read_link 失败必须上抛，不能伪装成一条正常条目");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("failed to read link "),
+            "错误应由 read_link 那条 arm 产生，实际：{msg}"
+        );
+    }
+
     #[test]
     fn symlink_cycle_is_reported_as_broken_not_infinite_loop() {
         let t = TempHome::new();

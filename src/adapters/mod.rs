@@ -92,8 +92,9 @@ pub fn lookup<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capability::{Kind, SkillSource, Spec};
     use crate::manifest::KNOWN_HARNESSES;
-    use crate::testutil::TempHome;
+    use crate::testutil::{FakeAdapter, TempHome};
 
     /// 三个常量的**字面拼写**必须在 registry 之外再钉一遍。少了这条，把
     /// `CLAUDE_CODE`/`CODEX` 的串值互换是一个能让上面所有 detect/lookup 测试
@@ -126,6 +127,15 @@ mod tests {
         assert!(
             lookup(&reg, "Codex").is_none(),
             "lookup 必须按精确串匹配，否则与 manifest 的 targets 校验不一致"
+        );
+        // 变异实测：`starts_with` 让 lookup("code") 命中 codex，而 manifest 侧是精确串比较。
+        assert!(lookup(&reg, "code").is_none(), "lookup 不允许前缀匹配");
+        // 反方向的同一条例子（变异实测）：`name.starts_with(a.name())` 逃得过上面那行——
+        // "code" 不是任何注册名的前缀——却让 lookup("codex-plus") 命中 codex。两个方向都是
+        // 前缀匹配，都得钉；精确匹配契约要求两侧一律 None。
+        assert!(
+            lookup(&reg, "codex-plus").is_none(),
+            "lookup 不允许前缀匹配（反方向：注册名是入参的前缀）"
         );
     }
 
@@ -188,6 +198,45 @@ mod tests {
         assert!(
             left.is_empty(),
             "adapter 在注入的 root 下留下了东西：{left:?}"
+        );
+    }
+
+    /// 三个骨架的 `supports()` 目前都只是占位 `Support::Native`，而 Task 13 通过
+    /// `registry()` 实际消费的就是这一个 produced 行为（Task 8 评审的 M26/M27 全存活）。
+    /// 它若悄悄变成别的值，`henv diff` 会声称「什么都能交付给谁」，而三个骨架同时错的
+    /// 情况下没有任何一条现有测试会红。这里逐家断言，互换某一家的返回值也能定位到是谁。
+    #[test]
+    fn skeleton_supports_is_native_for_every_harness() {
+        let t = TempHome::new();
+        let cap = FakeAdapter::cap(
+            Kind::Skill,
+            "pin-me",
+            Spec::Skill {
+                source: SkillSource::AgentsDir,
+                path: None,
+            },
+        );
+        for a in registry(&t.home) {
+            assert_eq!(
+                a.supports(&cap),
+                Support::Native,
+                "{} 的骨架占位被改动了；Task 12 之前它必须是 Native",
+                a.name()
+            );
+        }
+    }
+
+    /// `.claude` 是一个**普通文件**或**断链**时，`exists()` 也返回 true，于是 detect 声称
+    /// 「装了 claude」，紧接着 `read_state` 交出空表——「没装」和「装了但读不出」重新变得
+    /// 不可区分，这正是 D4 在 scanner 侧刚消掉的形状。detect 只认目录。
+    #[test]
+    fn detect_rejects_a_regular_file_at_the_harness_path() {
+        let t = TempHome::new();
+        t.write(".claude", "not a directory");
+        let reg = registry(&t.home);
+        assert!(
+            !lookup(&reg, CLAUDE_CODE).unwrap().detect(),
+            "detect 必须要求目录；换成 exists() 时普通文件也会被认成已安装"
         );
     }
 }
