@@ -3344,6 +3344,13 @@ git commit -m "feat: HarnessAdapter trait、注册表与三家骨架"
   `split_plugin_key`、`mcp_capability`。Task 11 的 kimi adapter 复用 `read_json_if_present`
   与 `mcp_capability`；`split_plugin_key` 只 claude 用（kimi 的 `installed.json` 是数组、
   身份在 `id` 字段里，不需要拆 `name@marketplace`）。
+  **落地后的签名（Task 9 修复轮 `c35d9c1`；本节下面的示例代码是修复前的形状）：**
+  `read_json_if_present(&Path) -> Result<Option<Value>>` 保证返回的文档**是对象**（顶层
+  不是对象 = 形状故障），这一处三家共用，kimi/codex 不必各自再写一遍；
+  `mcp_capability(name, cfg, harness, file) -> Result<Capability>` 现在是**可失败的**，
+  第四个参数只用于报错定位（调用方自己的那个 JSON 文件），`command` / `args` / `env`
+  的「键在但类型不对」由它上抛。配套的三态原语 `expect_object` / `expect_array` /
+  `expect_string` / `optional_string` 就在 `claude_code.rs`，照它们写，别另建一套。
 
 实测数据形状（本机 2026-09-23 盘点，即测试 fixture 的依据）：
 
@@ -4287,6 +4294,12 @@ git commit -m "feat: codex read_state（config.toml 动态导航，对未知字�
 > 就会把「配置坏了」报成「没装任何东西」。**落地时必须按 Task 9 已改过的样板处理**：
 > 键缺失 → 空；键在但类型不对 → `bail!` 带路径 + 键名（不带值）。
 > `mcp_capability` / `read_json_if_present` 直接从 `claude_code.rs` 复用，不要另写一份。
+> Task 9 修复轮之后它们的签名是 `read_json_if_present(&Path) -> Result<Option<Value>>`
+> （返回的文档保证是对象）和 `mcp_capability(name, cfg, harness, file) -> Result<Capability>`，
+> 所以本节示例里的 `mcp_capability(name, cfg, KIMI_CODE)` 落地时要写成
+> `mcp_capability(name, cfg, KIMI_CODE, &self.home.kimi_mcp())?`；第四个参数只用于报错里
+> 带出**是哪家 harness 的哪个文件**读坏了。`env` / `args` 的形状故障 helper 已经管了，
+> 但 `root.get("mcpServers")` 这一层仍要按上面的三态自己处理。
 
 **Files:**
 - Modify: `src/adapters/kimi_code.rs`
