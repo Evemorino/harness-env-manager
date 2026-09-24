@@ -330,8 +330,10 @@ fn toml_optional_string<'a>(
     toml_expect_string(value, file, &format!("{context} field `{key}`")).map(Some)
 }
 
-/// 布尔门禁的强制版。claude 那六个原语里**没有**布尔版（Task 11 要补的 `expect_bool`
-/// 就是它），codex 侧 `enabled` 是这个形状唯一的读者，所以本文件自带一对。
+/// 布尔门禁的强制版。claude 那一族形状原语**原本**没有布尔版（Task 11 预备派单已给它补上
+/// `expect_bool`，见 [crate::adapters::claude_code::expect_bool]），但那一族收
+/// `serde_json::Value`，与本文件的 `toml::Value` 类型域不通，合并不了，所以本文件自带一对。
+/// codex 侧 `enabled` 是这个形状唯一的读者。
 /// `.and_then(toml::Value::as_bool).unwrap_or(true)` 就是被裁定为 Critical 的塌缩：
 /// `enabled = "yes"` 会被读成「已启用」。
 fn toml_expect_bool(value: &TomlValue, file: &Path, what: &str) -> anyhow::Result<bool> {

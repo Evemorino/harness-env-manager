@@ -397,6 +397,42 @@ pub(crate) fn expect_string<'a>(
         .ok_or_else(|| shape_fault(value, file, what, "a string"))
 }
 
+/// 第七个形状原语：**强制**位置的布尔裁决，与上面三个 `expect_*` 同族同形状
+/// （收 `&Value`，「键缺失」由调用方的 `Option` 分支处理，这里只裁决「值在但类型不对」，
+/// 报错只报类型名、绝不带值）。返回 `bool` 而不是 `&bool`：`Value::as_bool` 给的就是
+/// `Copy` 值，套一层生命周期参数会被 `clippy::needless_lifetimes` 在 `-D warnings` 下拒掉。
+///
+/// 它存在的理由是 Task 9 `Produces` 末尾点出的那个空洞：kimi 每条安装记录带 `enabled`，
+/// 而 claude 侧同类判定用的是本模块私有的 `gate_enabled` + `type_name`，import 不到。
+/// 直接写 `.and_then(Value::as_bool).unwrap_or(true)` 就是计划里判为 Critical 的塌缩——
+/// `enabled: "yes"` 会被读成「已启用」，diff 于是把用户关掉的 plugin 念成已同步。
+/// 所以调用方（Task 11）写成：
+///
+/// ```text
+/// let enabled = match record.get("enabled") {
+///     Some(v) => expect_bool(v, &file, &format!("plugins[{i}] field `enabled`"))?,
+///     None => true, // 缺键 = 未表态 = 启用，与 claude/codex 两侧的默认一致
+/// };
+/// ```
+///
+/// 关键是**两步分开**：「缺键」才是「未表态 = 启用」，「有值但不是布尔」是故障。
+///
+/// codex 侧同一条规则用的是它自己那对 `toml_expect_bool` / `toml_optional_bool`
+/// （`toml::Value` 与本函数收的 `serde_json::Value` 类型域不通，合并不了；
+/// 与 `split_plugin_key` 那个能合并的 `&str` 情形不同）。
+///
+/// **可见性是这一族里唯一的例外，写成 `pub` 而不是 `pub(crate)`**：它现在还没有生产调用方
+/// （Task 11 才接上），而 `pub(crate)` + 只有 `#[cfg(test)]` 用 = 在 lib 目标里是死代码，
+/// `cargo clippy --all-targets -- -D warnings` 直接报 `expect_bool is never used`。
+/// 本计划不许用 `#[allow]`/`#[expect]` 消 lint，放宽成 `pub` 是不改任何已评审行为的那条路
+/// （另一条路是把 claude 私有的那处布尔判定改成调用它，那会改掉 Task 9 已钉死的报错文本，
+/// 超出本次范围）。Task 11 落地调用方之后，协调方如愿意可把它收紧回 `pub(crate)`。
+pub fn expect_bool(value: &Value, file: &Path, what: &str) -> anyhow::Result<bool> {
+    value
+        .as_bool()
+        .ok_or_else(|| shape_fault(value, file, what, "a boolean"))
+}
+
 /// 可选字符串字段：键缺失 → `Ok(None)`；显式 `null` → `Ok(None)`（JSON 里写「无」的
 /// 常见形态，与缺键同义）；**有值但不是字符串** → 故障上抛，不塌成 `None`。
 pub(crate) fn optional_string<'a>(
@@ -426,9 +462,11 @@ pub(crate) fn optional_string<'a>(
 /// `mcpServers` 里一个已具名 server 的配置。那些位置的 `null` 是坏值，不是「没配」，
 /// 所以 `type_name` 的 `"null"` 分支必须仍然可达。
 ///
-/// 形状原语这一族（`expect_object` / `expect_array` / `expect_string` / `optional_string` /
-/// 本函数 / `optional_array`）都是 `pub(crate)`：**走 JSON 的调用方**（claude 自己 +
-/// Task 11 的 kimi）复用它们，不许另写一份。
+/// 形状原语这一族**七条**（`expect_object` / `expect_array` / `expect_string` /
+/// [`expect_bool`] / `optional_string` / 本函数 / `optional_array`）：
+/// **走 JSON 的调用方**（claude 自己 + Task 11 的 kimi）复用它们，不许另写一份。
+/// 第七条 `expect_bool` 是 Task 9 `Produces` 末尾点出的那个空洞补上的（kimi 的 `enabled`）；
+/// 它暂时是 `pub` 而不是 `pub(crate)`，理由（死代码 lint，不是签名变更）写在它自己的文档里。
 /// 这里也曾经写着「Task 10/11 复用它们」，那是错的：codex 手里是 `toml::Value`，与本族收的
 /// `serde_json::Value` 类型域不通，一个都喂不进去，所以它另写了 `toml_expect_*` /
 /// `toml_optional_*` 那一套。两套只能各自被自己的测试钉住，改形状规则时**两处都要改**。
@@ -1698,6 +1736,36 @@ mod tests {
                 "a string"
             )
         );
+    }
+
+    /// 第七个形状原语（kimi 的 `enabled` 用它）。这里直接测 helper 而不是绕某家的
+    /// `read_state`：落地代码里它**还没有生产调用方**——claude 自己的布尔判定走的是私有的
+    /// `gate_enabled` 那条链（Task 9 已评审，改它不在本次范围），所以本条是它目前唯一的看守，
+    /// Task 11 接上之后才多一条端到端的。
+    /// 消息**逐字**钉死：文件路径 + 位置 + 期望类型 + 实际类型这四段就是全部内容，
+    /// 多出来的一个字都可能是漏值。
+    #[test]
+    fn expect_bool_reports_a_non_boolean_as_a_shape_fault_never_the_value() {
+        let file = Path::new("/x/installed.json");
+        let what = "plugins[0] field `enabled`";
+        // 取值刻意偏向「长得像布尔」：`.unwrap_or(true)` 那种塌缩会把它们全读成已启用；
+        // `"true"` 同时是「报错顺手回显值」最容易漏出来的那个形态。
+        for (found, name) in [
+            (json!("yes"), "a string"),
+            (json!("true"), "a string"),
+            (json!(1), "a number"),
+            (json!(null), "null"),
+            (json!([true]), "an array"),
+            (json!({ "enabled": true }), "an object"),
+        ] {
+            let err = expect_bool(&found, file, what).expect_err("有值但不是布尔 = 故障");
+            assert_eq!(err.to_string(), shape_msg(file, what, "a boolean", name));
+        }
+        assert!(
+            !expect_bool(&json!(false), file, what).unwrap(),
+            "`false` 必须读成 false，不是默认值"
+        );
+        assert!(expect_bool(&json!(true), file, what).unwrap());
     }
 
     /// 合并成一份实现之后（codex 那个逐字相同的私有 `split_key` 已删），这条把**两家共用**
