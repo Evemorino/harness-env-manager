@@ -439,7 +439,13 @@ shell out 系统 git、不引 `git2`，缓存 `~/.cache/henv/git/<repo-hash>/`�
 
 **B2 未做的 / B3**：MCP 三家写入、plugin bundle 拆解、`degrade:` 真正生效（§9.1 的声明性占位，
 至今仍不改变报告）、`--prune`、`--harness <name>`。因此本节的 `.bak`、失败隔离与事务性（§9.7）
-目前只有 skills 交付那一条路径实装，配置文件的写路径尚未涉及。
+在 B2 结束时有 skills 交付那一条路径实装，配置文件的写路径尚未涉及。
+
+**B3 拆成三份做**（2026-09-26 定的边界）：**B3a = MCP 三家写入**（§9.6，含其新增的所有权
+裁决与账本键修订）；**B3b = plugin bundle 拆解 + `degrade:` 生效**（§9.5，会连带 §2.2 第 7 条
+的 kimi `installed.json` 解析与 `optional_bool`）；**B3c = `--prune` 与 `--harness <name>`**。
+拆开的理由是 B3a 独立于另外两份——它只碰配置文件、不碰 bundle，而 §9.8 的 `--prune` 要删东西、
+语义最重，不适合与「第一次改用户配置文件」混在一次改动里。
 
 ### 9.1 范围
 
@@ -612,32 +618,99 @@ manifest 里写了 `degrade:` 块，或该 plugin 条目的 `targets` 含一个�
 
 | harness | 机制 | 理由 |
 |---|---|---|
-| claude-code | shell out `claude mcp add-json` | §2.1 第 1 条：`~/.claude.json` 71KB、0600、被 harness 频繁重写，直接 merge 会与它并发写竞争丢数据 |
+| claude-code | shell out `claude mcp add-json -s user` | §2.1 第 1 条：`~/.claude.json` 71KB、0600、被 harness 频繁重写，直接 merge 会与它并发写竞争丢数据 |
 | codex | `toml_edit` **只改** `[mcp_servers]` 子树 | §2.2 第 3 条：其余字节原样，表结构与字面量形态不动 |
 | kimi-code | serde_json 改 `mcpServers` 键，保留其他顶层键 | §2.2 第 4 条：结构简单，无需特殊处理 |
 
 `env` 一律以 `${VAR}` 引用形态写入，**永不展开**（§3 决策 3）。
 
-**claude 那条必须显式指定 user 级 scope**（`claude mcp add` 默认可能落在项目级
-`.mcp.json`——那是「跑在哪个 cwd」都变的另一份配置，与 henv「管用户级环境」的定位不符）。
-确切 flag 名在实现时对 `claude mcp add-json --help` 核实；**这里钉死的是意图：写入必须落在
-用户级配置上，不许落到任何项目目录里**。这条要有一条断言 cwd 无关的测试兜底。
+**claude 那条必须显式指定 user 级 scope——已核实，不再只是意图。** 本机实测
+`claude mcp add-json` 的 `-s, --scope <scope>` 取 `local|user|project`，**默认 `local`**；
+而 `local` 落在 `projects.<cwd>.mcpServers`，正是读路径明确不读的项目级位置（§2.1 第 1 条）。
+⇒ 实现必须写死 `-s user`。漏了它的后果不是报错而是**静默无用**：写进去的东西 henv 自己
+都看不见，下一次 `diff` 照旧报 `install`，而用户以为已经装好了。兜底测试断言 argv 含
+`-s user` 且子命令名是 `add-json`——**这条不能靠「跑在某个 cwd 恰好也行」蒙过去**，
+`local` 与 `user` 的差别只在配置落在哪个文件里，与 cwd 无关地恒真。
+
+**claude 的 `update` 是两条命令：先 `remove -s user <name>`，再 `add-json -s user <name> <json>`。**
+实测（隔离 HOME）：`add-json` 对**已存在**的名字直接失败——`MCP server <name> already exists in user
+config`，退出码非 0，没有 `--force` 之类的覆盖开关；`remove` 只摘掉 `mcpServers` 里那一个键，其余
+顶层键（`numStartups` 等）原样留下。所以「改一个 henv 已经交付过的 MCP」在 claude 上必须走两步，
+而 `remove` 对不存在的名字会以 `No MCP server named "<name>" in user scope` 退出 1——**不吞它**：
+走到 `update` 说明 diff 刚看到过它，这时 remove 失败是真故障，照 §9.7 报 partial。
+
+**写路径与读路径必须同址。** adapter 只暴露「这家 MCP 配置在哪、什么格式」
+（`mcp_target() -> Option<McpTarget { path, format }>`，与 `skills_target_dir()` 同一形状），
+字节一律由 `src/apply/` 写。这样 `read_mcps` 与写入指向**同一个文件**——「写进去了、
+读不出来」这类自相矛盾不是被测试抓出来的，是结构上不可能的。claude 是唯一的例外形状：
+位置由 `claude` 自己决定，但仍钉在 `~/.claude.json` 顶层（`-s user`），与读路径一致。
+
+**只覆盖账本里记着的条目（§9.3 不变式二在 MCP 上的落实）。** `diff` 对 MCP 的裁决因此
+不只看 spec 是否相同，还要问「这条是不是 henv 放的」：
+
+| 现状 vs 清单 | 账本 | 裁决 |
+|---|---|---|
+| 相同 | 有/无 | `in-sync`——与 skills 那条一致：内容相同就不看账本（本机那 14 条用户自建软链靠的就是这条，§9.3） |
+| 不同 | **无** | `conflict`——同名但不是 henv 放的，`apply` 拒绝并点名 |
+| 不同 | 有 | `update`；账本哈希与现状对不上时额外注记「被手改过」（仍然覆盖，§9.3 已声明该取舍） |
+
+没有这一条，MCP 就是不变式二的缺口：用户在 `~/.claude.json` 里自己配的 `ctx` 会被清单里
+同名的 `ctx` **静默覆盖**——而那是用户的配置，不是 henv 的构建产物。今天 `diff` 走的是
+`compare_versions`、完全不看账本，所以报的是 `update`；B3a 把这个裁决点补上。
+代价（**已接受**）：用户想让 henv 接管一个自己手配过的同名 MCP，得先自己删掉再 `apply`。
+
+`update` 的 from/to 用**可读命令行**（`npx -y @upstash/context7-mcp`）而不是哈希：MCP 的
+「内容」就是它的命令行，哈希在这里只是账本用的凭证。凭证由
+`store::hash::hash_mcp_spec(command, args, env)`（与 `hash_dir` 并列）产出，读写两侧共用
+一份实现——两侧各算各的，正是「账本哈希对不上」这类谜题的来源。
+
+**为什么是三个原生字段而不是 `hash_spec(&Spec)`**（2026-09-26 与实现对齐）：`Spec` 没有
+`Serialize`，为哈希去 derive 它会把序列化形状变成对外契约；而 `&Spec` 版本还要为另外六个
+变体（`Skill`/`Plugin`/`Hook`/`Command`/`Agent`/`Only`）写永远走不到的 arm。三个原生字段
+顺带让「拿一个 skill spec 算 mcp 哈希」在类型上不可表达。**env 的值参与哈希**——与
+`mcp_summary`（只渲染键名，§3 决策 3）不同，账本要认得出「同一条 server 换了一个环境变量
+引用」是改动。
+
+**账本键是 `(harness, kind, name)`，不是 `(harness, name)`。** 同名跨 kind 是清单明确允许的
+（`skills.foo` 与 `mcps.foo` 并存），而 `record` 的语义是「同名覆盖旧的」——键里不带 kind 的话，
+写一个 mcp `foo` 会**静默抹掉**同名 skill `foo` 的账本记录，那条 skill 随即从「henv 放的」
+退化成「用户手放的」，下一次 `diff` 报 `conflict` 而不是 `in-sync`，`modified` 检测一起失明。
+这个缺陷在 B2 之前不暴露，因为那时只有 skill 会被记账。
 
 ### 9.7 事务、备份与失败隔离（对 §5 的修订）
 
 §5 的「写配置文件：临时文件写好 → fsync → rename；rename 前落 `.bak`」笼统覆盖了所有写入。
 本节收窄，**这是对 §5 的修订**：
 
-- **配置文件**（codex `config.toml`、kimi `mcp.json`）：同目录临时文件 → fsync → rename；
-  rename 前落 `.bak`。
-  **claude 是例外且无备份**：MCP 走 shell out `claude mcp add-json`（§9.6），文件由 `claude`
-  自己写，henv 既不该也不能在旁边落 `.bak`。这是选 shell out 的附带代价——**已接受**，
-  因为另一条路（直接 merge `~/.claude.json`）会与 harness 并发写竞争、丢的是更多数据。
+- **配置文件**（codex `config.toml`、kimi `mcp.json`）：同目录临时文件 → fsync → rename。
+  **`.bak` 只在它还不存在时落一次，名字 `<file>.henv.bak`**（§2.2 第 5 条：两家都没有 `.bak`
+  残留，命名无历史包袱）。单槽是刻意的：`.bak` 的语义是「henv 介入**之前**的样子」，
+  无条件覆盖会让它退化成「上一次的样子」——第二次 `apply` 之后，盘上再没有任何东西能回到
+  原状，而给配置留 `.bak` 的全部理由就是兜住**不可重建**的东西。不加时间戳轮转：henv 没有
+  清理机制，会堆积。名字里带 `.henv.` 是为了不踩用户自己的 `<file>.bak`。**文件不存在时
+  无需备份**——没有「之前」可言。
+  **临时文件的命名**：`.<name>.henv-tmp-<pid>`（与 skill 交付的 `sibling()` 同一形状），
+  写在目标同目录、写完 fsync 后 rename 到目标；中途失败就删掉它，不留半截。带 pid 让两次
+  并发 `apply` 的临时文件名不同——它们仍会在 `rename` 上竞争（单文件写入无法避免），但
+  不会互删对方的临时文件。
+  **权限只保留、不放宽**：临时文件按目标的**现有**权限位落盘（目标不存在则 `0600`，
+  **不跟 umask**），`rename` 因此不会把用户的 `0600` 悄悄放宽成 `0644`——`~/.codex/config.toml`
+  里坐的正是明文 `experimental_bearer_token`。`.bak` 经 `fs::copy` 天然带过原权限位。
+  **claude 是例外且无备份**：MCP 走 shell out `claude mcp add-json -s user -- <name> <json>`
+  与 `claude mcp remove -s user -- <name>`（§9.6；那个 `--` 不可省——名字来自清单，而清单
+  放行 `-h` 这类形状，没有 `--` 时真 CLI 会把它读成 `--help`、打印帮助并退出 0），
+  文件由 `claude` 自己写，henv 既不该也不能在旁边落 `.bak`。这是选 shell out 的附带代价
+  ——**已接受**，因为另一条路（直接 merge `~/.claude.json`）会与 harness 并发写竞争、
+  丢的是更多数据。
 - **skills 拷贝交付**：同层临时目录 → rename 到位，**不落 `.bak`**——内容可从来源重建，
   备份它只是噪音；`.bak` 只留给**不可重建**的东西。注意拷贝**替换的是整个目录**：目标已存在
   且是 henv 账上的条目时先 rename 到临时名再换入，不做逐文件 merge（用户手改的副本会被整体
   覆盖，这是 §9.3 已声明的取舍）
-- **没有任何符号链接要处理**——henv 既不创建它们，也不改写既有的（§9.3 不变式一与其后的边界）
+- **henv 不创建任何符号链接**（§9.3 不变式一与其后的边界），也不改写既有的。唯一要处置的
+  既有链接是**配置文件自己**：`write_config` 的 `rename` 换掉的是链接本身，而备份那步的
+  `fs::copy` 反而**跟随**它——两边对链接的处置相反，用户的 chezmoi/stow 关系会被静默销毁、
+  内容只以普通文件形式留在 `.bak` 里。所以目标是链接时**拒绝写入并报错**，链条归用户自己。
+  父目录是软链不受影响：`rename` 落在解析后的目录里，照常写。
 - **失败隔离**：一个 adapter 中途失败 → 该 harness 记 `partial`，其余继续，`ApplyReport` 汇总
 - **重跑即修复**，无 rollback 命令（§5 不变）
 
