@@ -10,7 +10,8 @@ use std::path::PathBuf;
     version,
     about,
     // `--help` 是人读得到的第二处披露面（第一处是 `examples/env.yaml` 的注释与 lib.rs 的
-    // rustdoc）。两件事必须在这里说清：`degrade:` 在 Plan A 不生效，以及哪个子命令会写盘
+    // rustdoc）。两件事必须在这里说清：`degrade:` 从 B3b 起真的生效（但只对写了
+    // `source_harness:` 的条目——没有拆解就没有「装不下」），以及哪个子命令会写盘
     // ——只写进文档的话，读终端的人和读代码的人拿到的信息不对称，而「我配了 skip 怎么没静音」
     // 与「只想看看怎么把我配置改了」正是那种误会的产物。
     // 只披露，不改 `render()` 的产物——那是被 insta golden 逐字节锁住的格式。
@@ -18,8 +19,10 @@ use std::path::PathBuf;
 写盘边界：`diff` 全程只输出报告，不写任何配置文件，有 drift 也算成功退出（门禁语义留给 Plan C 的 doctor）；\n\
 `apply` 会写——它向各家的 skills 目录真拷贝内容，并把「放了什么」记进 ~/.local/state/henv/provenance.json。\n\
 `apply` 落盘前会先渲染计划并要一次 y/N 确认（`--yes` 跳过，供脚本与 CI 用）；\n\
+`apply --prune` 只撤销账本里记着的条目（henv 自己交付过的 skill 拷贝与 MCP 键），用户手放的 drift 一律只报不删；\n\
+`apply --harness <name>` 把一次运行限定在一家（值域：claude-code / codex / kimi-code）。\n\
 `skills list` 同样只读：它只把仓库取到 henv 自己的缓存目录下看完即删。\n\n\
-degrade: 政策在 Plan A 只是声明性占位——plugin 尚未拆解，skip/report 两侧都不生效，报告不会因为它而改变。"
+degrade: 政策决定「目标 harness 吃不下、但内容已经拆出来了」的能力是进报告还是静默丢弃（§9.5）。"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -48,6 +51,12 @@ enum Command {
         /// 不问确认直接执行（用于脚本与 CI）
         #[arg(long)]
         yes: bool,
+        /// 撤销 henv 自己交付过、清单里已经不要了的东西（只删账本里记着的）
+        #[arg(long)]
+        prune: bool,
+        /// 只对这一家生效（claude-code / codex / kimi-code）
+        #[arg(long, value_name = "NAME", value_parser = parse_harness)]
+        harness: Option<String>,
     },
 }
 
@@ -74,6 +83,22 @@ enum SkillsCmd {
     },
 }
 
+/// `--harness <name>` 的值域校验（§9.8）。
+///
+/// 在 CLI 层就拒绝未知名字：`plan_for` 的 `only` 是一张**过滤器**，
+/// 一个永远不匹配的名字会让整次运行静默变成「没有已安装的 harness」——
+/// 用户敲错一个字母得到的是「无事可做」，不是报错。
+fn parse_harness(s: &str) -> Result<String, String> {
+    if henv::manifest::KNOWN_HARNESSES.contains(&s) {
+        Ok(s.to_string())
+    } else {
+        Err(format!(
+            "unknown harness `{s}` (known: {})",
+            henv::manifest::KNOWN_HARNESSES.join(", ")
+        ))
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let home = henv::home::Home::resolve()?;
     match Cli::parse().command {
@@ -82,7 +107,12 @@ fn main() -> anyhow::Result<()> {
             let mut lock = stdout.lock();
             henv::run_diff(&manifest, &home, &mut lock)?;
         }
-        Command::Apply { manifest, yes } => {
+        Command::Apply {
+            manifest,
+            yes,
+            prune,
+            harness,
+        } => {
             let mut confirm: Box<dyn Confirm> = if yes {
                 Box::new(AssumeYes)
             } else {
@@ -90,7 +120,14 @@ fn main() -> anyhow::Result<()> {
             };
             let stdout = std::io::stdout();
             let mut lock = stdout.lock();
-            henv::run_apply(&manifest, &home, &mut lock, confirm.as_mut())?;
+            henv::run_apply(
+                &manifest,
+                &home,
+                &mut lock,
+                confirm.as_mut(),
+                prune,
+                harness.as_deref(),
+            )?;
         }
         Command::Skills { cmd } => match cmd {
             SkillsCmd::List {
@@ -132,5 +169,17 @@ mod tests {
             } => assert_eq!(git_ref.as_deref(), Some("main")),
             _ => panic!("解析成了别的子命令"),
         }
+    }
+
+    /// §9.8 的 `--harness <name>`：值域在 CLI 层就判，敲错一个字母得到的是报错，
+    /// 不是「无事可做」。
+    #[test]
+    fn apply_rejects_an_unknown_harness_name() {
+        // `Cli` 没实现 `Debug`（clap 的派生不生成它），所以不能用 `unwrap_err()`。
+        match Cli::try_parse_from(["henv", "apply", "--harness", "cursor"]) {
+            Ok(_) => panic!("未知的 harness 名必须在 CLI 层就被拒"),
+            Err(err) => assert!(err.to_string().contains("unknown harness"), "{err}"),
+        }
+        assert!(Cli::try_parse_from(["henv", "apply", "--harness", "codex"]).is_ok());
     }
 }

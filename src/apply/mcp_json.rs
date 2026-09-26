@@ -63,6 +63,43 @@ pub fn upsert_kimi_mcp(
     write_config(target, body.as_bytes())
 }
 
+/// 从 kimi 的 `mcp.json` 里摘掉 `mcpServers.<name>`（`upsert_kimi_mcp` 的逆操作，§9.8）。
+///
+/// **键不在就不写**：`--prune` 重跑是正常路径，重写一份内容没变的文件只会平白
+/// 制造一次 mtime 变动、一份 `.bak` 和一串「文件被动过」的疑问。
+pub fn remove_kimi_mcp(target: &Path, name: &str) -> anyhow::Result<()> {
+    let existing = match std::fs::read_to_string(target) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("{}: cannot read", target.display())),
+    };
+    if existing.trim().is_empty() {
+        return Ok(());
+    }
+    // 绝不把内容放进错误消息：mcp.json 里可能有明文密钥（值是 adapter 读回来的活配置）。
+    let mut root: serde_json::Value = serde_json::from_str(&existing)
+        .with_context(|| format!("{}: not valid JSON, refusing to touch it", target.display()))?;
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("{}: top level must be an object", target.display()))?;
+
+    // 缺失与显式 `null` 都是「还没有」——不落盘。其余形状报错，理由同 `upsert_kimi_mcp`：
+    // 拒绝写入的形状也必须拒绝「宣称删掉了」，否则账本会被摘掉而文件根本没被碰过。
+    let servers = match obj.get_mut("mcpServers") {
+        None | Some(serde_json::Value::Null) => return Ok(()),
+        Some(serde_json::Value::Object(servers)) => servers,
+        Some(_) => anyhow::bail!("{}: `mcpServers` must be an object", target.display()),
+    };
+    if servers.remove(name).is_none() {
+        return Ok(());
+    }
+
+    let mut body = serde_json::to_string_pretty(&root)
+        .with_context(|| format!("{}: cannot serialize", target.display()))?;
+    body.push('\n');
+    write_config(target, body.as_bytes())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,7 +215,7 @@ mod tests {
     /// `mcpServers` 不是对象（这里是个字符串）→ 报错，不动文件。
     /// 覆盖会连坐整个 kimi。
     #[test]
-    fn a_non_object_mcp_servers_is_refused_and_the_file_is_untouched() {
+    fn removing_refuses_a_non_object_mcp_servers_without_touching_the_file() {
         let t = TempHome::new();
         let p = t.path(".kimi-code/mcp.json");
         t.write(".kimi-code/mcp.json", "{\"mcpServers\": \"oops\"}\n");
@@ -193,7 +230,7 @@ mod tests {
     /// 语法坏掉的 mcp.json → 报错，且文件一字节不变（§9.7）。
     /// 错误消息里不许回显文件内容——那里面可能是明文密钥。
     #[test]
-    fn a_broken_config_is_refused_and_never_echoed() {
+    fn removing_from_a_broken_config_is_refused_and_never_echoed() {
         let t = TempHome::new();
         let p = t.path(".kimi-code/mcp.json");
         t.write(
@@ -225,5 +262,104 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
         assert_eq!(v["mcpServers"]["context7"]["env"]["K"], "${K}");
         assert_eq!(v["mcpServers"]["context7"]["env"]["W"], "${A_B1}");
+    }
+
+    /// Review Focus 5：键不在就**一个字节都不动**，也不落 `.bak`。
+    /// 夹具里有意留了另一个 server 与一个顶层键——「不动」是逐字节的。
+    #[test]
+    fn removing_a_missing_key_leaves_the_file_untouched() {
+        let t = TempHome::new();
+        let p = t.path(".kimi-code/mcp.json");
+        t.write(
+            ".kimi-code/mcp.json",
+            "{\n  \"keep\": 1,\n  \"mcpServers\": {\n    \"user-own\": {\n      \"command\": \"their-binary\"\n    }\n  }\n}\n",
+        );
+        let before = std::fs::read(&p).unwrap();
+
+        remove_kimi_mcp(&p, "context7").unwrap();
+
+        assert_eq!(std::fs::read(&p).unwrap(), before, "空操作不许重写文件");
+        assert!(
+            !p.with_file_name("mcp.json.henv.bak").exists(),
+            "空操作不许落备份"
+        );
+    }
+
+    /// 文件不存在、与「这个键从来没写下过」是同一件事：什么都不做，也什么都不建。
+    #[test]
+    fn removing_from_a_missing_file_creates_nothing() {
+        let t = TempHome::new();
+        let p = t.path(".kimi-code/mcp.json");
+        remove_kimi_mcp(&p, "context7").unwrap();
+        assert!(!p.exists(), "撤销不是创建");
+        assert!(!p.parent().unwrap().exists(), "连父目录都不该建");
+    }
+
+    /// 真删：其余 server 与顶层键都留着，只有那一条消失。
+    #[test]
+    fn removing_drops_only_the_named_server() {
+        let t = TempHome::new();
+        let p = t.path(".kimi-code/mcp.json");
+        t.write(".kimi-code/mcp.json", "{\"keep\": 1}\n");
+        upsert_kimi_mcp(&p, "user-own", "their-binary", &[], &BTreeMap::new()).unwrap();
+        upsert_kimi_mcp(&p, "context7", "npx", &args2(), &env1()).unwrap();
+
+        remove_kimi_mcp(&p, "context7").unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+        assert!(v["mcpServers"].get("context7").is_none());
+        assert_eq!(v["mcpServers"]["user-own"]["command"], "their-binary");
+        assert_eq!(v["keep"], 1);
+    }
+
+    /// 显式 `null` 是「还没有」不是故障（读路径也这么认）→ 不落盘。
+    #[test]
+    fn an_explicit_null_mcp_servers_is_a_no_op() {
+        let t = TempHome::new();
+        let p = t.path(".kimi-code/mcp.json");
+        t.write(
+            ".kimi-code/mcp.json",
+            "{\"mcpServers\": null, \"keep\": 1}\n",
+        );
+        let before = std::fs::read(&p).unwrap();
+
+        remove_kimi_mcp(&p, "context7").unwrap();
+
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+    }
+
+    /// `mcpServers` 不是对象 → 报错、不动文件。与 `upsert_kimi_mcp` 同一条纪律：
+    /// **拒绝写入的形状也必须拒绝「宣称删掉了」**，否则账本会被摘掉而文件没被碰过。
+    #[test]
+    fn a_non_object_mcp_servers_is_refused_and_the_file_is_untouched() {
+        let t = TempHome::new();
+        let p = t.path(".kimi-code/mcp.json");
+        t.write(".kimi-code/mcp.json", "{\"mcpServers\": \"oops\"}\n");
+        let before = std::fs::read(&p).unwrap();
+
+        let err = remove_kimi_mcp(&p, "context7").unwrap_err();
+        assert!(format!("{err:#}").contains("mcpServers"), "{err:#}");
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+    }
+
+    /// 语法坏掉的 mcp.json → 报错、文件一字节不变，且**不回显内容**（可能有明文密钥）。
+    #[test]
+    fn a_broken_config_is_refused_and_never_echoed() {
+        let t = TempHome::new();
+        let p = t.path(".kimi-code/mcp.json");
+        t.write(
+            ".kimi-code/mcp.json",
+            "{\"doc\": \"sk-live-abc\"\n{\"broken\":\n",
+        );
+        let before = std::fs::read(&p).unwrap();
+
+        let err = remove_kimi_mcp(&p, "context7").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            !msg.contains("sk-live-abc"),
+            "错误消息不许回显配置内容：{msg}"
+        );
+        assert_eq!(std::fs::read(&p).unwrap(), before);
     }
 }

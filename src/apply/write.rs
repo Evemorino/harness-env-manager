@@ -165,7 +165,11 @@ fn sibling(name: &std::ffi::OsStr, suffix: &str) -> OsString {
 
 /// 删掉一个条目，**不跟随软链**：断链要能被删掉，目录要整棵删。
 /// 本来就不存在不是错误。
-fn remove_any(path: &Path) -> anyhow::Result<()> {
+///
+/// `--prune` 的 skill 撤销原语（§9.8）：`deliver_skill` 的逆操作。
+/// **不比对内容哈希**——§9.3 已经接受「用户手改过的副本会被删除」这一取舍；
+/// 有资格调用它的是账本，不是这里。
+pub fn remove_any(path: &Path) -> anyhow::Result<()> {
     let Ok(meta) = std::fs::symlink_metadata(path) else {
         return Ok(());
     };

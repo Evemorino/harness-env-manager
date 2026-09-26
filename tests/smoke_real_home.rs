@@ -17,7 +17,23 @@ fn diff_again_real_home_succeeds_and_reports_every_detected_harness() {
 
     println!("{text}");
 
-    assert!(text.ends_with("drift\n"), "缺 Plan 页脚：{text}");
+    // 只钉「末行是页脚」，不钉它**以哪个词结尾**：页脚的字段从 180213a 起是
+    // `conflict … undeliverable, drift, unknown`，写死 `ends_with("drift")` 会在
+    // 字段增减时静默失效——这条 `#[ignore]` 的验收就是这么烂掉过一次的。
+    let footer = text.lines().last().unwrap_or_default();
+    assert!(footer.starts_with("Plan: "), "缺 Plan 页脚：{text}");
+    // 逐个字段名核一遍（不核顺序、不核数值）：页脚渲染坏了而前缀还在，也要拦住。
+    for field in [
+        "conflict",
+        "install",
+        "update",
+        "remove",
+        "undeliverable",
+        "drift",
+        "unknown",
+    ] {
+        assert!(footer.contains(field), "页脚缺 `{field}`：{footer}");
+    }
     // 本机三家都装着（spec §2）：一行都不该是 "not installed"
     for name in ["claude-code", "codex", "kimi-code"] {
         let line = text

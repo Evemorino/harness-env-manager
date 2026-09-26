@@ -135,6 +135,46 @@ impl Targets {
             Targets::Only(list) => list.iter().any(|h| h == harness),
         }
     }
+
+    /// §9.5：交付目标 = `targets` − `source_harness`。
+    ///
+    /// `known` 是「有哪几家 harness」——`All` 不知道这件事，只有调用方知道
+    /// （`compute` 手里那几家的名字，与 `KNOWN_HARNESSES` 相等）。当参数传而不是
+    /// 从 `manifest` 读，是为了让本模块继续不认识「清单」这个概念。
+    pub fn minus(&self, harness: &str, known: &[&str]) -> Targets {
+        match self {
+            Targets::All => Targets::Only(
+                known
+                    .iter()
+                    .filter(|h| **h != harness)
+                    .map(|h| (*h).to_string())
+                    .collect(),
+            ),
+            Targets::Only(list) => Targets::Only(
+                list.iter()
+                    .filter(|h| h.as_str() != harness)
+                    .cloned()
+                    .collect(),
+            ),
+        }
+    }
+
+    /// 空目标集：这个能力谁都不交付。
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Targets::Only(list) if list.is_empty())
+    }
+
+    /// 目标集里有没有 `in_play` 里的任何一家。
+    ///
+    /// `All` 恒真——它包含所有家。`Only` 则可能整份名单都点名了没被启用的家
+    /// （`targets: [kimi-code]` 而 `harnesses.kimi-code.enabled = false`），
+    /// 那种条目一条行都产生不出来，§9.5 要把它当「无法满足」报出来。
+    pub fn any_in(&self, in_play: &[&str]) -> bool {
+        match self {
+            Targets::All => true,
+            Targets::Only(list) => list.iter().any(|h| in_play.contains(&h.as_str())),
+        }
+    }
 }
 
 /// 每家 harness 对一个能力的接纳度——「拆解降级」的判定点
@@ -809,6 +849,64 @@ mod tests {
                 from: "6.3.0".into(),
                 to: "6.4.1".into()
             }
+        );
+    }
+
+    /// §9.5 的交付目标 = `targets` − `source_harness`。
+    /// `All` 是默认值，它必须能**具体化**成「除这一家之外的三家」——
+    /// 否则「默认三家全要」的清单写上一个源 harness 之后就哪家都不交付了。
+    #[test]
+    fn minus_a_harness_from_all_names_the_rest() {
+        let known = ["claude-code", "codex", "kimi-code"];
+        assert_eq!(
+            Targets::All.minus("claude-code", &known),
+            Targets::Only(vec!["codex".into(), "kimi-code".into()])
+        );
+    }
+
+    #[test]
+    fn minus_a_harness_from_an_explicit_list_keeps_the_order() {
+        let known = ["claude-code", "codex", "kimi-code"];
+        let t = Targets::Only(vec!["kimi-code".into(), "claude-code".into()]);
+        assert_eq!(
+            t.minus("claude-code", &known),
+            Targets::Only(vec!["kimi-code".into()])
+        );
+    }
+
+    /// 减掉一家不在名单里的 harness 是恒等变换——`targets` 里本来就没它。
+    #[test]
+    fn minus_something_that_is_not_there_changes_nothing() {
+        let known = ["claude-code", "codex", "kimi-code"];
+        let t = Targets::Only(vec!["codex".into()]);
+        assert_eq!(t.minus("claude-code", &known), t);
+    }
+
+    #[test]
+    fn any_in_answers_whether_a_target_is_in_play() {
+        assert!(Targets::All.any_in(&["codex"]), "All 包含所有家");
+        assert!(Targets::Only(vec!["codex".into()]).any_in(&["codex", "kimi-code"]));
+        assert!(
+            !Targets::Only(vec!["kimi-code".into()]).any_in(&["claude-code", "codex"]),
+            "整份名单都没被启用 → 不在盘面上"
+        );
+        assert!(
+            !Targets::Only(vec![]).any_in(&["codex"]),
+            "空集当然不在盘面上"
+        );
+    }
+
+    /// `All` 减去唯一已知的一家 = 空集。这正是 §9.5 「目标只有源 harness 自己」
+    /// 那个要报 undeliverable 的情形，所以「空」必须判得出来。
+    #[test]
+    fn only_and_all_cannot_be_empty_until_they_are() {
+        assert!(!Targets::All.is_empty(), "All 永远不空");
+        assert!(!Targets::Only(vec!["codex".into()]).is_empty());
+        assert!(Targets::Only(vec![]).is_empty());
+        assert!(
+            Targets::All
+                .minus("claude-code", &["claude-code"])
+                .is_empty()
         );
     }
 }

@@ -291,8 +291,9 @@ plugins:
     source: claude-marketplace  # 只有 claude-code 原生理解它
     marketplace: obra/superpowers-marketplace
     entry: superpowers
-    source_harness: claude-code # 拆解时从哪一家的已安装 bundle 取内容。**必填**，见 §9.5 ——
-                                # 本机同一 plugin 有 3 份、2 个版本，不写死就会挑错版本
+    source_harness: claude-code # 从这家的已安装 bundle 取内容。**写了就是请求拆解**，交付目标
+                                # = targets − 这家（§9.5）；不许从「哪些 harness 装了它」反推——
+                                # 本机同一 plugin 有 3 份、2 个版本，反推必然挑错版本
     degrade:
       hooks: report             # 拆出后装不下的能力：report（进报告）| skip（静默丢弃）
       commands: report
@@ -305,6 +306,10 @@ Schema 决策：
 2. **密钥语法即门禁**：`env` 值必须匹配 `${VAR}`，`manifest.rs` 校验阶段拒绝任何字面量。
 3. **degrade 策略按 plugin 条目声明**，不做全局开关：不同 bundle 对 hooks 的依赖程度不同。
 4. **`targets: all` 是默认值**：显式列表只用于定向分发场景。
+5. **`source_harness:` 的存在本身就是拆解请求**，不拿「`degrade:` 写没写」当开关：`degrade` 是
+   `#[serde(default)]` 的，代码区分不出「没写」与「写了空的」，而 `source_harness` 是
+   `Option`，它的 `Some`/`None` 天然就是二分。语义唯一之后反过来也成立——**没写
+   `source_harness:` 的 plugin 条目一律不拆解**（§9.5），它只做版本对账，且不再假装能装。
 
 ## 5. 数据流与错误处理
 
@@ -361,7 +366,7 @@ codex         + install  mcp/context7, mcp/browser-use
               ~ update   skill/dingtalk-mail (ref drift: v2.1 → v2.2)
               ! undeliverable  hook/superpowers:pre-commit (no hook support)
 kimi-code     + install  mcp/context7
-              - drift    mcp/experimental-thing (未在清单中，--prune 可删)
+              - drift    mcp/experimental-thing (未在清单中，只报不删)
 
 Plan: 0 conflict, 3 install, 1 update, 0 remove, 1 undeliverable, 1 drift, 0 unknown
 ```
@@ -437,13 +442,19 @@ shell out 系统 git、不引 `git2`，缓存 `~/.cache/henv/git/<repo-hash>/`�
 旧提交上并报「新鲜」**、非默认分支则永远解不出来；现已改为按 `origin/<ref>` 解析。以及
 `skills list` 的长选项缺省被 clap 生成为 `--git-ref`，与本节承诺的 `--ref` 不符，现已对齐。
 
-**B2 未做的 / B3**：MCP 三家写入、plugin bundle 拆解、`degrade:` 真正生效（§9.1 的声明性占位，
-至今仍不改变报告）、`--prune`、`--harness <name>`。因此本节的 `.bak`、失败隔离与事务性（§9.7）
+**B2 未做的 / B3 已全部做完**：MCP 三家写入（B3a）、plugin bundle 拆解与 `degrade:` 真正生效
+（B3b）、`--prune` 与 `--harness <name>`（B3c）。`degrade:` 的生效范围要看清：**只有写了
+`source_harness:` 的条目**会去拆 bundle，也就只有它们会有「目标吃不下但内容已拆出」的能力；
+其余条目不拆解，`degrade:` 对它们仍是死的（§9.5）。本节的 `.bak`、失败隔离与事务性（§9.7）
 在 B2 结束时有 skills 交付那一条路径实装，配置文件的写路径尚未涉及。
 
 **B3 拆成三份做**（2026-09-26 定的边界）：**B3a = MCP 三家写入**（§9.6，含其新增的所有权
-裁决与账本键修订）；**B3b = plugin bundle 拆解 + `degrade:` 生效**（§9.5，会连带 §2.2 第 7 条
-的 kimi `installed.json` 解析与 `optional_bool`）；**B3c = `--prune` 与 `--harness <name>`**。
+裁决与账本键修订，已完成）；**B3b = plugin bundle 拆解 + `degrade:` 生效**（§9.5，含
+`source_harness:` 新字段与 §4 schema 补行、§9.4 的 bundle 过期判据修订、plugin 条目那个
+「diff 说 install、apply 一个字节没写」的假成功收口，以及 Plan A 移交清单第 1 条的
+`optional_bool`——kimi 的 `enabled: null` 今天会让整条安装记录读不出来，
+`source_harness: kimi-code` 在那种机器上根本走不通，所以它不是顺手加戏）；
+**B3c = `--prune` 与 `--harness <name>`**。
 拆开的理由是 B3a 独立于另外两份——它只碰配置文件、不碰 bundle，而 §9.8 的 `--prune` 要删东西、
 语义最重，不适合与「第一次改用户配置文件」混在一次改动里。
 
@@ -577,11 +588,13 @@ skill 目录里多出来的点文件」，而这正是 §9.11 刚记下的那类
   「新鲜」，正是本条要防的静默过期；非默认分支更是本地根本没有，只活在 `origin/<ref>` 里。
   裸 `<ref>` 只作为回退，覆盖 `fetch` 管不到的形状（tag 进的是 `refs/tags/`、裸提交 sha）。
   网络不可达则沿用缓存内容、把该条目标 `stale`，**不报失败**——离线也要能用。
-- **bundle 拆解**：比对账本记的 `bundle@from@version@sha` 与该 bundle 当前的值。
-  **纯本地比对**，不需要网络。**「当前的值」取安装自带的 manifest 声明，不取 harness 的
-  `gitCommitSha`**——§2.2 第 7 条实测 claude 的 `gitCommitSha` 陈旧（与安装内容不符），拿它比对
-  会让一个过期的副本看起来是新的。（`version` 定位符本身可信，但「过期」要回答的是「副本内容
-  对不对」，内容的权威声明在副本自己的 manifest 里，不在 harness 的记账里。）
+- **bundle 拆解**：对源 bundle 里那份内容（`<install_path>/skills/<skill>/`）**直接算哈希与
+  账本的 `content_hash` 比**，与 `agents-dir` / `local` 同一条路。**纯本地比对**，不需要网络。
+  这里刻意**不用版本串**：bundle 自带的 manifest 通常只声明 `version`、**没有 sha**，而版本串
+  回答不了本条要回答的那个问题——「副本内容对不对」（同一版本被重新发布、或开发期原地改内容，
+  版本串看起来都是新鲜的）。同样刻意**不取 harness 的 `gitCommitSha`**——§2.2 第 7 条实测它
+  陈旧（与安装内容不符），拿它比对会让一个过期的副本看起来是新的。manifest 声明的版本仍然要读
+  （§9.5），但它只进 `source_id` 给人看，不承重。
 - **`agents-dir` / `local`**：直接对源目录内容算哈希与账本比。这同时覆盖了「改了源忘了 apply」
   ——`diff` 报 `update`。
 
@@ -595,24 +608,112 @@ skill 目录里多出来的点文件」，而这正是 §9.11 刚记下的那类
 
 **与 §2.1 第 2 条决策的关系（正面处理，避免读成自相矛盾）**：§2.1 第 2 条说「v1 以 bundle
 manifest 对账为主，**仅当目标 harness 缺对应 manifest 时才降级拆解**」——它反对的是**自动**
-降级（那会把 kimi 的原生安装拆成符号链接，是降级而非升级）。本节要的是**用户显式请求**的拆解：
-manifest 里写了 `degrade:` 块，或该 plugin 条目的 `targets` 含一个装不了它的 harness。
-两者不冲突——前者禁止自动，后者是声明式意图。**没有显式意图就绝不拆解。**
+降级（那会把 kimi 的原生安装拆成符号链接，是降级而非升级）。本节要的是**用户显式请求**的拆解，
+而显式请求的载体就是 `source_harness:` 这个字段本身。两者不冲突——前者禁止自动，后者是声明式
+意图。**没有显式意图就绝不拆解。**
 
-- **来源 harness 必须在 manifest 里显式写死**（新增字段 `source_harness:`，与 `degrade:` 同级；
-  §4 需相应补一行）。**禁止**从「哪些 harness 装了它」反推来源：§2.2 第 6 条实测到同一个 plugin
-  在本机有 3 份、2 个版本，反推必然挑错版本，把某一家静默换版。写死之后语义才唯一。
-- **内容来源**：`source_harness:` 那家的**已安装 bundle**（adapter 已能定位：claude 的
-  `installed_plugins.json` 与缓存路径、codex 的 `plugins/`、kimi 的 `managed/` + `installed.json`）。
-  **不从 marketplace 或远端重新拉取**——那是 plugin 原生安装的活，超出 §9.1 的范围。
-- **交付**：把该 bundle 里 `skills/<name>/` 直接拷进目标 harness 的 skills 目录。
-  **不经过 `~/.agents/skills` 中转**（§9.3）。
-- **装不下的部分**（hooks / commands / agents / MCP）按该 plugin 条目的 `degrade:` 策略
-  `report`（进报告）或 `skip`（静默丢弃）。**这是 `degrade:` 第一次真实生效**——
-  Plan A 里它只是声明性占位。
-- **拆解目标是 kimi 时**：仍 undeliverable（§9.1）——kimi 没有用户级 skills 目录。
+#### 开关与目标
+
+- **写了 `source_harness:` 就是请求拆解**（理由见 §4 Schema 决策第 5 条）。它的存在同时意味着
+  **这条 plugin 条目在顺利拆解时不再产生 `Kind::Plugin` 行**：这条条目的语义已经从「在目标上
+  装 plugin」变成「取一份内容 + 一份 degrade 策略」。
+  **反过来说，拆不出东西时它仍要产生一条 `Kind::Plugin` 的 `undeliverable` 行**——那是
+  「定位不到」「差集为空」这些理由的落点。没有这条行，失败就没人说。
+- **交付目标 = `targets` − `source_harness`**：源那家已经原生装着这个 bundle（内容就是从它那儿
+  取的），再拷一份进它的 skills 目录等于给同一批 skill 造出第二套不带命名空间的副本——claude 的
+  plugin skill 是 `superpowers:brainstorming`，拷成 `~/.claude/skills/brainstorming` 是重复曝光。
+- **差集为空**（例如 `targets: [claude-code]` 而源也是 claude）→ 落在那条 plugin 行上，理由
+  写明「目标只有源 harness 自己」。**不能静默什么都不做。**
+- **那条 `undeliverable` 行的落点**：源 harness 那一节（问题都在它身上）；源家没有一节
+  （在 `harnesses:` 里被关掉、或本机没装）时落第一家有节的家；**一家有节的都没有**时落
+  `Plan` 的**全局段**，渲染成 `(global)` 一段（排在所有 harness 节之后、`Plan:` 汇总行
+  之前）。三种落点都**不许让这一行消失**——「清单里有一条根本无法满足的要求」必须在报告
+  里可见；丢了它，`diff` 会报 `0 undeliverable`，用户以为一切正常。
+- **没写 `source_harness:` 的条目**走今天的对账路，但**不再假装能装**：`install` / `update`
+  改判 `undeliverable`（理由写明原生 plugin 安装不在本轮范围，§9.1，并指路「写 `source_harness:`
+  可拆解交付其 skills」），`in-sync` / `unknown` 保留——它们不承诺写盘。修的是「diff 说 install、
+  `apply` 一个字节没写、两边都不报错」这个假成功——交付层对「没有内容的非 Skill 条目」是安静
+  跳过的，而没有内容正是 plugin 条目今天的常态。
+
+#### 来源与定位
+
+- **来源 harness 必须在 manifest 里显式写死**（字段定义见 §4）。**禁止**从「哪些 harness 装了它」
+  反推来源：§2.2 第 6 条实测到同一个 plugin 在本机有 3 份、2 个版本，反推必然挑错版本，把某一家
+  静默换版。写死之后语义才唯一。
+- **它不进 `Spec::Plugin`**——§2.2 第 3 条「`Spec::Plugin` 不加字段」的约束仍然有效（那是 B0
+  为版本判据定的）。走与 `DegradeTable` 同一个先例的**旁路表**：`lower` 产出，与 degrade 表
+  共用同一份 plugin 身份（`a_degrade_policy_never_leaks_across_plugins` 那族测试守的性质）。
+- **谁能当源：三家都能写**（值必须是 `KNOWN_HARNESSES` 之一，拼错在校验期报错）。**能不能定位
+  是运行时的事**——静态能力限制在清单校验期骂，机器状态在报告里报。
+- **内容来源**：`source_harness:` 那家的**已安装 bundle**——按条目名在该家 `read_state()` 的
+  `Kind::Plugin` 记录里找，取 `install_path`。**不从 marketplace 或远端重新拉取**：那是 plugin
+  原生安装的活，超出 §9.1 的范围。
+- **定位不到就整条条目 `undeliverable`，报文区分两种原因**，因为它们对用户是两件事：该家没装
+  这个 plugin；或该家的安装记录根本不含路径。**后者是 codex 的固定事实**——它的 `config.toml`
+  里只有 `[plugins."<entry>@<marketplace>"] enabled`，`version` / `sha` / `install_path` 恒为
+  `None`（§2.2 第 2–4 条），所以 `source_harness: codex` 今天必然落进这一支。让它在报告里如实
+  说出来，好过在校验期立一条会随 codex 演进失效的静态禁令。
+- **bundle 自带 manifest**：读 `.claude-plugin/plugin.json` / `.codex-plugin/plugin.json` /
+  `.kimi-plugin/plugin.json`，kimi 还要认根目录 `kimi.plugin.json` 那种形状（§2.2 第 3 条实测
+  两种并存）。**缺失 = `None`（不是错误），存在但解不开 = 报错**——与 adapter 现有约定一致。
+  它声明的版本只进 `source_id` 给人看，**不作过期判据**（§9.4）。`source_id` 用 §9.3 定的形状
+  `bundle@<source_harness>@<version>@<sha>`，后两段取不到时**整段省掉**——不写空串占位，更不
+  编造 sha。这个串只供人读，没有解析方（§9.4 已把它从判据里摘掉）。
+
+#### 交付什么
+
+- **`skills/<skill>/` 下每个目录各是一个独立的 `Kind::Skill` 能力**（名字 = 目录名，
+  `Origin::Plugin { name: <条目名> }`，内容的本地路径 = 那个目录），直接拷进目标 harness 的
+  skills 目录，**不经过 `~/.agents/skills` 中转**（§9.3）。交付复用现成那条路——同层临时目录
+  → rename、`.bak`、失败隔离、账本，与 `agents-dir` / `local` / `git` 共用一套实现。
+  > **这些能力不是 `lower` 产出的。** `lower` 是纯函数、够不着盘，而 skill 目录名只有读了
+  > bundle 才知道。它们与 `ResolvedSources` 一起由源解析那一步产出，共同进 `plan_apply`
+  > （§9.2 的接口本来就是 `desired + resolved`，这条不改变它的形状）。
+- **`degrade:` 第一次真实生效的第一处**：kimi 作目标时没有用户级 skills 目录，拆解出的 skill
+  判 `Unsupported` → 走已有的 `Unsupported → Undeliverable`，由 `degrade.skills` 决定 report
+  还是 skip。
+  > **判据要落在「目标有没有用户级 skills 目录」，不是「它是不是来自 bundle」。** kimi 的
+  > `supports()` 对 `Origin::Plugin` 的条目返回 `Native`——对 bundle **内部**原生携带的 skill
+  > 确实如此，但对一份拆解出去的散装拷贝不成立。两个概念必须分开，否则拆解产物会被判 `Native`
+  > → `deliver_skills` 在 `target_dir == None` 上早退 → 又是一次静默不写。
+- **`degrade:` 第一次真实生效的第二处**：bundle 里**装不下的部分**（hooks / commands / agents /
+  MCP）**只探存在性、不解析内容**，按该 plugin 条目的 `degrade.<kind>` 逐 kind 决定 `report`
+  （进报告）还是 `skip`（静默丢弃）。**不为它们新建能力身份**——它们进的是该条目的报告说明，
+  不是 diff 行。
+- **拆解目标是 kimi 时**：skill 仍 undeliverable（§9.1）——kimi 没有用户级 skills 目录。
   注意这与「来源是 kimi」是两件事：`source_harness: kimi-code` 而目标是 claude 是
   **本设计最想要的用法**（把 kimi 独有的 plugin 携带的 skill 给 claude 用）。
+
+#### 源家那一份永不报 drift（2026-09-26 与实现对齐）
+
+`source_harness:` 指向的那一家，它的 plugin 行**与它分发出来的 skill 行**在它自己那一节里
+永远不报 `drift`——即使清单显式写了 `targets:` 把它排除在外（「把 claude 的 bundle 交给
+codex」正是这么写的）。理由同 §9.3：那份内容是**清单要求的**来源，不是「不在清单里的东西」。
+判据是 `source_harness` 本身，**不是** `targets`。反过来，**不是**源家、又不在 targets 里的
+家装的那份照旧报 drift——那是用户该看见的事。
+
+#### 三处终审边界的处置（2026-09-26 终审记下，同日收尾轮修完）
+
+- **同名碰撞 → 报出来，不猜**：清单里手写的 `skill/foo` 与某个 bundle 拆出来的
+  `skill/foo` 是**同一条 `CapId` 身份**，不可能都交付。旧行为是让 `ContentIndex`
+  按排序次序覆盖（`lower` 在前、拆解在后，于是覆盖方向恰好与「谁更显式」相反），
+  报告里还会出现两行同名条目。现在先到先得：**清单手写的优先于 bundle 拆出的**，
+  bundle 之间按 `manifest.plugins` 的顺序；被挡下的那条给它的 plugin 记一条
+  「`CapId` 同名，这一条不交付」的失败理由，于是报告里出的是那行 undeliverable。
+- **交付目标全是被 `harnesses:` 关掉的家 → 报出来**：`targets: [kimi-code]` 而
+  `kimi-code` 被关掉时，plugin 行被吸收、拆出来的 skill 行又没有目标节，整条在报告
+  里看不见。现在 `decompose` 拿**清单层面启用的家**判一次（刻意不用 `--harness`
+  过滤后的那份：视图切换不该让一个清单问题时隐时现），命中就记一条
+  「交付目标是 `kimi-code`，都不在 `harnesses:` 启用的家里」的失败理由。
+- **源家被读两遍 → 只读一次**：被启用的源 harness 原先在 `plan_for` 的 pairs 循环里
+  读一次、在 `scan_source_harnesses` 里再读一次。旧注释说「用同一个 `read_state()`
+  所以一致」，但两次调用之间盘面会变——那只做到了「同一条读路径」，没做到「同一次
+  观察」。现在 `plan_for` 把已读过的那份交进 `scan_source_harnesses`，同一个家只发
+  一次 `read_state()`，这才是「拆解不许有第二条读路径」的本意。
+
+**剩下的已知边界**（不是缺陷，是接受了的取舍）：bundle 里的内容与清单手写的同名时
+不做**内容**比较（同名即身份冲突，两边的字节一不一样不参与判决）；被关掉的家一律不
+规划（上面那条只是把「整条消失」变成「报一行」，没有把它变成可交付）。
 
 ### 9.6 MCP 三家三种写路径
 
@@ -735,6 +836,10 @@ henv skills list --repo <url> [--ref <r>] [--path <p>]        ← Plan B 新增
 东西——`--prune` 若按字面把它一起删，就正好毁掉 §9.3 承诺绝不碰的那批。所以：
 **prune = 撤销 henv 自己做过的事**（删掉自己交付的拷贝、从配置里摘掉 MCP），
 **不是**「让 harness 目录等于清单」。非 henv 条目一律只报不删，`--prune` 也不例外。
+
+**报告里那句提示与账本同源**（2026-09-26）：drift 行括号里写的是 `--prune` 对这条
+**会做什么**——账本记着的写「未在清单中，--prune 可删」，其余写「未在清单中，只报不删」。
+判据与 `prune_plan` 用的 `ledger.find` 是同一个，所以报告不会承诺它做不到的删除。
 
 **交互边界（已确认）**：henv 除 `apply` 的 y/N 确认外**不提问**。「这个 skill 加给哪几家」
 这类对话由 agent 承担，产物是 env.yaml 里的一行 `targets:`（§4 已有字段，不引入新概念）。

@@ -7,7 +7,7 @@ use crate::capability::{CapId, Capability, Kind, Origin, SkillSource, Spec, norm
 use crate::manifest::{
     DegradeAction, DegradePolicy, Manifest, PluginEntry, PluginSourceKind, SkillSourceKind,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// tilde 展开的**纯**内核：`root` 就是 HOME，`None` 表示环境里没有 HOME。
@@ -54,7 +54,7 @@ fn home_from_env() -> Option<PathBuf> {
 /// `lower` 用它发能力，`DegradeTable` 用它做键——两处必须是同一个函数：分开两份
 /// 实现时（审计 U11），表可以按 entry 键、`lower` 按 key 发，degrade 策略就此静默
 /// 失效，而两边的单测各自都还是绿的。
-fn plugin_identity(key: &str, p: &PluginEntry) -> String {
+pub(crate) fn plugin_identity(key: &str, p: &PluginEntry) -> String {
     p.entry.clone().unwrap_or_else(|| key.to_string())
 }
 
@@ -133,11 +133,9 @@ pub fn lower(m: &Manifest) -> Vec<Capability> {
 /// plugin 名 → degrade 策略。非 plugin 来源的能力一律 Report。
 ///
 /// 键就是 [`plugin_identity`]，与 `lower` 发能力用的是同一个函数（审计 U11）。
-/// 查表只认 `Origin::Plugin`，而 Plan A 两侧各差一半、谁也吃不到它：**desired 侧**（`lower`
-/// 产出的）全是 `Origin::Manifest`，没有可命中的键；**actual 侧**的 bundle 能力带
-/// `Origin::Plugin`，但 Task 13 只对 desired 侧查表，没人来问。所以这张表在 Plan A 里
-/// **两侧都是惰性的**，`degrade: {hooks: skip}` 目前不产生任何可观察差异（计划交接决策 7）。
-/// 让策略生效是 Plan B 拆解 plugin 时的事——那是设计后果，不是这里要“顺手修掉”的 bug。
+/// 查表只认 `Origin::Plugin`。它从 B3b 起真的被读：`compute` 用它决定 `Unsupported` 的能力
+/// 进报告还是丢弃（§9.5），`decompose` 用它决定 bundle 里装不下的部分（hooks/commands/…）
+/// 要不要在报告里留一句话。
 #[derive(Debug, Clone, Default)]
 pub struct DegradeTable {
     by_plugin: BTreeMap<String, DegradePolicy>,
@@ -161,6 +159,41 @@ impl DegradeTable {
             Some(p) => p.action_for(cap.id.kind),
             None => DegradeAction::Report,
         }
+    }
+}
+
+/// 旁路表：plugin 身份 → 声明的源 harness（§9.5）。
+///
+/// 与 [`DegradeTable`] 同一个先例，同一个理由：清单里的这层声明**不进 `Spec`**。
+/// `Spec::Plugin` 回答「装的是什么」，`diff` 的版本判决只读它；「从哪取内容」
+/// 与装的是什么无关。两件事混进一个类型，纯函数就得知道一件它不需要知道的事。
+///
+/// **`None` 与「不在表里」是同一件事**：没写 `source_harness:` = 不拆解。
+#[derive(Debug, Default)]
+pub struct SourceHarnessTable {
+    by_plugin: BTreeMap<String, String>,
+}
+
+impl SourceHarnessTable {
+    pub fn new(m: &Manifest) -> Self {
+        let mut by_plugin = BTreeMap::new();
+        for (key, p) in &m.plugins {
+            if let Some(s) = &p.source_harness {
+                by_plugin.insert(plugin_identity(key, p), s.clone());
+            }
+        }
+        Self { by_plugin }
+    }
+
+    pub fn get(&self, plugin: &str) -> Option<&str> {
+        self.by_plugin.get(plugin).map(String::as_str)
+    }
+
+    /// 本次运行**要扫哪几家**——去重且有序（`BTreeSet`）。
+    /// 被声明为源的家即便在 `harnesses:` 里被关掉也在这个集合里：它只是内容来源，
+    /// 不是交付目标（§9.5）。
+    pub fn declared(&self) -> BTreeSet<&str> {
+        self.by_plugin.values().map(String::as_str).collect()
     }
 }
 
@@ -931,5 +964,48 @@ plugins:
             vec!["mcp/superpowers", "plugin/superpowers", "skill/superpowers"],
             "三条都得在，并且按 label 排序"
         );
+    }
+
+    /// §9.5：源 harness 走 `DegradeTable` 那个先例的**旁路表**，不进 `Spec`。
+    /// `Spec::Plugin` 的职责是「装的是什么」，`diff` 的版本判决只认它；
+    /// 「从哪取内容」与装的是什么无关，混进去会让纯函数多知道一件不相干的事。
+    #[test]
+    fn source_harness_table_is_keyed_by_plugin_identity() {
+        // key 是 `superpowers`，`entry` 是 `sp` → 身份取 `entry`（§2.1 第 3 条）
+        let m = Manifest::parse(
+            "version: 1\n\n\
+             plugins:\n  superpowers:\n    source: claude-marketplace\n    marketplace: official\n    entry: sp\n    source_harness: codex\n",
+        )
+        .expect("清单合法");
+        let t = SourceHarnessTable::new(&m);
+        assert_eq!(t.get("sp"), Some("codex"), "身份是 entry，不是 key");
+        assert_eq!(t.get("superpowers"), None);
+        assert_eq!(t.declared().into_iter().collect::<Vec<_>>(), vec!["codex"]);
+    }
+
+    /// 没写 `source_harness:` 的条目不进表——它的 `None` 才是「不拆解」的表达。
+    #[test]
+    fn a_plugin_without_a_source_harness_is_absent_from_the_table() {
+        let m = Manifest::parse(
+            "version: 1\n\n\
+             plugins:\n  p:\n    source: github\n    repo: x/y\n",
+        )
+        .expect("清单合法");
+        let t = SourceHarnessTable::new(&m);
+        assert_eq!(t.get("p"), None);
+        assert!(t.declared().is_empty());
+    }
+
+    /// 两家都声明同一个源时 `declared` 只出现一次——它是「要扫哪几家」的输入，
+    /// 重复会让 `scan_source_harnesses` 白扫一遍。
+    #[test]
+    fn declared_deduplicates() {
+        let m = Manifest::parse(
+            "version: 1\n\n\
+             plugins:\n  a:\n    source: github\n    repo: x/a\n    source_harness: codex\n  b:\n    source: github\n    repo: x/b\n    source_harness: codex\n",
+        )
+        .expect("清单合法");
+        let t = SourceHarnessTable::new(&m);
+        assert_eq!(t.declared().len(), 1);
     }
 }

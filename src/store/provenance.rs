@@ -126,6 +126,18 @@ impl Ledger {
             None => self.entries.push(entry),
         }
     }
+
+    /// 摘掉一条记录，返回是否真的摘到了（§9.8：`--prune` 成功后调用）。
+    ///
+    /// 键与 [`Ledger::find`] / [`Ledger::record`] 完全一致：`(harness, kind, name)`。
+    /// **摘不到不是错误**：重跑一次 `--prune` 是正常路径，返回 `false` 让调用方能区分
+    /// 「摘掉了」与「本来就没了」，而不是把后者报成故障。
+    pub fn remove(&mut self, harness: &str, kind: Kind, name: &str) -> bool {
+        let before = self.entries.len();
+        self.entries
+            .retain(|e| !(e.harness == harness && e.kind == kind && e.name == name));
+        self.entries.len() != before
+    }
 }
 
 #[cfg(test)]
@@ -214,6 +226,32 @@ mod tests {
             l.find("codex", Kind::Skill, "foo").unwrap().content_hash,
             "new"
         );
+    }
+
+    /// §9.8：`--prune` 成功后摘账。键与 `find`/`record` 完全一致——
+    /// 同名不同 kind、同名不同家都不许连坐。
+    #[test]
+    fn remove_drops_exactly_one_slot() {
+        let mut l = Ledger::default();
+        l.record(entry_of("claude-code", Kind::Skill, "foo", "h"));
+        l.record(entry_of("claude-code", Kind::Mcp, "foo", "m"));
+        l.record(entry_of("codex", Kind::Skill, "foo", "h2"));
+
+        assert!(l.remove("claude-code", Kind::Skill, "foo"));
+        assert!(l.find("claude-code", Kind::Skill, "foo").is_none());
+        assert!(
+            l.find("claude-code", Kind::Mcp, "foo").is_some(),
+            "同名不同 kind 不能连坐"
+        );
+        assert!(
+            l.find("codex", Kind::Skill, "foo").is_some(),
+            "同名不同家不能连坐"
+        );
+        assert_eq!(l.entries.len(), 2);
+
+        // 再删一次是 false，不是 panic——重跑 `--prune` 是正常路径。
+        assert!(!l.remove("claude-code", Kind::Skill, "foo"));
+        assert_eq!(l.entries.len(), 2);
     }
 
     /// B3a：同名的一个 skill 与一个 mcp 是**两件不同的东西**——

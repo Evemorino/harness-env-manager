@@ -1,17 +1,18 @@
 //! diff：`f(desired, actual) → Plan`，纯函数、幂等、只读（spec §3 决策 2）。
 //!
 //! 清单定义「必须有的」，不定义「不许有的」：actual 多出来的报 drift 但**不**删，
-//! 删除需显式 `apply --prune`（Plan B）。故 `Counts::remove` 在本计划中恒为 0。
+//! 删除需显式 `apply --prune`（§9.8）。`compute` 因此**永不产** [`Action::Remove`]
+//! ——它由 [`prune_plan`] 在账本授权下改判出来，故 `diff` 报告的 `remove` 恒为 0。
 //!
 //! 已知局限：remote MCP（仅 url、无 command）在 adapter 层归一为空 `Spec::Mcp`，diff 只按
 //! name 比较身份，解析延后到 Plan B。
 
 use crate::adapters::HarnessAdapter;
 use crate::capability::{
-    CapId, Capability, Kind, SkillSource, Spec, Support, VersionMatch, compare_versions,
+    CapId, Capability, Kind, Origin, SkillSource, Spec, Support, VersionMatch, compare_versions,
     mcp_summary,
 };
-use crate::lower::DegradeTable;
+use crate::lower::{DegradeTable, SourceHarnessTable};
 use crate::manifest::DegradeAction;
 use crate::store::hash::hash_mcp_spec;
 use crate::store::provenance::Ledger;
@@ -35,6 +36,12 @@ pub enum Action {
     Conflict {
         reason: String,
     },
+    /// §9.8：`apply --prune` 独有——撤销一条 henv 自己交付过、清单里已经不要了的东西。
+    ///
+    /// **`compute` 与 `diff` 永不产它**：只有 [`prune_plan`] 会把账本记着的
+    /// [`Action::Drift`] 改判成它。rank 排在 conflict 之后、install 之前——
+    /// 删除与交付同属「这次要动手做什么」，而冲突仍是唯一决定「能不能做」的那个。
+    Remove,
     Install,
     /// from = 现状，to = 期望
     Update {
@@ -51,16 +58,17 @@ pub enum Action {
 }
 
 impl Action {
-    /// 输出分组顺序：conflict → install → update → undeliverable → drift → unknown → in-sync
+    /// 输出分组顺序：conflict → remove → install → update → undeliverable → drift → unknown → in-sync
     pub fn rank(&self) -> u8 {
         match self {
             Action::Conflict { .. } => 0,
-            Action::Install => 1,
-            Action::Update { .. } => 2,
-            Action::Undeliverable { .. } => 3,
-            Action::Drift => 4,
-            Action::Unknown => 5,
-            Action::InSync => 6,
+            Action::Remove => 1,
+            Action::Install => 2,
+            Action::Update { .. } => 3,
+            Action::Undeliverable { .. } => 4,
+            Action::Drift => 5,
+            Action::Unknown => 6,
+            Action::InSync => 7,
         }
     }
 }
@@ -102,6 +110,13 @@ pub struct HarnessPlan {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Plan {
     pub harnesses: Vec<HarnessPlan>,
+    /// 挂不进任何 harness 节的条目（§9.5）。
+    ///
+    /// 今天只有一种来源：**一家 harness 都没装**时，拆解条目的 `undeliverable`
+    /// 落不到任何**会被渲染**的节——未安装的家整节被 `render` 跳过。过去这一行会被
+    /// 静默丢掉（`diff` 报 `0 undeliverable`，用户以为一切正常，而清单里明明有一条
+    /// 根本无法满足的要求）。全局段把它接住，`render` 渲染成一个 `(global)` 段。
+    pub unattached: Vec<PlanEntry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -118,17 +133,21 @@ pub struct Counts {
 impl Plan {
     pub fn counts(&self) -> Counts {
         let mut c = Counts::default();
-        for h in &self.harnesses {
-            for e in &h.entries {
-                match &e.action {
-                    Action::Conflict { .. } => c.conflict += 1,
-                    Action::Install => c.install += 1,
-                    Action::Update { .. } => c.update += 1,
-                    Action::Undeliverable { .. } => c.undeliverable += 1,
-                    Action::Drift => c.drift += 1,
-                    Action::Unknown => c.unknown += 1,
-                    Action::InSync => {}
-                }
+        for e in self
+            .harnesses
+            .iter()
+            .flat_map(|h| h.entries.iter())
+            .chain(self.unattached.iter())
+        {
+            match &e.action {
+                Action::Conflict { .. } => c.conflict += 1,
+                Action::Remove => c.remove += 1,
+                Action::Install => c.install += 1,
+                Action::Update { .. } => c.update += 1,
+                Action::Undeliverable { .. } => c.undeliverable += 1,
+                Action::Drift => c.drift += 1,
+                Action::Unknown => c.unknown += 1,
+                Action::InSync => {}
             }
         }
         c
@@ -151,6 +170,7 @@ impl Plan {
         self.harnesses
             .iter()
             .flat_map(|h| h.entries.iter())
+            .chain(self.unattached.iter())
             .filter(|e| matches!(e.action, Action::Conflict { .. }))
             .collect()
     }
@@ -315,18 +335,159 @@ fn short_hash(h: &str) -> String {
     h.chars().take(8).collect()
 }
 
+/// 这条 plugin 条目拆出了几条 skill（§9.5 的「拆不出东西」判据）。
+///
+/// 按 `desired` 数而不是另立一张计数表：拆解产的 skill 就在 `desired` 里，
+/// 数它是最直接的读法，也省掉一处会在两次运行之间漂移的状态。
+fn decomposed_skill_count(desired: &[Capability], plugin: &str) -> usize {
+    desired
+        .iter()
+        .filter(|c| {
+            c.id.kind == Kind::Skill
+                && matches!(&c.origin, Origin::Plugin { name } if name == plugin)
+        })
+        .count()
+}
+
+/// 拆解条目那批 `Kind::Plugin` 行的落点（§9.5「开关与目标」）。
+///
+/// 顺利拆解时**一条都不产生**；三种情况各产生一条 `undeliverable`：
+/// 定位不到、交付目标差集为空、拆不出任何 skill。这第三种是「一片干净」的缺口——
+/// 一个只有 `hooks/` 的 bundle 若什么都不报，用户看到的报告与「一切正常」分不开。
+///
+/// **落点**：源 harness 那一节——三种情况的问题都在它身上（它是内容来源）。
+/// 它没有一节时（在 `harnesses:` 里被关掉、或本机没装）落第一家有节的；一家有节的
+/// 都没有时进 `unattached`，由 `render` 的全局段接住。三种落点都**不许让这一行消失**：
+/// 「清单里有一条根本无法满足的要求」必须出现在报告里。
+///
+/// **未安装的家不算「有节」**：`render` 对它只打一行 `not installed (skipped)`，
+/// 挂上去等于丢掉——那正是全局段要消灭的静默。
+fn detached_plugin_rows(
+    desired: &[Capability],
+    inputs: &[HarnessInput],
+    content: &ContentIndex,
+    sources: &SourceHarnessTable,
+) -> DetachedRows {
+    let known: Vec<&str> = inputs.iter().map(|i| i.state.name.as_str()).collect();
+    let mut rows = DetachedRows::default();
+
+    for cap in desired {
+        if cap.id.kind != Kind::Plugin {
+            continue;
+        }
+        let Some(source) = sources.get(&cap.id.name) else {
+            continue; // 没写 `source_harness:`：走 `Spec` 那条常规路，不在这里分行
+        };
+        let reason = match content.unresolved.get(&cap.id) {
+            // 内容层已经写好了整句（定位不到、manifest 解不开），原样带上。
+            Some(Unresolved::Failed(r) | Unresolved::Deferred(r)) => r.clone(),
+            None if cap.targets.minus(source, &known).is_empty() => format!(
+                "plugin `{}`：交付目标 = targets − `{source}`，差集为空（目标只有源 harness 自己）（§9.5）",
+                cap.id.name
+            ),
+            // 拆不出 skill 就没有 skill 行能承载「还有 hook 未拆解」那句
+            // `degrade.<kind> = report` 注记，只能挂在这条 undeliverable 上——
+            // 否则 `report` 事实上退化成 `skip`（§9.5）。
+            None if decomposed_skill_count(desired, &cap.id.name) == 0 => {
+                let base = format!(
+                    "plugin `{}`：bundle `{source}` 里拆不出任何 skill（§9.5）",
+                    cap.id.name
+                );
+                match content.notes.get(&cap.id.name) {
+                    Some(note) => format!("{base}；{note}"),
+                    None => base,
+                }
+            }
+            None => continue,
+        };
+        let slot = inputs
+            .iter()
+            .find(|i| i.state.name == source && i.state.detected)
+            .or_else(|| inputs.iter().find(|i| i.state.detected));
+        let entry = PlanEntry::new(cap.id.clone(), Action::Undeliverable { reason });
+        match slot {
+            Some(slot) => rows
+                .by_harness
+                .entry(slot.state.name.clone())
+                .or_default()
+                .push(entry),
+            // 一家有节的都没有：进全局段，而不是丢掉。
+            None => rows.unattached.push(entry),
+        }
+    }
+    rows
+}
+
+/// `detached_plugin_rows` 的产物：按 harness 分好的行，以及挂不进任何节的。
+#[derive(Debug, Default)]
+struct DetachedRows {
+    by_harness: BTreeMap<String, Vec<PlanEntry>>,
+    unattached: Vec<PlanEntry>,
+}
+
+/// §9.8：`--prune` 的规划层。纯函数、幂等、只读——与 `compute` 同一条纪律。
+///
+/// 把「账本里记着**且**本轮判为 [`Action::Drift`]」的条目改写成 [`Action::Remove`]，
+/// 其余 drift 原样保留。**这是不变式二在规划层的落点**：账本说这个 slot 是 henv 的，
+/// 才有资格删；用户手放的条目在账本里没有记录，于是永远是 `Drift`——
+/// `--prune` 因此**不是**「让 harness 目录等于清单」。
+///
+/// 键必须带 `harness`：账本本来就是逐 harness 的，`codex` 名下的一条记录
+/// 不能授权删掉 `claude-code` 的同名条目。
+///
+/// `Plan::unattached` 不参与：它只装 `undeliverable`（§9.5），没有 drift 可改判。
+pub fn prune_plan(plan: &Plan, ledger: &Ledger) -> Plan {
+    let mut out = plan.clone();
+    for h in &mut out.harnesses {
+        for e in &mut h.entries {
+            if !matches!(e.action, Action::Drift) {
+                continue;
+            }
+            if ledger.find(&h.harness, e.id.kind, &e.id.name).is_none() {
+                continue;
+            }
+            e.action = Action::Remove;
+            // 那句「--prune 可删」只对 drift 行成立：改判成 remove 之后它已经不
+            // 「可删」而是「即将删」。留着会让 remove 行挂一句反话。
+            e.note = None;
+        }
+        // 改判改变了 rank，必须重排：`render` 依赖「同组连续」。
+        h.entries.sort_by(|x, y| {
+            x.action
+                .rank()
+                .cmp(&y.action.rank())
+                .then_with(|| x.id.label().cmp(&y.id.label()))
+        });
+    }
+    out
+}
+
+/// §9.5：henv **不代装原生 plugin**（§9.1）。没写 `source_harness:` 的条目
+/// 落在这个理由上——它仍然做版本对账，只是不再假装能装。
+const NO_NATIVE_INSTALL: &str =
+    "henv 不代装原生 plugin；写 `source_harness:` 可从某家的已安装 bundle 拆解交付（§9.5）";
+
 /// `f(desired, actual) → Plan`，纯函数、幂等、只读（spec §3 决策 2）。
 ///
 /// `content` 与 `ledger` 让「字节一不一样、是谁放的」参与判决（§9.3）。两者都为
 /// 空时行为与 Plan A 逐字节相同——`ContentIndex::default()` + `Ledger::default()`
 /// 就是那条路径。
+///
+/// `sources` 是 §9.5 的旁路表：这一条 plugin 的内容从哪一家取。
+/// 它只回答「拆不拆、从哪拆」，不进 `Spec`、不参与版本判决。
 pub fn compute(
     desired: &[Capability],
     inputs: &[HarnessInput],
     degrade: &DegradeTable,
     content: &ContentIndex,
     ledger: &Ledger,
+    sources: &SourceHarnessTable,
 ) -> Plan {
+    // §9.5：拆解条目的报错行按落点分好，等各节出场时取走。
+    let DetachedRows {
+        mut by_harness,
+        mut unattached,
+    } = detached_plugin_rows(desired, inputs, content, sources);
     let mut harnesses = Vec::with_capacity(inputs.len());
 
     for input in inputs {
@@ -350,6 +511,8 @@ pub fn compute(
         }
 
         let mut entries: Vec<PlanEntry> = Vec::new();
+        // 挂到这一节的拆解报错行（源家定位不到、差集为空、拆不出 skill）。
+        entries.extend(by_harness.remove(&harness).unwrap_or_default());
         let mut matched: HashSet<CapId> = HashSet::new();
 
         let desired_plugins: HashSet<String> = desired
@@ -359,6 +522,29 @@ pub fn compute(
             .collect();
 
         for cap in desired {
+            // §9.5：写了 `source_harness:` 的条目**不产生 `Kind::Plugin` 行**——
+            // 顺利拆解时由拆出来的 skill 行承担，不顺利时由上面那批挂着的行承担。
+            //
+            // 源家那一段必须**先于** targets 判据：源家通常不在 targets 里
+            // （交付目标 = targets − 源），但它的 `read_state()` 一定扫得到那个
+            // plugin（我们刚从这里取的 `install_path`），不先吸收掉就会掉进
+            // 下面的 drift 段，被报成「不在清单里的东西」——而它恰恰是清单要求的。
+            if cap.id.kind == Kind::Plugin {
+                if let Some(src) = sources.get(&cap.id.name) {
+                    if harness == src {
+                        matched.insert(cap.id.clone());
+                        continue;
+                    }
+                    // 其余家：只要它是交付目标就吸收掉（这条的 plugin 行由拆出来的
+                    // skill 承担）。**不在 targets 里的家照旧走 drift 判据**——
+                    // 「清单说这条只给 codex」而 claude 也有时，今天报 drift，
+                    // 这个行为不属于 B3b 要改的范围。
+                    if cap.targets.includes(&harness) {
+                        matched.insert(cap.id.clone());
+                        continue;
+                    }
+                }
+            }
             if !cap.targets.includes(&harness) {
                 continue;
             }
@@ -429,6 +615,25 @@ pub fn compute(
                         },
                         _ => action,
                     };
+                    // §9.5：没写 `source_harness:` 的条目不再假装能装（§9.1）。
+                    // 只改 install/update 两条——`in-sync`/`unknown`/`conflict` 是
+                    // 「对账结果」，照旧保留：这条目仍然回答「本机是不是清单要的那个版本」。
+                    let action =
+                        if cap.id.kind == Kind::Plugin && sources.get(&cap.id.name).is_none() {
+                            match &action {
+                                Action::Install => Action::Undeliverable {
+                                    reason: NO_NATIVE_INSTALL.to_string(),
+                                },
+                                Action::Update { from, to } => Action::Undeliverable {
+                                    reason: format!(
+                                        "{NO_NATIVE_INSTALL}（清单要 {to}，本机是 {from}）"
+                                    ),
+                                },
+                                other => other.clone(),
+                            }
+                        } else {
+                            action
+                        };
                     // 已经是 undeliverable 的行自带 reason，再挂一遍注记是同一句话说两遍。
                     let note = match unresolved {
                         Some(Unresolved::Deferred(r) | Unresolved::Failed(r))
@@ -437,6 +642,19 @@ pub fn compute(
                             verdict_note.or_else(|| Some(r.clone()))
                         }
                         _ => verdict_note,
+                    };
+                    // §9.5：bundle 里装不下的部分（hooks/commands/…）进的是
+                    // **这条目的报告说明**，不是 diff 行。拆解出的 skill 正是这条目的产物，
+                    // 所以注记跟着它们走；两份注记同时在时都要留着（源过期 / 还有没拆的东西
+                    // 是两件事）。
+                    let note = match &cap.origin {
+                        Origin::Plugin { name } => match (note, content.notes.get(name)) {
+                            (Some(a), Some(b)) => Some(format!("{b}；{a}")),
+                            (Some(a), None) => Some(a),
+                            (None, Some(b)) => Some(b.clone()),
+                            (None, None) => None,
+                        },
+                        _ => note,
                     };
                     entries.push(PlanEntry::new(cap.id.clone(), action).with_note(note));
                 }
@@ -447,17 +665,32 @@ pub fn compute(
             if matched.contains(&a.id) {
                 continue;
             }
-            // plugin bundle 分发出来的 skill 不是漂移
+            // plugin bundle 分发出来的 skill 不是漂移。两种情形都算：
+            // 1. 这条 plugin 的交付目标里有本家——它会作为拆出来的 skill 行出现；
+            // 2. **本家就是它的 `source_harness`**——源家自己装着的那一份是内容来源
+            //    （与上面 plugin 行 `harness == src` 那条吸收同一个理由）。显式写
+            //    `targets: [codex]` 时源家不在 `desired_plugins` 里，只看那个集合就会
+            //    把清单要的东西报成「不在清单里的东西」（§9.5、Review Focus 3）。
             if let Spec::Skill {
                 source: SkillSource::PluginBundle { plugin },
                 ..
             } = &a.spec
             {
-                if desired_plugins.contains(plugin) {
+                if desired_plugins.contains(plugin) || sources.get(plugin) == Some(harness.as_str())
+                {
                     continue;
                 }
             }
-            entries.push(PlanEntry::new(a.id.clone(), Action::Drift));
+            // 这句提示必须与 `prune_plan` 的判据同源（§9.3 不变式二）：它要预告
+            // `--prune` **会**对这条做什么。写死一句「可删」会把用户手放的东西
+            // 也算进去——那正是 §9.8 明说的「非 henv 条目一律只报不删」。
+            let hint = match ledger.find(&harness, a.id.kind, &a.id.name) {
+                Some(_) => "未在清单中，--prune 可删",
+                None => "未在清单中，只报不删",
+            };
+            entries.push(
+                PlanEntry::new(a.id.clone(), Action::Drift).with_note(Some(hint.to_string())),
+            );
         }
 
         entries.sort_by(|x, y| {
@@ -475,14 +708,30 @@ pub fn compute(
         });
     }
 
-    Plan { harnesses }
+    // 兜底：`by_harness` 的键都取自 detected 的家，而每个 detected 的家都会在上面
+    // 取走自己那批，所以这里正常情况下已经空了。真有空隙也不能丢——那正是全局段
+    // 要消灭的静默。
+    for (_, rows) in by_harness {
+        unattached.extend(rows);
+    }
+    unattached.sort_by(|x, y| {
+        x.action
+            .rank()
+            .cmp(&y.action.rank())
+            .then_with(|| x.id.label().cmp(&y.id.label()))
+    });
+
+    Plan {
+        harnesses,
+        unattached,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::capability::{CapId, Capability, Kind, Origin, SkillSource, Spec, Targets};
-    use crate::lower::DegradeTable;
+    use crate::lower::{DegradeTable, SourceHarnessTable};
     use crate::manifest::Manifest;
     use crate::store::provenance::{Ledger, LedgerEntry};
     use crate::store::skills::{ContentIndex, ResolvedContent, TargetContent, Unresolved};
@@ -493,6 +742,542 @@ mod tests {
         DegradeTable::new(&Manifest::parse("version: 1\n").unwrap())
     }
 
+    fn no_source_harness() -> SourceHarnessTable {
+        SourceHarnessTable::default()
+    }
+
+    /// 一条写了 `source_harness:` 的 plugin 能力（`lower` 的产物形状 + 旁路表里有它）。
+    fn plugin_with_source(name: &str) -> (Capability, SourceHarnessTable) {
+        let m = crate::manifest::Manifest::parse(&format!(
+            "version: 1\n\nplugins:\n  {name}:\n    source: github\n    repo: x/y\n    source_harness: claude-code\n"
+        ))
+        .expect("清单合法");
+        let desired = crate::lower::lower(&m);
+        let table = SourceHarnessTable::new(&m);
+        let cap = desired
+            .into_iter()
+            .find(|c| c.id.kind == Kind::Plugin)
+            .expect("lower 会产出这条 plugin");
+        (cap, table)
+    }
+
+    fn fake(harness: &str) -> FakeAdapter {
+        FakeAdapter::native(harness) // `native` 已经 detected: true
+    }
+
+    /// 一批 adapter → 一批现状。
+    ///
+    /// **不返回 `HarnessInput`**：那个类型借 `state` 与 `adapter` 两样
+    /// （`pub struct HarnessInput<'a> { state: &'a HarnessState, adapter: &'a dyn HarnessAdapter }`），
+    /// 借不出函数体内的局部量。所以两样都由调用方持有，各返回一份。
+    /// 既有的 `run_with_ledger` 在函数里内联了这两行；本 Task 的测试要一次给
+    /// `compute` 两三家，才提出来。
+    fn harness_states(adapters: Vec<FakeAdapter>) -> (Vec<HarnessState>, Vec<FakeAdapter>) {
+        let states = adapters
+            .iter()
+            .map(|a| HarnessState {
+                name: a.name().to_string(),
+                detected: a.detect(),
+                actual: a.read_state().unwrap(),
+            })
+            .collect();
+        (states, adapters)
+    }
+
+    fn harness_inputs<'a>(
+        states: &'a [HarnessState],
+        adapters: &'a [FakeAdapter],
+    ) -> Vec<HarnessInput<'a>> {
+        states
+            .iter()
+            .zip(adapters)
+            .map(|(state, adapter)| HarnessInput { state, adapter })
+            .collect()
+    }
+
+    /// §9.5：写了 `source_harness:`、顺利拆解 → **不产生 `Kind::Plugin` 行**。
+    /// 今天它会落一条 `+ install plugin/x`——而 apply 一个字节都写不出来。
+    #[test]
+    fn a_decomposed_plugin_produces_no_plugin_row() {
+        let (plugin, sources) = plugin_with_source("p");
+        let (states, adapters) = harness_states(vec![fake("claude-code"), fake("codex")]);
+        let inputs = harness_inputs(&states, &adapters);
+        // 拆出来的那条 skill：目标是除源之外的家
+        let skill = Capability {
+            id: CapId::new(Kind::Skill, "brainstorming"),
+            origin: Origin::Plugin { name: "p".into() },
+            spec: Spec::Skill {
+                source: SkillSource::PluginBundle { plugin: "p".into() },
+                path: None,
+            },
+            targets: Targets::Only(vec!["codex".into(), "claude-code".into()]),
+        };
+
+        let plan = compute(
+            &[plugin.clone(), skill],
+            &inputs,
+            &no_degrade(),
+            &ContentIndex::default(),
+            &Ledger::default(),
+            &sources,
+        );
+
+        for h in &plan.harnesses {
+            assert!(
+                !h.entries.iter().any(|e| e.id.kind == Kind::Plugin),
+                "{} 不该有 plugin 行：{:?}",
+                h.harness,
+                h.entries
+            );
+        }
+    }
+
+    /// §9.5 第 3 条：差集为空（`targets` 只有源家）→ 一条 `undeliverable`，
+    /// 理由写明「目标只有源 harness 自己」。落点在源家那一节。
+    #[test]
+    fn an_empty_delivery_target_set_lands_as_one_row_on_the_source() {
+        let m = crate::manifest::Manifest::parse(
+            "version: 1\n\nplugins:\n  p:\n    source: github\n    repo: x/y\n    source_harness: claude-code\n    targets: [claude-code]\n",
+        )
+        .expect("清单合法");
+        let desired = crate::lower::lower(&m);
+        let sources = SourceHarnessTable::new(&m);
+        let (states, adapters) = harness_states(vec![fake("claude-code"), fake("codex")]);
+        let inputs = harness_inputs(&states, &adapters);
+
+        let plan = compute(
+            &desired,
+            &inputs,
+            &no_degrade(),
+            &ContentIndex::default(),
+            &Ledger::default(),
+            &sources,
+        );
+
+        let claude = plan
+            .harnesses
+            .iter()
+            .find(|h| h.harness == "claude-code")
+            .unwrap();
+        let row = claude
+            .entries
+            .iter()
+            .find(|e| e.id.kind == Kind::Plugin)
+            .expect("要有一条 plugin 行");
+        match &row.action {
+            Action::Undeliverable { reason } => {
+                assert!(reason.contains("差集为空"), "{reason}");
+                assert!(reason.contains("claude-code"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(
+            plan.harnesses
+                .iter()
+                .flat_map(|h| &h.entries)
+                .filter(|e| e.id.kind == Kind::Plugin)
+                .count(),
+            1,
+            "整份计划里只许有一条 plugin 行"
+        );
+    }
+
+    /// §9.5：**一家有节的都没有**时，行进 `unattached`（全局段），而不是消失。
+    ///
+    /// 这就是「一家 harness 都没装」的机器：未安装的家整节被 `render` 跳过，
+    /// 挂上去等于丢掉。过去这一行会被静默吞掉——`diff` 报 `0 undeliverable`，
+    /// 而清单里明明有一条根本无法满足的要求。
+    #[test]
+    fn an_undeliverable_row_with_no_rendered_section_goes_to_the_global_bucket() {
+        let m = crate::manifest::Manifest::parse(
+            "version: 1\n\nplugins:\n  p:\n    source: github\n    repo: x/y\n    source_harness: claude-code\n",
+        )
+        .expect("清单合法");
+        let desired = crate::lower::lower(&m);
+        let sources = SourceHarnessTable::new(&m);
+        let (states, adapters) = harness_states(vec![
+            fake("claude-code").with_detected(false),
+            fake("codex").with_detected(false),
+        ]);
+        let inputs = harness_inputs(&states, &adapters);
+
+        let plan = compute(
+            &desired,
+            &inputs,
+            &no_degrade(),
+            &ContentIndex::default(),
+            &Ledger::default(),
+            &sources,
+        );
+
+        assert!(
+            plan.harnesses.iter().all(|h| h.entries.is_empty()),
+            "未安装的家本来就该是空的：{:?}",
+            plan.harnesses
+        );
+        assert_eq!(
+            plan.unattached.len(),
+            1,
+            "这一行必须被接住：{:?}",
+            plan.unattached
+        );
+        assert_eq!(plan.unattached[0].id.kind, Kind::Plugin);
+        assert_eq!(plan.counts().undeliverable, 1, "汇总要数得到它");
+        assert!(!plan.is_clean(), "有 undeliverable 就不是 clean");
+    }
+
+    /// §9.5 第 3 条后半：拆不出任何 skill 时也要有一条 `undeliverable`。
+    /// 少了这一条，一个只有 `hooks/` 的 bundle 在报告里会是**一片干净**。
+    #[test]
+    fn a_bundle_that_yields_no_skill_still_reports_one_row() {
+        let (plugin, sources) = plugin_with_source("p");
+        let (states, adapters) = harness_states(vec![fake("claude-code"), fake("codex")]);
+        let inputs = harness_inputs(&states, &adapters);
+        // 清单里只有那条 plugin，`desired` 里一条 `Origin::Plugin` 的 skill 都没有
+        let plan = compute(
+            &[plugin],
+            &inputs,
+            &no_degrade(),
+            &ContentIndex::default(),
+            &Ledger::default(),
+            &sources,
+        );
+        let row = plan
+            .harnesses
+            .iter()
+            .flat_map(|h| &h.entries)
+            .find(|e| e.id.kind == Kind::Plugin)
+            .expect("拆不出东西要报出来");
+        match &row.action {
+            Action::Undeliverable { reason } => assert!(reason.contains("拆不出"), "{reason}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// §9.5「来源与定位」：定位不到 → 整条 undeliverable，理由原样来自内容层，
+    /// 不再被包一层通用话（那是 `ResolvedContent` 那条路的行为，这里是 plugin 的）。
+    #[test]
+    fn an_unlocated_bundle_carries_the_content_layer_reason() {
+        let (plugin, sources) = plugin_with_source("p");
+        let (states, adapters) = harness_states(vec![fake("claude-code"), fake("codex")]);
+        let inputs = harness_inputs(&states, &adapters);
+        let mut content = ContentIndex::default();
+        content.unresolved.insert(
+            plugin.id.clone(),
+            Unresolved::Failed("plugin `p`：`claude-code` 的安装记录里没有安装路径（§9.5）".into()),
+        );
+
+        let plan = compute(
+            &[plugin],
+            &inputs,
+            &no_degrade(),
+            &content,
+            &Ledger::default(),
+            &sources,
+        );
+        let row = plan
+            .harnesses
+            .iter()
+            .flat_map(|h| &h.entries)
+            .find(|e| e.id.kind == Kind::Plugin)
+            .expect("要报出来");
+        match &row.action {
+            Action::Undeliverable { reason } => {
+                assert!(reason.contains("没有安装路径"), "{reason}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// §9.5 的 drift 陷阱：源家**一定**扫得到那个 plugin（我们刚从这里取的
+    /// `install_path`）。它绝不能被报成 `- drift`——那是「不在清单里的东西」，
+    /// 而它恰恰是清单要求的。
+    #[test]
+    fn the_installed_copy_on_the_source_harness_is_not_drift() {
+        let (plugin, sources) = plugin_with_source("p");
+        // 源家的现状里有这条 plugin（Origin::Adopted，与 adapter 扫出来的同形）
+        let (states, adapters) = harness_states(vec![
+            fake("claude-code").with_caps(vec![FakeAdapter::plugin("p", None, None)]),
+            fake("codex"),
+        ]);
+        let inputs = harness_inputs(&states, &adapters);
+
+        let plan = compute(
+            &[plugin],
+            &inputs,
+            &no_degrade(),
+            &ContentIndex::default(),
+            &Ledger::default(),
+            &sources,
+        );
+        let claude = plan
+            .harnesses
+            .iter()
+            .find(|h| h.harness == "claude-code")
+            .unwrap();
+        assert!(
+            claude.entries.iter().all(|e| e.action != Action::Drift),
+            "源家那份是内容来源，不是 drift：{:?}",
+            claude.entries
+        );
+    }
+
+    /// 上面那条只放了 `Kind::Plugin`，走的是 `harness == src` 那条吸收。
+    /// 这条钉的是**同一陷阱的第二个入口**：bundle 分发出来的 skill。
+    /// 清单写 `targets: [codex]`（「把 claude 的 bundle 交给 codex」，最自然的写法）
+    /// 时源家不在原始 targets 里，`desired_plugins` 因而是空的——
+    /// 只按它判就会把源家自己那份报成 `- drift`（终审 Important#1）。
+    #[test]
+    fn a_bundled_skill_on_the_source_harness_is_not_drift_when_targets_exclude_it() {
+        let (mut plugin, sources) = plugin_with_source("p");
+        plugin.targets = Targets::Only(vec!["codex".into()]);
+        // 源家 claude-code 的现状：那个 plugin 本身 + 它分发出来的一条 skill
+        // （软链形状，`src/adapters/claude_code.rs` 扫出来的就是这两条）。
+        let (states, adapters) = harness_states(vec![
+            fake("claude-code").with_caps(vec![
+                FakeAdapter::plugin("p", None, None),
+                FakeAdapter::bundled_skill("brainstorming", "p"),
+            ]),
+            fake("codex"),
+        ]);
+        let inputs = harness_inputs(&states, &adapters);
+
+        let plan = compute(
+            &[plugin],
+            &inputs,
+            &no_degrade(),
+            &ContentIndex::default(),
+            &Ledger::default(),
+            &sources,
+        );
+        let claude = plan
+            .harnesses
+            .iter()
+            .find(|h| h.harness == "claude-code")
+            .unwrap();
+        assert!(
+            claude.entries.iter().all(|e| e.action != Action::Drift),
+            "源家那份是内容来源，不在 targets 里也一样：{:?}",
+            claude.entries
+        );
+    }
+
+    /// 反面控制：**不是**源家、又不在 targets 里的家，它自己装的那份照旧报 drift。
+    /// §9.5 要的是「源家别误报」，不是「谁装了都别报」——
+    /// 清单说这条只给 codex 而 kimi 也有时，那是用户该看见的事。
+    #[test]
+    fn a_bundled_skill_on_a_non_source_harness_still_drifts() {
+        let (mut plugin, sources) = plugin_with_source("p");
+        plugin.targets = Targets::Only(vec!["codex".into()]);
+        let (states, adapters) = harness_states(vec![
+            fake("claude-code"),
+            fake("codex"),
+            fake("kimi-code").with_caps(vec![FakeAdapter::bundled_skill("brainstorming", "p")]),
+        ]);
+        let inputs = harness_inputs(&states, &adapters);
+
+        let plan = compute(
+            &[plugin],
+            &inputs,
+            &no_degrade(),
+            &ContentIndex::default(),
+            &Ledger::default(),
+            &sources,
+        );
+        let kimi = plan
+            .harnesses
+            .iter()
+            .find(|h| h.harness == "kimi-code")
+            .unwrap();
+        assert_eq!(
+            kimi.entries.len(),
+            1,
+            "非源家的多出来那份要报出来：{:?}",
+            kimi.entries
+        );
+        assert_eq!(kimi.entries[0].action, Action::Drift);
+    }
+
+    /// §9.5：一个只有 `hooks/`、拆不出任何 skill 的 bundle，`degrade.<kind> = report`
+    /// 的那句「还有 hook 未拆解」不能因为没有 skill 行就丢掉——
+    /// 丢了的话 `report` 事实上退化成 `skip`（终审 Minor#2）。
+    #[test]
+    fn a_bundle_with_no_skills_still_carries_the_leftover_note() {
+        let (plugin, sources) = plugin_with_source("p");
+        let (states, adapters) = harness_states(vec![fake("claude-code"), fake("codex")]);
+        let inputs = harness_inputs(&states, &adapters);
+        let mut content = ContentIndex::default();
+        content.notes.insert(
+            "p".into(),
+            "bundle `claude-code` 里还有 hook，未拆解（degrade.<kind> = report；要静音把它改成 skip）（§9.5）"
+                .into(),
+        );
+
+        let plan = compute(
+            &[plugin],
+            &inputs,
+            &no_degrade(),
+            &content,
+            &Ledger::default(),
+            &sources,
+        );
+        let row = plan
+            .harnesses
+            .iter()
+            .flat_map(|h| &h.entries)
+            .find(|e| matches!(e.action, Action::Undeliverable { .. }))
+            .expect("拆不出 skill 要有 undeliverable 行");
+        let Action::Undeliverable { reason } = &row.action else {
+            unreachable!()
+        };
+        assert!(reason.contains("hook"), "注记要跟着走：{reason}");
+    }
+
+    /// §9.5「开关与目标」后半：**没写** `source_harness:` 的条目，
+    /// `install` 改判 `undeliverable`（不再假装能装），理由指路。
+    #[test]
+    fn an_install_for_a_plugin_without_a_source_harness_becomes_undeliverable() {
+        let m = crate::manifest::Manifest::parse(
+            "version: 1\n\nplugins:\n  p:\n    source: github\n    repo: x/y\n",
+        )
+        .expect("清单合法");
+        let desired = crate::lower::lower(&m);
+        let (states, adapters) = harness_states(vec![fake("codex")]);
+        let inputs = harness_inputs(&states, &adapters);
+
+        let plan = compute(
+            &desired,
+            &inputs,
+            &no_degrade(),
+            &ContentIndex::default(),
+            &Ledger::default(),
+            &no_source_harness(),
+        );
+        match &plan.harnesses[0].entries[0].action {
+            Action::Undeliverable { reason } => {
+                assert!(reason.contains("source_harness"), "指路要指对：{reason}");
+                assert!(reason.contains("§9.5"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 同一条道理推到 `update`：理由里要带上「清单要什么、本机是什么」。
+    #[test]
+    fn an_update_for_a_plugin_without_a_source_harness_becomes_undeliverable() {
+        let m = crate::manifest::Manifest::parse(
+            "version: 1\n\nplugins:\n  p:\n    source: github\n    repo: x/y\n    ref: v2.0\n",
+        )
+        .expect("清单合法");
+        let desired = crate::lower::lower(&m);
+        let (states, adapters) =
+            harness_states(vec![fake("codex").with_caps(vec![FakeAdapter::plugin(
+                "p",
+                Some("v1.0"),
+                None,
+            )])]);
+        let inputs = harness_inputs(&states, &adapters);
+
+        let plan = compute(
+            &desired,
+            &inputs,
+            &no_degrade(),
+            &ContentIndex::default(),
+            &Ledger::default(),
+            &no_source_harness(),
+        );
+        match &plan.harnesses[0].entries[0].action {
+            Action::Undeliverable { reason } => {
+                assert!(reason.contains("v2") && reason.contains("v1"), "{reason}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// **`in-sync` 与 `unknown` 原样保留**（§9.5）：没写 `source_harness:` 的条目
+    /// 仍然做版本对账，只是不再假装能装。改判范围只到 install/update 为止。
+    #[test]
+    fn a_plugin_without_a_source_harness_keeps_in_sync_and_unknown() {
+        // 版本同 → in-sync
+        let m = crate::manifest::Manifest::parse(
+            "version: 1\n\nplugins:\n  p:\n    source: github\n    repo: x/y\n    ref: v1.0\n",
+        )
+        .unwrap();
+        let desired = crate::lower::lower(&m);
+        let (states, adapters) =
+            harness_states(vec![fake("codex").with_caps(vec![FakeAdapter::plugin(
+                "p",
+                Some("v1.0"),
+                None,
+            )])]);
+        let inputs = harness_inputs(&states, &adapters);
+        let plan = compute(
+            &desired,
+            &inputs,
+            &no_degrade(),
+            &ContentIndex::default(),
+            &Ledger::default(),
+            &no_source_harness(),
+        );
+        assert_eq!(plan.harnesses[0].entries[0].action, Action::InSync);
+
+        // 版本无法判定 → unknown（codex 的常态：它不记版本）
+        let (states, adapters) = harness_states(vec![
+            fake("codex").with_caps(vec![FakeAdapter::plugin("p", None, None)]),
+        ]);
+        let inputs = harness_inputs(&states, &adapters);
+        let plan = compute(
+            &desired,
+            &inputs,
+            &no_degrade(),
+            &ContentIndex::default(),
+            &Ledger::default(),
+            &no_source_harness(),
+        );
+        assert_eq!(plan.harnesses[0].entries[0].action, Action::Unknown);
+    }
+
+    /// §9.5「交付什么」：bundle 里装不下的部分（hooks/commands/...）进的是
+    /// **该条目的报告说明**，跟着拆解出的 skill 行走，不是 diff 行、
+    /// 也不为它们新建能力身份。
+    #[test]
+    fn the_leftover_note_rides_every_decomposed_skill_row() {
+        let (plugin, sources) = plugin_with_source("p");
+        let (states, adapters) = harness_states(vec![fake("claude-code"), fake("codex")]);
+        let inputs = harness_inputs(&states, &adapters);
+        let skill = Capability {
+            id: CapId::new(Kind::Skill, "brainstorming"),
+            origin: Origin::Plugin { name: "p".into() },
+            spec: Spec::Skill {
+                source: SkillSource::PluginBundle { plugin: "p".into() },
+                path: None,
+            },
+            targets: Targets::Only(vec!["codex".into()]),
+        };
+        let mut content = ContentIndex::default();
+        content.notes.insert(
+            "p".into(),
+            "bundle `claude-code` 里还有 hook，未拆解（degrade.<kind> = report）".into(),
+        );
+
+        let plan = compute(
+            &[plugin, skill],
+            &inputs,
+            &no_degrade(),
+            &content,
+            &Ledger::default(),
+            &sources,
+        );
+        let row = plan
+            .harnesses
+            .iter()
+            .flat_map(|h| &h.entries)
+            .find(|e| e.id.kind == Kind::Skill)
+            .expect("拆出来的 skill 有一行");
+        let note = row.note.as_deref().expect("注记要跟着走");
+        assert!(note.contains("hook"), "{note}");
+    }
+
     /// 既有测试的默认入参：内容层缺席 = Plan A 行为。
     fn plan_a(desired: &[Capability], inputs: &[HarnessInput]) -> Plan {
         compute(
@@ -501,6 +1286,7 @@ mod tests {
             &no_degrade(),
             &ContentIndex::default(),
             &Ledger::default(),
+            &no_source_harness(),
         )
     }
 
@@ -532,6 +1318,7 @@ mod tests {
             &no_degrade(),
             &ContentIndex::default(),
             ledger,
+            &no_source_harness(),
         )
     }
 
@@ -564,6 +1351,7 @@ mod tests {
                     e.id.label(),
                     match &e.action {
                         Action::Conflict { .. } => "conflict".to_string(),
+                        Action::Remove => "remove".to_string(),
                         Action::Install => "install".to_string(),
                         Action::Update { .. } => "update".to_string(),
                         Action::InSync => "in-sync".to_string(),
@@ -766,9 +1554,13 @@ mod tests {
     }
 
     #[test]
-    fn same_sha_across_differing_version_strings_is_update() {
+    fn same_sha_across_differing_version_strings_is_undeliverable() {
         // spec §2.1 第 3 条修订后的核心场景：sha 相同不再判 Same（gitCommitSha 陈旧，
-        // §2.2 第 7 条），version 6.4.1 vs v6.3.0 归一化后不同 → Different → update。
+        // §2.2 第 7 条），version 6.4.1 vs v6.3.0 归一化后不同 → Different。
+        // §9.5 第 3 条再把这条 `update` 改判 `undeliverable`（没写 source_harness:
+        // 不再假装能装）。compare_versions 的 `Different` 仍在跑——from/to 落进理由串；
+        // 断 undeliverable 仍能抓住 compare_versions 的回归：判成 Same/Unknown 会
+        // 得 in-sync/unknown，这里就失败。
         let sha = "b36e0829c6d0140e93cfef2ca599b1b07d4a7797";
         let d = desired(
             Kind::Plugin,
@@ -789,7 +1581,10 @@ mod tests {
         );
         assert_eq!(
             labels(&hp),
-            vec![("plugin/superpowers".to_string(), "update".to_string())]
+            vec![(
+                "plugin/superpowers".to_string(),
+                "undeliverable".to_string()
+            )]
         );
     }
 
@@ -927,6 +1722,7 @@ mod tests {
             &table,
             &ContentIndex::default(),
             &Ledger::default(),
+            &no_source_harness(),
         );
         assert!(plan.harnesses[0].entries.is_empty(), "skip means silent");
     }
@@ -966,6 +1762,7 @@ mod tests {
             &table,
             &ContentIndex::default(),
             &Ledger::default(),
+            &no_source_harness(),
         );
         assert_eq!(plan.harnesses[0].entries.len(), 1);
         assert_eq!(plan.counts().undeliverable, 1);
@@ -1250,18 +2047,7 @@ mod tests {
         };
         let a = DegradingAdapter;
         let plan = plan_a(
-            &[desired(
-                Kind::Plugin,
-                "bundle",
-                Spec::Plugin {
-                    marketplace: None,
-                    entry: "bundle".into(),
-                    version: None,
-                    sha: None,
-                    install_path: None,
-                    enabled: true,
-                },
-            )],
+            &[desired(Kind::Mcp, "bundle", mcp_spec("x"))],
             &[HarnessInput {
                 state: &s,
                 adapter: &a,
@@ -1477,6 +2263,7 @@ mod tests {
             &DegradeTable::new(&Manifest::parse("version: 1\n").unwrap()),
             content,
             ledger,
+            &no_source_harness(),
         )
     }
 
@@ -1494,6 +2281,37 @@ mod tests {
                 path: Some(t.path(&format!(".claude/skills/{name}"))),
             },
         )
+    }
+
+    /// 报告要能**预告** `--prune` 会做什么（§9.3 不变式二）：同样是 drift 行，
+    /// 账本记着的那条写「--prune 可删」，用户手放的那条写「只报不删」——
+    /// 两句用的是**同一个判据**（`ledger.find`），与 `prune_plan` 同源。
+    #[test]
+    fn a_drift_row_says_whether_prune_can_touch_it() {
+        let t = TempHome::new();
+        let actual = vec![actual_skill(&t, "owned"), actual_skill(&t, "handmade")];
+        let plan = content_plan(
+            actual,
+            &ContentIndex::default(),
+            &ledger_claiming("owned", "h"),
+        );
+
+        let note = |name: &str| {
+            plan.harnesses[0]
+                .entries
+                .iter()
+                .find(|e| e.id.name == name)
+                .unwrap_or_else(|| panic!("{name} 该有一行 drift"))
+                .note
+                .clone()
+                .unwrap_or_default()
+        };
+        assert!(note("owned").contains("--prune 可删"), "{}", note("owned"));
+        assert!(
+            note("handmade").contains("只报不删"),
+            "{}",
+            note("handmade")
+        );
     }
 
     #[test]
@@ -1605,5 +2423,195 @@ mod tests {
     fn conflicts_sort_first_and_are_counted() {
         assert_eq!(Action::Conflict { reason: "x".into() }.rank(), 0);
         assert!(Action::Conflict { reason: "x".into() }.rank() < Action::Install.rank());
+    }
+
+    /// §9.8：`Action::Remove` 是 `--prune` 的执行形状。`diff` 永不产它，
+    /// 但 rank 必须先定好——渲染与排序都读它，插进来也不能打乱既有相对顺序。
+    #[test]
+    fn remove_ranks_after_conflict_and_before_install() {
+        let update = Action::Update {
+            from: "a".into(),
+            to: "b".into(),
+        };
+        let undeliverable = Action::Undeliverable { reason: "r".into() };
+        assert_eq!(Action::Conflict { reason: "x".into() }.rank(), 0);
+        assert_eq!(Action::Remove.rank(), 1);
+        assert!(Action::Remove.rank() < Action::Install.rank());
+        assert!(Action::Install.rank() < update.rank());
+        assert!(update.rank() < undeliverable.rank());
+        assert!(undeliverable.rank() < Action::Drift.rank());
+        assert!(Action::Drift.rank() < Action::Unknown.rank());
+        assert!(Action::Unknown.rank() < Action::InSync.rank());
+    }
+
+    /// `remove` 今天恒为 0（`diff` 不产删除），但计数逻辑必须已经在，
+    /// 且 `is_clean()` 认它——否则 `--prune` 的计划会被报成「干净」。
+    #[test]
+    fn a_remove_entry_counts_and_makes_the_plan_unclean() {
+        let plan = Plan {
+            harnesses: vec![HarnessPlan {
+                harness: "claude-code".into(),
+                detected: true,
+                entries: vec![PlanEntry::new(
+                    CapId::new(Kind::Skill, "gone"),
+                    Action::Remove,
+                )],
+                actual_by_kind: BTreeMap::new(),
+            }],
+            unattached: Vec::new(),
+        };
+        assert_eq!(plan.counts().remove, 1);
+        assert!(!plan.is_clean());
+    }
+
+    fn skill_entry(name: &str, action: Action) -> PlanEntry {
+        PlanEntry::new(CapId::new(Kind::Skill, name), action)
+    }
+
+    fn ledger_entry(harness: &str, kind: Kind, name: &str) -> LedgerEntry {
+        LedgerEntry {
+            harness: harness.into(),
+            kind,
+            name: name.into(),
+            path: PathBuf::from("/somewhere").join(name),
+            source_id: "agents-dir".into(),
+            content_hash: "h".into(),
+            delivered_at_unix: 1_700_000_000,
+        }
+    }
+
+    /// §9.8 的核心判决：**账本里记着的 drift 才是删除候选**。
+    /// 非账本 drift（用户手放的）原样保留——`--prune` 不是「让目录等于清单」。
+    #[test]
+    fn prune_turns_only_ledger_recorded_drift_into_removals() {
+        let plan = Plan {
+            harnesses: vec![HarnessPlan {
+                harness: "claude-code".into(),
+                detected: true,
+                entries: vec![
+                    skill_entry("owned", Action::Drift),
+                    skill_entry("handmade", Action::Drift),
+                    skill_entry("wanted", Action::Install),
+                ],
+                actual_by_kind: BTreeMap::new(),
+            }],
+            unattached: Vec::new(),
+        };
+        let mut ledger = Ledger::default();
+        ledger.record(ledger_entry("claude-code", Kind::Skill, "owned"));
+
+        let pruned = prune_plan(&plan, &ledger);
+
+        let action = |name: &str| {
+            pruned.harnesses[0]
+                .entries
+                .iter()
+                .find(|e| e.id.name == name)
+                .unwrap()
+                .action
+                .clone()
+        };
+        assert_eq!(action("owned"), Action::Remove);
+        assert_eq!(action("handmade"), Action::Drift, "非账本条目只报不删");
+        assert_eq!(action("wanted"), Action::Install, "其余动作不受影响");
+
+        // 原计划一个字节没动——`prune_plan` 是纯函数。
+        assert_eq!(
+            plan.harnesses[0].entries[0].action,
+            Action::Drift,
+            "不许改入参"
+        );
+    }
+
+    /// 改判成 `Remove` 之后，「--prune 可删」必须消失——它已经不是「可删」而是
+    /// 「即将删」。render 的 remove 行会把注记原样贴进括号后，留着就是一句反话。
+    #[test]
+    fn a_removal_drops_the_stale_prune_hint() {
+        let plan = Plan {
+            harnesses: vec![HarnessPlan {
+                harness: "claude-code".into(),
+                detected: true,
+                entries: vec![
+                    skill_entry("owned", Action::Drift)
+                        .with_note(Some("未在清单中，--prune 可删".into())),
+                ],
+                actual_by_kind: BTreeMap::new(),
+            }],
+            unattached: Vec::new(),
+        };
+        let mut ledger = Ledger::default();
+        ledger.record(ledger_entry("claude-code", Kind::Skill, "owned"));
+
+        let pruned = prune_plan(&plan, &ledger);
+        assert_eq!(pruned.harnesses[0].entries[0].action, Action::Remove);
+        assert_eq!(
+            pruned.harnesses[0].entries[0].note, None,
+            "remove 行不能挂着「可删」"
+        );
+    }
+
+    /// 账本键含 harness：`codex` 名下的一条记录不能把 `claude-code` 的 drift
+    /// 变成删除，反过来也一样。
+    #[test]
+    fn a_ledger_entry_from_another_harness_does_not_authorize_a_removal() {
+        let plan = Plan {
+            harnesses: vec![HarnessPlan {
+                harness: "claude-code".into(),
+                detected: true,
+                entries: vec![skill_entry("foo", Action::Drift)],
+                actual_by_kind: BTreeMap::new(),
+            }],
+            unattached: Vec::new(),
+        };
+        let mut ledger = Ledger::default();
+        ledger.record(ledger_entry("codex", Kind::Skill, "foo"));
+
+        assert_eq!(
+            prune_plan(&plan, &ledger).harnesses[0].entries[0].action,
+            Action::Drift
+        );
+    }
+
+    /// 空账本 = 一条都不删。这是「账本丢了只会退化成什么都不敢动」那条性质的
+    /// 具体形态（§9.3）。
+    #[test]
+    fn an_empty_ledger_prunes_nothing() {
+        let plan = Plan {
+            harnesses: vec![HarnessPlan {
+                harness: "claude-code".into(),
+                detected: true,
+                entries: vec![skill_entry("foo", Action::Drift)],
+                actual_by_kind: BTreeMap::new(),
+            }],
+            unattached: Vec::new(),
+        };
+        assert_eq!(
+            prune_plan(&plan, &Ledger::default()).harnesses[0].entries[0].action,
+            Action::Drift
+        );
+    }
+
+    /// 改判会改变 rank：删除条目必须重排到它该在的位置，
+    /// 否则 `render` 的「同组连续」假设会破。
+    #[test]
+    fn prune_re_sorts_entries_after_re_judging() {
+        let plan = Plan {
+            harnesses: vec![HarnessPlan {
+                harness: "claude-code".into(),
+                detected: true,
+                entries: vec![
+                    skill_entry("a", Action::Drift),
+                    skill_entry("b", Action::Install),
+                ],
+                actual_by_kind: BTreeMap::new(),
+            }],
+            unattached: Vec::new(),
+        };
+        let mut ledger = Ledger::default();
+        ledger.record(ledger_entry("claude-code", Kind::Skill, "a"));
+
+        let entries = &prune_plan(&plan, &ledger).harnesses[0].entries;
+        assert_eq!(entries[0].id.name, "a", "remove(1) 排在 install(2) 之前");
+        assert_eq!(entries[0].action, Action::Remove);
     }
 }

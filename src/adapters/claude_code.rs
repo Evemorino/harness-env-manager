@@ -452,6 +452,23 @@ pub(crate) fn expect_bool(value: &Value, file: &Path, what: &str) -> anyhow::Res
         .ok_or_else(|| shape_fault(value, file, what, "a boolean"))
 }
 
+/// 可选布尔：**缺键与显式 `null` 都是「没表态」**，其余交给 [`expect_bool`]。
+///
+/// 与 `optional_string` / `optional_object` / `optional_array` 同一条分界：
+/// 容器级的 `null` 在 JSON 里是「这个键没有值」，不是「这个键的值是坏东西」。
+/// 少了这一支，kimi 的 `installed.json` 里一条 `"enabled": null` 就会让
+/// **整份文件**读不出来——用户的写法明明是合法的。
+pub(crate) fn optional_bool(
+    value: Option<&Value>,
+    file: &Path,
+    what: &str,
+) -> anyhow::Result<Option<bool>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(v) => Ok(Some(expect_bool(v, file, what)?)),
+    }
+}
+
 /// 可选字符串字段：键缺失 → `Ok(None)`；显式 `null` → `Ok(None)`（JSON 里写「无」的
 /// 常见形态，与缺键同义）；**有值但不是字符串** → 故障上抛，不塌成 `None`。
 pub(crate) fn optional_string<'a>(
@@ -1787,6 +1804,39 @@ mod tests {
             "`false` 必须读成 false，不是默认值"
         );
         assert!(expect_bool(&json!(true), file, what).unwrap());
+    }
+
+    /// 第七个形状原语：`null` 与缺键同义（都是「没表态」），
+    /// 而**不是**布尔 = 坏值。写成 `.and_then(Value::as_bool).unwrap_or(true)`
+    /// 就把用户显式关掉的 plugin 报成已启用；只写 `expect_bool` 则把一个
+    /// 合法的 `null` 报成整份文件读不出来。两条都不行。
+    #[test]
+    fn optional_bool_treats_null_like_a_missing_key() {
+        let f = Path::new("x.json");
+        let what = "field `enabled`";
+        assert_eq!(optional_bool(None, f, what).unwrap(), None);
+        assert_eq!(
+            optional_bool(Some(&serde_json::Value::Null), f, what).unwrap(),
+            None
+        );
+        assert_eq!(
+            optional_bool(Some(&serde_json::json!(true)), f, what).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            optional_bool(Some(&serde_json::json!(false)), f, what).unwrap(),
+            Some(false)
+        );
+    }
+
+    /// 放宽的只有 `null`：类型错了仍然是坏值。这是「缺键」与「写坏了」的分界，
+    /// 也是失败隔离契约要求的那条线。
+    #[test]
+    fn optional_bool_still_refuses_a_wrong_type() {
+        let f = Path::new("x.json");
+        let e = optional_bool(Some(&serde_json::json!("yes")), f, "field `enabled`")
+            .expect_err("字符串不是布尔");
+        assert!(format!("{e:#}").contains("enabled"), "{e:#}");
     }
 
     /// 合并成一份实现之后（codex 那个逐字相同的私有 `split_key` 已删），这条把**两家共用**

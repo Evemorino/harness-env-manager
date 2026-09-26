@@ -45,6 +45,38 @@ pub fn upsert_codex_mcp(
     write_config(target, doc.to_string().as_bytes())
 }
 
+/// 从 codex 的 `config.toml` 里摘掉 `[mcp_servers.<name>]`（`upsert_codex_mcp` 的逆操作，§9.8）。
+///
+/// **键不在就不写**（同 `remove_kimi_mcp`）：`write_config` 会备份并 rename，
+/// 不该为一次什么都没删的操作动用户的文件。
+pub fn remove_codex_mcp(target: &Path, name: &str) -> anyhow::Result<()> {
+    let existing = match std::fs::read_to_string(target) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("{}: cannot read", target.display())),
+    };
+    if existing.trim().is_empty() {
+        return Ok(());
+    }
+    // **绝不把文件内容放进错误消息**：config.toml 里可能有 token（`experimental_bearer_token`）。
+    let mut doc: DocumentMut = existing
+        .parse()
+        .with_context(|| format!("{}: not valid TOML, refusing to touch it", target.display()))?;
+
+    // 借用收在块里：`slots` 活着的时候 `doc` 是被借出的，最后那次 `to_string` 需要它。
+    let removed = {
+        let Some(item) = doc.get_mut("mcp_servers") else {
+            return Ok(());
+        };
+        let mut slots = Slots::of(item, target)?;
+        slots.remove(name)
+    };
+    if !removed {
+        return Ok(());
+    }
+    write_config(target, doc.to_string().as_bytes())
+}
+
 /// `mcp_servers` 的两种合法拼法。
 ///
 /// **两种都要认**：`toml` crate 把 `mcp_servers = { ... }` 读成 `Value::Table`
@@ -117,6 +149,18 @@ impl<'a> Slots<'a> {
                 }
                 t.insert(name, Value::InlineTable(server));
             }
+        }
+    }
+
+    /// 摘掉一条 MCP 子树，返回是否真的摘到了（§9.8 的撤销原语）。
+    ///
+    /// **摘不到不是错误**：键本来就不在时返回 `false`，由调用方决定「不落盘」。
+    /// 块表与内联表都要认——读路径两种都认（`Slots::of` 的理由），
+    /// 一种认一种不认会让「diff 说该删、apply 说删不了」。
+    fn remove(&mut self, name: &str) -> bool {
+        match self {
+            Slots::Block(t) => t.remove(name).is_some(),
+            Slots::Inline(t) => t.remove(name).is_some(),
         }
     }
 }
@@ -323,5 +367,114 @@ mod tests {
             doc["mcp_servers"]["context7"]["env"]["W"].as_str(),
             Some("${A_B1}")
         );
+    }
+
+    /// Review Focus 5：键不在就逐字节不动（这里连注释一起钉住），也不落 `.bak`。
+    #[test]
+    fn removing_a_missing_key_leaves_the_bytes_alone() {
+        let t = TempHome::new();
+        let p = t.path(".codex/config.toml");
+        t.write(
+            ".codex/config.toml",
+            "# 用户自己写的\nmodel = \"gpt-5\"\n\n[mcp_servers.other]\ncommand = \"their-binary\"\n",
+        );
+        let before = std::fs::read(&p).unwrap();
+
+        remove_codex_mcp(&p, "context7").unwrap();
+
+        assert_eq!(std::fs::read(&p).unwrap(), before, "空操作不许重写文件");
+        assert!(!p.with_file_name("config.toml.henv.bak").exists());
+    }
+
+    /// 文件不存在 → 什么都不建。
+    #[test]
+    fn removing_from_a_missing_file_creates_nothing() {
+        let t = TempHome::new();
+        let p = t.path(".codex/config.toml");
+        remove_codex_mcp(&p, "context7").unwrap();
+        assert!(!p.exists(), "撤销不是创建");
+    }
+
+    /// 文件在、但压根没有 `mcp_servers` 表 → 不写（不许凭空建一张空表出来）。
+    #[test]
+    fn a_file_without_mcp_servers_is_a_no_op() {
+        let t = TempHome::new();
+        let p = t.path(".codex/config.toml");
+        t.write(".codex/config.toml", "model = \"gpt-5\"\n");
+        let before = std::fs::read(&p).unwrap();
+
+        remove_codex_mcp(&p, "context7").unwrap();
+
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+    }
+
+    /// 真删块表：注释、别的键、别的 MCP 一个不少，只有那棵子树没了。
+    #[test]
+    fn removing_drops_only_the_named_block_table() {
+        let t = TempHome::new();
+        let p = t.path(".codex/config.toml");
+        t.write(".codex/config.toml", "# 用户自己写的\nmodel = \"gpt-5\"\n");
+        upsert_codex_mcp(&p, "other", "their-binary", &[], &BTreeMap::new()).unwrap();
+        upsert_codex_mcp(&p, "context7", "npx", &args2(), &env1()).unwrap();
+
+        remove_codex_mcp(&p, "context7").unwrap();
+
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(!text.contains("context7"), "{text}");
+        assert!(text.contains("# 用户自己写的"), "注释必须活下来：{text}");
+        let v: toml::Value = toml::from_str(&text).unwrap();
+        assert_eq!(v["model"].as_str(), Some("gpt-5"));
+        assert_eq!(
+            v["mcp_servers"]["other"]["command"].as_str(),
+            Some("their-binary")
+        );
+    }
+
+    /// 内联拼法也要认——读路径两种都认（`Slots::of` 的理由），
+    /// 一种认一种不认会让「diff 说该删、apply 说删不了」。
+    #[test]
+    fn removing_works_on_the_inline_form_too() {
+        let t = TempHome::new();
+        let p = t.path(".codex/config.toml");
+        t.write(
+            ".codex/config.toml",
+            "mcp_servers = { context7 = { command = \"npx\" }, other = { command = \"x\" } }\n",
+        );
+
+        remove_codex_mcp(&p, "context7").unwrap();
+
+        let text = std::fs::read_to_string(&p).unwrap();
+        let v: toml::Value = toml::from_str(&text).unwrap();
+        assert!(v["mcp_servers"].get("context7").is_none(), "{text}");
+        assert_eq!(v["mcp_servers"]["other"]["command"].as_str(), Some("x"));
+    }
+
+    /// 内联拼法里键不在 → 字节不动。
+    #[test]
+    fn the_inline_form_without_the_key_is_a_no_op() {
+        let t = TempHome::new();
+        let p = t.path(".codex/config.toml");
+        t.write(
+            ".codex/config.toml",
+            "mcp_servers = { other = { command = \"x\" } }\n",
+        );
+        let before = std::fs::read(&p).unwrap();
+
+        remove_codex_mcp(&p, "context7").unwrap();
+
+        assert_eq!(std::fs::read(&p).unwrap(), before);
+    }
+
+    /// 语法坏掉的 config.toml → 报错、文件一字节不变。
+    #[test]
+    fn removing_from_a_broken_config_is_refused_and_never_echoed() {
+        let t = TempHome::new();
+        let p = t.path(".codex/config.toml");
+        t.write(".codex/config.toml", "[[[not toml\n");
+        let before = std::fs::read(&p).unwrap();
+
+        assert!(remove_codex_mcp(&p, "context7").is_err());
+
+        assert_eq!(std::fs::read(&p).unwrap(), before);
     }
 }

@@ -13,6 +13,7 @@ pub mod mcp;
 pub mod mcp_claude;
 pub mod mcp_json;
 pub mod mcp_toml;
+pub mod prune;
 pub mod write;
 
 pub use write::deliver_skill;
@@ -23,6 +24,9 @@ pub struct HarnessReport {
     pub harness: String,
     /// 本次真正交付的条目 label（如 `skill/foo`），按 label 排好序。
     pub delivered: Vec<String>,
+    /// 本次真正**撤销**掉的条目 label（如 `skill/foo`）。只有 `--prune` 会填它；
+    /// 撤销不交付任何东西，所以这两个列表在同一次运行里互斥。
+    pub removed: Vec<String>,
     /// `Some` = 这家只做成了一部分（§9.7 失败隔离）。没有回滚，重跑就是修复路径。
     pub failure: Option<String>,
 }
@@ -35,6 +39,8 @@ impl HarnessReport {
     pub fn absorb(&mut self, other: HarnessReport) {
         self.delivered.extend(other.delivered);
         self.delivered.sort();
+        self.removed.extend(other.removed);
+        self.removed.sort();
         if let Some(f) = other.failure {
             self.failure = Some(match self.failure.take() {
                 Some(prev) => format!("{prev}; {f}"),
@@ -62,6 +68,7 @@ pub fn deliver_skills(
     let mut report = HarnessReport {
         harness: harness.to_string(),
         delivered: Vec::new(),
+        removed: Vec::new(),
         failure: None,
     };
     let Some(target_dir) = target_dir else {
@@ -148,6 +155,10 @@ impl ApplyReport {
     pub fn delivered_total(&self) -> usize {
         self.harnesses.iter().map(|h| h.delivered.len()).sum()
     }
+
+    pub fn removed_total(&self) -> usize {
+        self.harnesses.iter().map(|h| h.removed.len()).sum()
+    }
 }
 
 /// 执行计划（§9.2 第 2 步）。**全项目唯一会往 `Home` 下写东西的函数。**
@@ -196,15 +207,21 @@ pub fn execute(
         let Some(adapter) = crate::adapters::lookup(&registry, &hp.harness) else {
             continue;
         };
-        match adapter.apply(hp, desired, content, ledger) {
-            Ok(r) => report.harnesses.push(r),
+        let mut harness_report = match adapter.apply(hp, desired, content, ledger) {
+            Ok(r) => r,
             // adapter 级失败（连目标目录都建不出来）——也走 partial，不上抛。
-            Err(e) => report.harnesses.push(HarnessReport {
+            Err(e) => HarnessReport {
                 harness: hp.harness.clone(),
                 delivered: Vec::new(),
+                removed: Vec::new(),
                 failure: Some(format!("{e:#}")),
-            }),
-        }
+            },
+        };
+        // §9.8：撤销与交付隔离在**条目**这一级，所以两半各跑各的、合成一份报告。
+        // 计划里没有 `Remove` 条目时这是一个空报告——`--prune` 之外零影响，
+        // 因为 `diff::compute` 与 `diff` 都不产 `Remove`。
+        harness_report.absorb(prune::prune_harness(adapter, hp, ledger));
+        report.harnesses.push(harness_report);
     }
     Ok(report)
 }
@@ -481,11 +498,13 @@ mod tests {
                 &desired,
                 &t.home,
                 crate::store::git::SourceMode::Fetch,
+                &crate::store::skills::BundleTable::new(),
             )
             .unwrap()
             .sources,
             targets: Default::default(),
             unresolved: Default::default(),
+            notes: Default::default(),
         };
         let inputs: Vec<crate::diff::HarnessInput> = states
             .iter()
@@ -501,6 +520,7 @@ mod tests {
             &crate::lower::DegradeTable::new(&manifest),
             &content,
             &Ledger::default(),
+            &crate::lower::SourceHarnessTable::default(),
         );
         (plan, desired, content)
     }
@@ -582,11 +602,13 @@ mod tests {
         let mut skills = HarnessReport {
             harness: "claude-code".into(),
             delivered: vec!["skill/z".into()],
+            removed: Vec::new(),
             failure: Some("skill/a: boom".into()),
         };
         skills.absorb(HarnessReport {
             harness: "claude-code".into(),
             delivered: vec!["mcp/context7".into(), "mcp/b".into()],
+            removed: Vec::new(),
             failure: Some("mcp/c: also boom".into()),
         });
 
@@ -609,15 +631,61 @@ mod tests {
         let mut skills = HarnessReport {
             harness: "codex".into(),
             delivered: Vec::new(),
+            removed: Vec::new(),
             failure: None,
         };
         skills.absorb(HarnessReport {
             harness: "codex".into(),
             delivered: vec!["mcp/context7".into()],
+            removed: Vec::new(),
             failure: Some("mcp/context7: nope".into()),
         });
         assert_eq!(skills.failure.as_deref(), Some("mcp/context7: nope"));
         assert_eq!(skills.delivered, vec!["mcp/context7"]);
+    }
+
+    /// `--prune` 的删除结果与交付结果同构：合并后重排，且两份一条都不丢。
+    #[test]
+    fn absorb_merges_removals_too() {
+        let mut a = HarnessReport {
+            harness: "claude-code".into(),
+            delivered: vec!["skill/z".into()],
+            removed: vec!["mcp/context7".into()],
+            failure: None,
+        };
+        a.absorb(HarnessReport {
+            harness: "claude-code".into(),
+            delivered: Vec::new(),
+            removed: vec!["skill/a".into(), "mcp/b".into()],
+            failure: None,
+        });
+
+        assert_eq!(a.removed, vec!["mcp/b", "mcp/context7", "skill/a"]);
+        assert_eq!(a.delivered, vec!["skill/z"], "交付那一半不受影响");
+    }
+
+    /// 账本保存条件读它。少了这条，删成功却不落盘的那次运行会把已删条目
+    /// 在下一次 diff 里再报一遍 drift。
+    #[test]
+    fn removed_total_sums_across_harnesses() {
+        let r = ApplyReport {
+            harnesses: vec![
+                HarnessReport {
+                    harness: "claude-code".into(),
+                    delivered: Vec::new(),
+                    removed: vec!["skill/x".into()],
+                    failure: None,
+                },
+                HarnessReport {
+                    harness: "codex".into(),
+                    delivered: Vec::new(),
+                    removed: vec!["skill/y".into(), "mcp/z".into()],
+                    failure: None,
+                },
+            ],
+        };
+        assert_eq!(r.removed_total(), 3);
+        assert_eq!(r.delivered_total(), 0);
     }
 
     #[test]

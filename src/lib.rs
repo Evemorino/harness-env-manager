@@ -21,6 +21,7 @@ use std::path::Path;
 pub mod adapters;
 pub mod apply;
 pub mod capability;
+pub mod decompose;
 pub mod diff;
 pub mod home;
 pub mod lower;
@@ -86,20 +87,16 @@ fn plan_for(
     manifest_path: &Path,
     home: &Home,
     mode: store::skills::SourceMode,
+    only: Option<&str>,
 ) -> anyhow::Result<Planned> {
     let text = std::fs::read_to_string(manifest_path)
         .with_context(|| format!("cannot read manifest: {}", manifest_path.display()))?;
     let manifest = Manifest::parse(&text)
         .with_context(|| format!("invalid manifest: {}", manifest_path.display()))?;
 
-    let desired = lower::lower(&manifest);
+    let mut desired = lower::lower(&manifest);
     let degrade = lower::DegradeTable::new(&manifest);
-
-    // §9.2 第 1 步：全局来源解析。唯一在 compute 之前的 I/O。
-    // `mode` 在这里分岔成全链路唯一的两种行为：`Cached` 不联网（`diff`），
-    // `Fetch` 会去取（`apply`）。模式必须一路传到这一层——分类「延期还是失败」
-    // 是它的责任（§9.4），而这一层是唯一知道「源到底取到没有」的地方。
-    let content_sources = store::skills::resolve_sources(&desired, home, mode)?;
+    let sources = lower::SourceHarnessTable::new(&manifest);
 
     let registry = adapters::registry(home);
     // state 与它的 adapter 必须成对交给 compute，故先收进同一个 Vec 再借用。
@@ -107,6 +104,15 @@ fn plan_for(
     for a in &registry {
         if !is_enabled(&manifest, a.name()) {
             continue;
+        }
+        // §9.8 的 `--harness <name>`：**只过滤目标 pairs**。源扫描在下面，
+        // 走的是 `scan_source_harnesses(&sources, &registry)`，不接收 `only`——
+        // `source_harness:` 那家哪怕被排除也照样要被读，否则它的 bundle
+        // 会凭空变成「定位不到」，用户得到一份假的 undeliverable。
+        if let Some(only) = only {
+            if a.name() != only {
+                continue;
+            }
         }
         let detected = a.detect();
         // 未安装 → 空现状 + detected=false，由 render 显示跳过原因；
@@ -127,6 +133,37 @@ fn plan_for(
         ));
     }
 
+    // 源 harness 按需扫（§9.5）：**不进 `pairs`**——`source_harness:` 只请求读它，
+    // 不请求往它写，也不请求它多出一节 diff。它在 `harnesses:` 里很可能是关掉的，
+    // 那正是「我只想拿它的内容」的写法。
+    //
+    // 已经为启用的家读过的那份现状直接交出去：同一个家既是目标又是源时不该再读第二遍。
+    // 两次 `read_state()` 之间盘面会变，共用一份才让「diff 里读到的」与「拆解取到的」
+    // 真正是同一次观察（`decompose` 那句「不许有第二条读路径」原本只做到了同函数，
+    // 没做到同一次）。
+    let declared = sources.declared();
+    let already: std::collections::BTreeMap<String, decompose::SourceState> = pairs
+        .iter()
+        .filter(|(s, _)| declared.contains(s.name.as_str()))
+        .map(|(s, _)| {
+            let state = if s.detected {
+                decompose::SourceState::Scanned(s.actual.clone())
+            } else {
+                decompose::SourceState::NotInstalled
+            };
+            (s.name.clone(), state)
+        })
+        .collect();
+    let known: Vec<&str> = pairs.iter().map(|(s, _)| s.name.as_str()).collect();
+    let source_states = decompose::scan_source_harnesses(&sources, &registry, &already)
+        .context("cannot scan source harness state")?;
+
+    // §9.5 的拆解：把 bundle 里能拆的能力变成独立能力，追加进清单侧。
+    // 必须早于 `resolve_sources`——拆出来的 skill 也要解析内容（它们的源是 bundle）。
+    let decomposed = decompose::decompose_bundles(&manifest, &source_states, &known, home)?;
+    desired.extend(decomposed.capabilities.iter().cloned());
+    desired.sort_by_key(|c| c.id.label());
+
     // 目标侧内容扫描：逐家算，按 harness 名收进一张表。
     let mut targets: std::collections::BTreeMap<String, _> = Default::default();
     for (state, _) in &pairs {
@@ -144,13 +181,24 @@ fn plan_for(
         })
         .collect();
 
-    let content = store::skills::ContentIndex {
-        sources: content_sources.sources,
-        targets,
-        unresolved: content_sources.unresolved,
-    };
+    // §9.2 第 1 步：来源解析。唯一在 compute 之前的 I/O。
+    // `mode` 在这里分岔成全链路唯一的两种行为：`Cached` 不联网（`diff`），
+    // `Fetch` 会去取（`apply`）。模式必须一路传到这一层——分类「延期还是失败」
+    // 是它的责任（§9.4），而这一层是唯一知道「源到底取到没有」的地方。
+    let mut content = store::skills::resolve_sources(&desired, home, mode, &decomposed.locations)?;
+    content.targets = targets;
+    content.notes = decomposed.notes.clone();
+    // 定位失败的 plugin 条目：理由由内容层带进来（`compute` 按 `CapId` 取回，
+    // 与普通 skill 源失败走的是同一个 `unresolved` 表）。
+    for (plugin, reason) in &decomposed.failures {
+        content.unresolved.insert(
+            capability::CapId::new(capability::Kind::Plugin, plugin.clone()),
+            store::skills::Unresolved::Failed(reason.clone()),
+        );
+    }
+
     let ledger = store::provenance::Ledger::load(home)?;
-    let plan = diff::compute(&desired, &inputs, &degrade, &content, &ledger);
+    let plan = diff::compute(&desired, &inputs, &degrade, &content, &ledger, &sources);
     Ok(Planned {
         plan,
         desired,
@@ -164,10 +212,10 @@ fn plan_for(
 /// 恒以 `Ok(())` 结束（有 drift 也是 `Ok`）——`diff` 是报告不是断言，
 /// 门禁语义留给 Plan C 的 `doctor`。
 ///
-/// 注：`degrade:` 在 Plan A 只是声明性占位——plugin 尚未拆解，策略两侧都不生效，
-/// 真正按策略静音/降级要等 Plan B 拆解落地。
+/// 注：`degrade:` 从 B3b 起真的参与判决——它决定「目标 harness 吃不下、
+/// 但内容已经拆出来了」的那些能力是进报告还是静默丢弃（§9.5）。
 pub fn run_diff(manifest_path: &Path, home: &Home, out: &mut dyn Write) -> anyhow::Result<()> {
-    let planned = plan_for(manifest_path, home, store::skills::SourceMode::Cached)?;
+    let planned = plan_for(manifest_path, home, store::skills::SourceMode::Cached, None)?;
     write!(out, "{}", render::render(&planned.plan))?;
     Ok(())
 }
@@ -210,13 +258,26 @@ pub fn run_skills_list(
 /// 冲突在问人之前就返回错误——让人对着一个不可能执行的计划回答 y 没有意义。
 ///
 /// `apply` 是 henv 唯一的写路径；它不做计划以外的事（§9.1 的范围）。
+///
+/// `prune` 只撤销**账本里记着**的条目——henv 自己交付过的 skill 拷贝与 MCP 键；
+/// 用户手放的 drift 一律只报不删（§9.8）。`only` 把一次运行限定在一家，
+/// 且**只收窄目标**：源扫描不受它影响。
 pub fn run_apply(
     manifest_path: &Path,
     home: &Home,
     out: &mut dyn Write,
     confirm: &mut dyn Confirm,
+    prune: bool,
+    only: Option<&str>,
 ) -> anyhow::Result<()> {
-    let mut planned = plan_for(manifest_path, home, store::skills::SourceMode::Fetch)?;
+    let mut planned = plan_for(manifest_path, home, store::skills::SourceMode::Fetch, only)?;
+
+    // §9.8：`--prune` 只在这里改计划——`diff::compute` 与 `diff` 都不产删除动作，
+    // 于是「删什么」是一件可测的纯函数，而 `diff` 的输出逐字节不变。
+    // 改判必须在渲染之前：用户要看到的就是「这次会删什么」。
+    if prune {
+        planned.plan = diff::prune_plan(&planned.plan, &planned.ledger);
+    }
     write!(out, "{}", render::render(&planned.plan))?;
 
     let conflicts = planned.plan.conflicts();
@@ -257,7 +318,16 @@ pub fn run_apply(
         return Ok(());
     }
 
-    if !confirm.ask(&format!("将向 {} 交付。继续？", pending.join(", "))) {
+    // 确认文案要说清这次**不只是交付**：删除不可逆（§9.7 没有回滚命令）。
+    // 删除条数为 0 时文案与从前一字不差。
+    let removals = planned.plan.counts().remove;
+    let mut what = format!("将向 {} 交付", pending.join(", "));
+    if removals > 0 {
+        // 「最多」：这是**计划**里的删除条数，个别条目可能在执行时失败（§9.7 不进
+        // 事务、失败进报告）。数字偏高比偏低好，但话得说明白。
+        let _ = write!(what, "，最多删除 {removals} 项");
+    }
+    if !confirm.ask(&format!("{what}。继续？")) {
         let _ = writeln!(out, "cancelled");
         return Ok(());
     }
@@ -273,9 +343,14 @@ pub fn run_apply(
         for id in &h.delivered {
             let _ = writeln!(out, "{:<13} delivered {}", h.harness, id);
         }
+        for id in &h.removed {
+            let _ = writeln!(out, "{:<13} removed {}", h.harness, id);
+        }
     }
-    // 账本只在真的交付过东西之后写：一次空跑不该改动 henv 的状态文件。
-    if report.delivered_total() > 0 {
+    // 账本只在真的动过之后写：一次空跑不该改动 henv 的状态文件。
+    // 「删成功」也算动过——不落盘的话，下一次 diff 会把已删的条目再报一遍 drift，
+    // 而账本里那份记录还在（§9.7 的修复路径依赖它）。
+    if report.delivered_total() > 0 || report.removed_total() > 0 {
         planned.ledger.save(home)?;
     }
     let partial = report.partial();
@@ -289,7 +364,11 @@ pub fn run_apply(
 }
 
 /// `harnesses` 是 opt-out 列表：未列出 = 启用，只有显式 `enabled: false` 排除。
-fn is_enabled(m: &Manifest, name: &str) -> bool {
+/// 清单里这家开着没有。没写就是开（spec §4 harnesses 注释）。
+///
+/// `pub(crate)`：`decompose` 也要用同一条判据（§9.5 的「交付目标被关掉」），
+/// 复制一份 `unwrap_or(true)` 迟早在某一边走样。
+pub(crate) fn is_enabled(m: &Manifest, name: &str) -> bool {
     m.harnesses.get(name).map(|h| h.enabled).unwrap_or(true)
 }
 
@@ -357,7 +436,7 @@ mod tests {
         );
         let m = t.path("env.yaml");
 
-        let cached = plan_for(&m, &t.home, store::skills::SourceMode::Cached).unwrap();
+        let cached = plan_for(&m, &t.home, store::skills::SourceMode::Cached, None).unwrap();
         assert!(
             cached
                 .content
@@ -366,7 +445,7 @@ mod tests {
             "diff 不联网：第一次跑时缓存是空的，源应当报「这次判不了」"
         );
 
-        let fetched = plan_for(&m, &t.home, store::skills::SourceMode::Fetch).unwrap();
+        let fetched = plan_for(&m, &t.home, store::skills::SourceMode::Fetch, None).unwrap();
         assert!(
             fetched
                 .content
@@ -515,8 +594,24 @@ mod tests {
     fn apply(t: &TempHome, manifest: &str, confirm: &mut dyn Confirm) -> anyhow::Result<String> {
         t.write("env.yaml", manifest);
         let mut out = Vec::new();
-        run_apply(&t.path("env.yaml"), &t.home, &mut out, confirm)?;
+        run_apply(&t.path("env.yaml"), &t.home, &mut out, confirm, false, None)?;
         Ok(String::from_utf8(out).expect("utf8"))
+    }
+
+    /// 同上，但能指定 `--prune` 与 `--harness`。
+    fn apply_with(t: &TempHome, manifest: &str, prune: bool, only: Option<&str>) -> String {
+        t.write("env.yaml", manifest);
+        let mut out = Vec::new();
+        run_apply(
+            &t.path("env.yaml"),
+            &t.home,
+            &mut out,
+            &mut AssumeYes,
+            prune,
+            only,
+        )
+        .expect("run_apply");
+        String::from_utf8(out).expect("utf8")
     }
 
     /// 最省事的「一个 agents-dir skill」清单。
@@ -740,5 +835,115 @@ mod tests {
         assert!(out.contains("! undeliverable  skill/foo"), "{out}");
         assert!(out.contains("kimi-code 无用户级 skills 目录"), "{out}");
         assert!(!t.path(".kimi-code/skills").exists());
+    }
+
+    /// Review Focus 4：`--harness` 只收窄**目标**。没被点名的家一个字节都不写。
+    /// （「源扫描不跟着关掉」那条在 `tests/bundle_end_to_end.rs` 里以公开入口的形态钉。）
+    #[test]
+    fn harness_narrows_the_targets_only() {
+        let t = TempHome::new();
+        t.write(".agents/skills/foo/SKILL.md", "# foo");
+        t.mkdir(".claude").mkdir(".codex");
+
+        let out = apply_with(&t, one_skill_manifest(), false, Some("codex"));
+
+        assert!(t.path(".codex/skills/foo").exists(), "{out}");
+        assert!(
+            !t.path(".claude/skills/foo").exists(),
+            "没被点名的家一个字节都不该写：\n{out}"
+        );
+    }
+
+    /// Review Focus 2：没给 `--prune` 时，清单里已经不要的条目**一个都不删**，
+    /// 账本也不动——这是不变式，不是默认值。
+    #[test]
+    fn apply_without_prune_never_deletes_a_drifted_copy() {
+        let t = TempHome::new();
+        t.write(".agents/skills/foo/SKILL.md", "# foo");
+        t.mkdir(".codex");
+        apply_with(&t, one_skill_manifest(), false, Some("codex"));
+        assert!(t.path(".codex/skills/foo").exists(), "先交付到盘上");
+
+        // 清单里去掉 foo，再跑一次**不带** `--prune` 的 apply。
+        let out = apply_with(&t, "version: 1\n", false, Some("codex"));
+
+        assert!(
+            t.path(".codex/skills/foo").exists(),
+            "没给 --prune 就不许删：\n{out}"
+        );
+        assert!(!out.contains("removed"), "{out}");
+        let ledger = crate::store::provenance::Ledger::load(&t.home).unwrap();
+        assert!(
+            ledger.find(CODEX, Kind::Skill, "foo").is_some(),
+            "账本也不许动"
+        );
+    }
+
+    /// 正路：`--prune` 删掉账本记着的那一条，非账本的 drift 逐字节不动。
+    /// 端到端那条在 `tests/prune_end_to_end.rs` 里再走一遍公开入口。
+    #[test]
+    fn prune_deletes_only_what_the_ledger_records() {
+        let t = TempHome::new();
+        t.write(".agents/skills/foo/SKILL.md", "# foo");
+        t.mkdir(".codex");
+        t.write(".codex/skills/handmade/SKILL.md", "# handmade");
+        apply_with(&t, one_skill_manifest(), false, Some("codex"));
+        let handmade = std::fs::read(t.path(".codex/skills/handmade/SKILL.md")).unwrap();
+
+        let out = apply_with(&t, "version: 1\n", true, Some("codex"));
+
+        assert!(out.contains("removed skill/foo"), "{out}");
+        assert!(!t.path(".codex/skills/foo").exists(), "账本记着的要删掉");
+        assert!(
+            t.path(".codex/skills/handmade").exists(),
+            "非账本的 drift 不许动"
+        );
+        assert_eq!(
+            std::fs::read(t.path(".codex/skills/handmade/SKILL.md")).unwrap(),
+            handmade,
+            "逐字节不变"
+        );
+        let ledger = crate::store::provenance::Ledger::load(&t.home).unwrap();
+        assert!(
+            ledger.find(CODEX, Kind::Skill, "foo").is_none(),
+            "删成功要把账本落盘"
+        );
+    }
+
+    /// 确认文案必须说清这次会删东西——删除不可逆（§9.7 没有回滚命令）。
+    /// 这里顺手把「拒绝之后什么都不发生」也钉住。
+    #[test]
+    fn the_prompt_says_how_many_items_will_be_deleted() {
+        struct Recorder(Vec<String>);
+        impl Confirm for Recorder {
+            fn ask(&mut self, prompt: &str) -> bool {
+                self.0.push(prompt.to_string());
+                false
+            }
+        }
+
+        let t = TempHome::new();
+        t.write(".agents/skills/foo/SKILL.md", "# foo");
+        t.mkdir(".codex");
+        apply_with(&t, one_skill_manifest(), false, Some("codex"));
+
+        t.write("env.yaml", "version: 1\n");
+        let mut out = Vec::new();
+        let mut rec = Recorder(Vec::new());
+        run_apply(
+            &t.path("env.yaml"),
+            &t.home,
+            &mut out,
+            &mut rec,
+            true,
+            Some("codex"),
+        )
+        .unwrap();
+
+        assert_eq!(rec.0, vec!["将向 codex 交付，最多删除 1 项。继续？"]);
+        assert!(
+            t.path(".codex/skills/foo").exists(),
+            "拒绝之后什么都不该发生"
+        );
     }
 }

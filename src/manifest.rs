@@ -101,6 +101,20 @@ pub struct PluginEntry {
     pub degrade: DegradePolicy,
     #[serde(default)]
     pub targets: Targets,
+    /// 从哪一家的**已安装 bundle** 取内容。
+    ///
+    /// **写了就是请求拆解**（§9.5）：交付目标 = `targets` − 这家。不拿
+    /// 「`degrade:` 写没写」当开关——`degrade` 是 `#[serde(default)]` 的，
+    /// 代码区分不出「没写」与「写了空的」，而这里是 `Option`，`Some`/`None`
+    /// 天然就是二分。
+    ///
+    /// 值必须是 [`KNOWN_HARNESSES`] 之一，校验期就拒；**能不能定位到是另一件事**，
+    /// 那是运行时的判决（定位不到整条 undeliverable，见 §9.5）。
+    ///
+    /// 不许从「哪些 harness 装了它」反推：本机同一个 plugin 可以有 3 份、2 个版本，
+    /// 反推必然挑错版本。
+    #[serde(default)]
+    pub source_harness: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -585,6 +599,18 @@ impl Manifest {
             reject_blank(&at, "marketplace", p.marketplace.as_deref(), &mut e);
             reject_blank(&at, "entry", p.entry.as_deref(), &mut e);
             reject_blank(&at, "repo", p.repo.as_deref(), &mut e);
+            // §9.5：`source_harness:` 的值域就是已知 harness 名。
+            // 这里**只**判值域，不判「那家装没装这个 plugin」——那是运行时的判决，
+            // 而且它的失败理由完全不同（「claude-code 没装」要用户去装，
+            // 「claude_code 拼错了」要用户去改清单）。
+            if let Some(s) = &p.source_harness {
+                if !KNOWN_HARNESSES.contains(&s.as_str()) {
+                    e.push(format!(
+                        "{at}: `source_harness` must be one of {} (got `{s}`)",
+                        KNOWN_HARNESSES.join(", ")
+                    ));
+                }
+            }
             match p.source {
                 PluginSourceKind::ClaudeMarketplace => {
                     if p.marketplace.is_none() {
@@ -1079,6 +1105,46 @@ plugins:
             .unwrap_err()
             .to_string();
         assert!(err.contains("cursor"), "{err}");
+    }
+
+    /// §9.5 的开关：`source_harness:` 的**存在本身就是拆解请求**。
+    /// 没写 = `None` = 不拆解，它只做版本对账。
+    #[test]
+    fn a_plugin_without_source_harness_parses_to_none() {
+        let m = Manifest::parse(
+            "version: 1\n\n\
+             plugins:\n  superpowers:\n    source: claude-marketplace\n    marketplace: official\n    entry: superpowers\n",
+        )
+        .expect("没写 source_harness 是正常清单");
+        assert_eq!(m.plugins["superpowers"].source_harness, None);
+    }
+
+    #[test]
+    fn source_harness_round_trips() {
+        let m = Manifest::parse(
+            "version: 1\n\n\
+             plugins:\n  superpowers:\n    source: claude-marketplace\n    marketplace: official\n    entry: superpowers\n    source_harness: codex\n",
+        )
+        .expect("codex 是已知 harness");
+        assert_eq!(
+            m.plugins["superpowers"].source_harness.as_deref(),
+            Some("codex")
+        );
+    }
+
+    /// 拼错的家必须在**校验期**就被拒，不能拖到运行时当成「没装」——
+    /// `claud-code` 与「claude-code 没装这个 plugin」是两件完全不同的事，
+    /// 后者要用户去修安装，前者要用户去修清单。
+    #[test]
+    fn rejects_an_unknown_source_harness() {
+        let e = Manifest::parse(
+            "version: 1\n\n\
+             plugins:\n  p:\n    source: claude-marketplace\n    marketplace: official\n    entry: p\n    source_harness: claude_code\n",
+        )
+        .expect_err("下划线不是已知 harness 的拼法");
+        let msg = format!("{e:#}");
+        assert!(msg.contains("source_harness"), "{msg}");
+        assert!(msg.contains("claude-code"), "消息要点名合法取值：{msg}");
     }
 
     #[test]

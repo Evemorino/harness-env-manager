@@ -41,7 +41,15 @@ fn run_diff_to_string(t: &TempHome) -> String {
 fn run_apply_to_string(t: &TempHome) -> String {
     let mut out = Vec::new();
     let mut confirm = AssumeYes;
-    henv::run_apply(&t.path("env.yaml"), &t.home, &mut out, &mut confirm).expect("run_apply");
+    henv::run_apply(
+        &t.path("env.yaml"),
+        &t.home,
+        &mut out,
+        &mut confirm,
+        false,
+        None,
+    )
+    .expect("run_apply");
     String::from_utf8(out).expect("utf8")
 }
 

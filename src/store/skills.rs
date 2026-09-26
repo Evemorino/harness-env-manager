@@ -38,6 +38,23 @@ pub struct ResolvedContent {
     pub stale: Option<String>,
 }
 
+/// 一个被定位到的 bundle：它在盘上的根，以及该写进账本的来源标识（§9.5）。
+///
+/// 这是拆解那一步的产物、内容层的入参——所以类型住在这里而不是 `decompose`：
+/// 内容层声明它**需要什么**，拆解那一步负责**给出来**。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocatedBundle {
+    /// 源 harness 的安装记录里写的安装根目录。
+    pub install_path: PathBuf,
+    /// `bundle@<来源>@<版本>@<sha>`，缺段省略（纯展示串，见 `decompose::bundle_source_id`）。
+    pub source_id: String,
+}
+
+/// plugin 身份 → 定位到的 bundle。拆解没定位到的条目**不在表里**——
+/// 那时内容层该报的是「这个 bundle 没定位到」，而那条已经由 `Kind::Plugin` 的
+/// `undeliverable` 行说了（§9.5），这里不必再说一遍。
+pub type BundleTable = BTreeMap<String, LocatedBundle>;
+
 /// 目标侧一个 skill 的内容。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetContent {
@@ -50,7 +67,7 @@ pub enum TargetContent {
 
 /// `compute` 的内容层入参。
 ///
-/// 三个空表的 `Default` 让 Plan A 的行为**逐字节**保持——那是既有 306 条测试的前提，
+/// 四个空表的 `Default` 让 Plan A 的行为**逐字节**保持——那是既有 306 条测试的前提，
 /// 也是本计划能小步落地的基础。
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ContentIndex {
@@ -63,6 +80,13 @@ pub struct ContentIndex {
     /// 与 `sources` 是两个集合：一条源要么在 `sources`（有内容可比），要么在
     /// `unresolved`（没有内容，且这本身是一件要报告的事），不会两边都在。
     pub unresolved: BTreeMap<CapId, Unresolved>,
+    /// plugin 身份 → 报告注记（§9.5「装不下的部分」：bundle 里的 hooks/commands/
+    /// agents/MCP 只探了存在性，没拆）。
+    ///
+    /// 它**不参与任何判决**，只跟着那条目拆出来的 skill 行出现在报告里——
+    /// 「它们进的是该条目的报告说明，不是 diff 行」。与 `sources`/`unresolved`/
+    /// `targets` 一样，空表时行为与 Plan A 逐字节相同。
+    pub notes: BTreeMap<String, String>,
 }
 
 /// §9.2 第 1 步：全局来源解析。
@@ -78,6 +102,7 @@ pub fn resolve_sources(
     desired: &[Capability],
     home: &Home,
     mode: SourceMode,
+    bundles: &BundleTable,
 ) -> anyhow::Result<ContentIndex> {
     let mut out = ContentIndex::default();
     for cap in desired {
@@ -102,9 +127,25 @@ pub fn resolve_sources(
                 path,
                 git_ref,
             } => resolve_git(&mut out, cap, repo, path.as_deref(), git_ref, home, mode)?,
-            // PluginBundle（B3）：不是今天的事，安静跳过——它连「henv 该去哪取」
-            // 都还没定义，报出来只会让人以为是自己清单写错了。
-            SkillSource::PluginBundle { .. } => {}
+            // §9.5：拆解出的 skill 的内容来自**定位到的 bundle**。
+            // 路径从表里重算，不读 `Spec::Skill.path`——表是「这个 bundle 在哪」的
+            // 唯一权威（它是定位那一步的产物），而清单侧的 `path` 按约定是 `None`。
+            SkillSource::PluginBundle { plugin } => match bundles.get(plugin) {
+                Some(b) => resolve_one(
+                    &mut out,
+                    cap,
+                    b.install_path.join("skills").join(&cap.id.name),
+                    b.source_id.clone(),
+                )?,
+                None => {
+                    out.unresolved.insert(
+                        cap.id.clone(),
+                        Unresolved::Failed(format!(
+                            "plugin `{plugin}` 的 bundle 没有定位到，取不到它的内容（§9.5）"
+                        )),
+                    );
+                }
+            },
             SkillSource::Unknown => {}
         }
     }
@@ -283,6 +324,7 @@ mod tests {
             &[desired("foo", SkillSource::AgentsDir)],
             &t.home,
             SourceMode::Fetch,
+            &BundleTable::new(),
         )
         .unwrap();
         let r = idx
@@ -303,6 +345,7 @@ mod tests {
             &[desired("bar", SkillSource::Local { path: dir.clone() })],
             &t.home,
             SourceMode::Fetch,
+            &BundleTable::new(),
         )
         .unwrap();
         let r = idx
@@ -351,7 +394,8 @@ mod tests {
                 },
             ),
         ];
-        let idx = resolve_sources(&wanted, &t.home, SourceMode::Fetch).unwrap();
+        let idx =
+            resolve_sources(&wanted, &t.home, SourceMode::Fetch, &BundleTable::new()).unwrap();
         assert!(
             idx.sources.is_empty(),
             "一个都不该解析出来，实际 {:?}",
@@ -374,9 +418,12 @@ mod tests {
             "git 源取不到也要登记"
         );
         assert!(
-            !idx.unresolved
-                .contains_key(&CapId::new(Kind::Skill, "from-bundle")),
-            "bundle 源是 B3 的范围，今天不该出现在报告里"
+            matches!(
+                idx.unresolved.get(&CapId::new(Kind::Skill, "from-bundle")),
+                Some(Unresolved::Failed(r)) if r.contains("superpowers")
+            ),
+            "bundle 源没定位到也要有名有姓地记着（§9.5），实际 {:?}",
+            idx.unresolved.get(&CapId::new(Kind::Skill, "from-bundle"))
         );
     }
 
@@ -398,6 +445,7 @@ mod tests {
             )],
             &t.home,
             SourceMode::Fetch,
+            &BundleTable::new(),
         )
         .unwrap();
 
@@ -429,6 +477,7 @@ mod tests {
             )],
             &t.home,
             SourceMode::Cached,
+            &BundleTable::new(),
         )
         .unwrap();
 
@@ -450,6 +499,7 @@ mod tests {
             &[desired("bad-local", SkillSource::Local { path: t.path("nope") })],
             &t.home,
             SourceMode::Fetch,
+            &BundleTable::new(),
         )
         .unwrap();
         assert!(matches!(
@@ -473,10 +523,22 @@ mod tests {
                 git_ref: "main".into(),
             },
         );
-        resolve_sources(std::slice::from_ref(&cap), &t.home, SourceMode::Fetch).unwrap();
+        resolve_sources(
+            std::slice::from_ref(&cap),
+            &t.home,
+            SourceMode::Fetch,
+            &BundleTable::new(),
+        )
+        .unwrap();
 
         std::fs::remove_dir_all(&repo.dir).unwrap();
-        let idx = resolve_sources(std::slice::from_ref(&cap), &t.home, SourceMode::Fetch).unwrap();
+        let idx = resolve_sources(
+            std::slice::from_ref(&cap),
+            &t.home,
+            SourceMode::Fetch,
+            &BundleTable::new(),
+        )
+        .unwrap();
         let r = idx
             .sources
             .get(&CapId::new(Kind::Skill, "foo"))
@@ -518,6 +580,7 @@ mod tests {
             ],
             &t.home,
             SourceMode::Fetch,
+            &BundleTable::new(),
         )
         .expect("一个源被拒不该让整次解析报错");
 
@@ -540,7 +603,7 @@ mod tests {
         let t = TempHome::new();
         let mcp = FakeAdapter::mcp("context7", "npx");
         assert!(
-            resolve_sources(&[mcp], &t.home, SourceMode::Fetch)
+            resolve_sources(&[mcp], &t.home, SourceMode::Fetch, &BundleTable::new())
                 .unwrap()
                 .sources
                 .is_empty()
@@ -589,6 +652,7 @@ mod tests {
             &[desired("foo", SkillSource::AgentsDir)],
             &t.home,
             SourceMode::Fetch,
+            &BundleTable::new(),
         )
         .unwrap();
         let tgt = target_content(&[actual("foo", t.path(".claude/skills/foo"))]).unwrap();
@@ -606,5 +670,93 @@ mod tests {
         let idx = ContentIndex::default();
         assert!(idx.sources.is_empty());
         assert!(idx.targets.is_empty());
+    }
+
+    /// §9.5「交付什么」：拆解出的 skill 的内容来自**定位到的 bundle**，
+    /// 不是清单声明的路径（清单只声明了 `source_harness:`，没声明任何一个 skill）。
+    #[test]
+    fn a_plugin_bundle_skill_resolves_from_the_located_bundle() {
+        let t = TempHome::new();
+        t.write("bundle/skills/foo/SKILL.md", "hello\n");
+
+        let cap = Capability {
+            id: CapId::new(Kind::Skill, "foo"),
+            origin: Origin::Plugin {
+                name: "superpowers".into(),
+            },
+            spec: Spec::Skill {
+                source: SkillSource::PluginBundle {
+                    plugin: "superpowers".into(),
+                },
+                path: None,
+            },
+            targets: Targets::All,
+        };
+        let mut bundles = BundleTable::new();
+        bundles.insert(
+            "superpowers".to_string(),
+            LocatedBundle {
+                install_path: t.path("bundle"),
+                source_id: "bundle@claude-code@6.4.1".into(),
+            },
+        );
+
+        let idx = resolve_sources(
+            std::slice::from_ref(&cap),
+            &t.home,
+            SourceMode::Cached,
+            &bundles,
+        )
+        .unwrap();
+
+        let r = idx.sources.get(&cap.id).expect("要解析出内容");
+        assert_eq!(r.path, t.path("bundle/skills/foo"));
+        assert_eq!(r.source_id, "bundle@claude-code@6.4.1");
+        assert!(idx.unresolved.is_empty());
+    }
+
+    /// 表里没有这条 → 解析不出来，**理由要说是 bundle 没定位到**。
+    /// 这条路径今天达不到（定位失败时拆解压根不产出能力），但它是内容层的
+    /// 不变量：不许把「表里没有」静默成「源目录不存在」。
+    #[test]
+    fn a_plugin_bundle_skill_without_a_location_is_unresolved() {
+        let t = TempHome::new();
+        let cap = Capability {
+            id: CapId::new(Kind::Skill, "foo"),
+            origin: Origin::Plugin {
+                name: "superpowers".into(),
+            },
+            spec: Spec::Skill {
+                source: SkillSource::PluginBundle {
+                    plugin: "superpowers".into(),
+                },
+                path: None,
+            },
+            targets: Targets::All,
+        };
+        let idx = resolve_sources(
+            std::slice::from_ref(&cap),
+            &t.home,
+            SourceMode::Cached,
+            &BundleTable::new(),
+        )
+        .unwrap();
+
+        assert!(idx.sources.is_empty());
+        match idx.unresolved.get(&cap.id) {
+            Some(Unresolved::Failed(r)) => assert!(r.contains("superpowers"), "{r}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// 四个空表的 `Default`：Plan A 的行为**逐字节**保持（这是既有 306 条测试的前提，
+    /// 也是本计划能小步落地的基础）。加 `notes` 是第四个空表，不是第四种行为。
+    #[test]
+    fn an_empty_content_index_is_still_default() {
+        let idx = ContentIndex::default();
+        assert!(idx.sources.is_empty());
+        assert!(idx.targets.is_empty());
+        assert!(idx.unresolved.is_empty());
+        assert!(idx.notes.is_empty());
     }
 }

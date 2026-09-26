@@ -8,13 +8,20 @@ use std::fmt::Write as _;
 const NAME_WIDTH: usize = 13;
 /// 动作前缀列宽。`+ install`/`~ update`/`- drift`/`✓ in-sync` 都对齐到 11 列。
 const ACTION_WIDTH: usize = 11;
+/// §9.5 全局段的段名。宽度与 harness 名一致，好让动作列对齐。
+const GLOBAL_SECTION: &str = "(global)";
 
 pub fn render(plan: &Plan) -> String {
     let mut out = String::new();
     for h in &plan.harnesses {
         render_harness(h, &mut out);
     }
-    if !plan.harnesses.is_empty() {
+    // §9.5 全局段：挂不进任何 harness 节的条目（一家 harness 都没装时那条
+    // `undeliverable`）。没有它，这一行会被静默丢掉。空的时候输出逐字节不变。
+    if !plan.unattached.is_empty() {
+        render_unattached(&plan.unattached, &mut out);
+    }
+    if !plan.harnesses.is_empty() || !plan.unattached.is_empty() {
         out.push('\n');
     }
     let c = plan.counts();
@@ -48,12 +55,25 @@ fn render_harness(h: &HarnessPlan, out: &mut String) {
         return;
     }
 
+    render_entries(&pending, &head, out);
+}
+
+/// §9.5 的全局段：挂不进任何 harness 节的条目。段名不是 harness，落在
+/// `render_harness` 之外的这一段里，好让人一眼看出「这条不属于任何一家」。
+fn render_unattached(entries: &[PlanEntry], out: &mut String) {
+    let head = format!("{:<NAME_WIDTH$} ", GLOBAL_SECTION);
+    let pending: Vec<&PlanEntry> = entries.iter().collect();
+    render_entries(&pending, &head, out);
+}
+
+/// 逐条渲染一个节的待办行。`head` 是该节首行的名字列（含对齐），后续行用等宽缩进。
+fn render_entries(pending: &[&PlanEntry], head: &str, out: &mut String) {
     let mut i = 0;
     while i < pending.len() {
         let e = pending[i];
         i += 1;
-        // lead：该 harness 的首行带名字，后续行用等宽缩进对齐。
-        let lead = if i == 1 { head.clone() } else { indent() };
+        // lead：该节的首行带名字，后续行用等宽缩进对齐。
+        let lead = if i == 1 { head.to_string() } else { indent() };
         match &e.action {
             // install 无附加说明，合并成一行；diff 已按 label 排好序，故连续。
             // **带注记的 install 不参与合并**：合并行没有地方放注记，一旦并进去
@@ -95,12 +115,16 @@ fn render_harness(h: &HarnessPlan, out: &mut String) {
                 let _ = writeln!(out, "{}", with_note(line, e.note.as_ref()));
             }
             Action::Drift => {
+                // 括号里那句话由 `compute` 按账本给出（「--prune 可删」/「只报不删」）——
+                // 它预告的是 `--prune` 会做什么，写死在这里就必然与 `prune_plan` 的
+                // 判据分家（§9.3 不变式二）。没有注记时退回中性说法。
+                let reason = e.note.as_deref().unwrap_or("未在清单中");
                 let line = format!(
-                    "{lead}{}{} (未在清单中，--prune 可删)",
+                    "{lead}{}{} ({reason})",
                     action_cell("- drift"),
                     e.id.label()
                 );
-                let _ = writeln!(out, "{}", with_note(line, e.note.as_ref()));
+                let _ = writeln!(out, "{line}");
             }
             Action::Unknown => {
                 let line = format!(
@@ -114,6 +138,16 @@ fn render_harness(h: &HarnessPlan, out: &mut String) {
                 let line = format!(
                     "{lead}{}{} ({reason})",
                     action_cell("! conflict"),
+                    e.id.label()
+                );
+                let _ = writeln!(out, "{}", with_note(line, e.note.as_ref()));
+            }
+            // §9.8：`--prune` 的删除行。它与 drift 是两回事——drift 只说「清单里没有」，
+            // 这一行说的是「这次会真的删掉，因为账本记着它是 henv 放的」。
+            Action::Remove => {
+                let line = format!(
+                    "{lead}{}{} (从 henv 账本移除)",
+                    action_cell("- remove"),
                     e.id.label()
                 );
                 let _ = writeln!(out, "{}", with_note(line, e.note.as_ref()));
@@ -195,6 +229,7 @@ mod tests {
     /// kimi-code 有 install/drift。
     fn spec_plan() -> Plan {
         Plan {
+            unattached: Vec::new(),
             harnesses: vec![
                 hp(
                     "claude-code",
@@ -231,7 +266,10 @@ mod tests {
                     true,
                     vec![
                         pe(Kind::Mcp, "context7", Action::Install),
-                        pe(Kind::Mcp, "experimental-thing", Action::Drift),
+                        // §9.8 的例子：这是用户**手配**的一条（不在账本里），所以提示是
+                        // 「只报不删」——`--prune` 只删 henv 自己交付过的。
+                        pe(Kind::Mcp, "experimental-thing", Action::Drift)
+                            .with_note(Some("未在清单中，只报不删".into())),
                     ],
                     vec![(Kind::Mcp, 1)],
                 ),
@@ -290,6 +328,7 @@ mod tests {
         // 只要有一个是 0，交换它与相邻种类的排列就检不出来（0 计数会被跳过）。
         // 这条是 `Kind::all()` 顺序在 Task 2 之外的第二道闸，两道都要在。
         let plan = Plan {
+            unattached: Vec::new(),
             harnesses: vec![hp(
                 "codex",
                 true,
@@ -320,6 +359,7 @@ mod tests {
     #[test]
     fn in_sync_entries_render_only_the_summary_line() {
         let plan = Plan {
+            unattached: Vec::new(),
             harnesses: vec![hp(
                 "claude-code",
                 true,
@@ -348,6 +388,7 @@ mod tests {
     #[test]
     fn empty_harness_says_nothing_installed() {
         let plan = Plan {
+            unattached: Vec::new(),
             harnesses: vec![hp("codex", true, vec![], vec![])],
         };
         assert!(render(&plan).contains("codex         ✓ in-sync  (nothing installed)\n"));
@@ -356,6 +397,7 @@ mod tests {
     #[test]
     fn undetected_harness_is_reported_not_listed_as_install() {
         let plan = Plan {
+            unattached: Vec::new(),
             harnesses: vec![hp(
                 "codex",
                 false,
@@ -381,6 +423,7 @@ mod tests {
     fn undeliverable_prefix_is_not_padded_to_eleven() {
         // `! undeliverable` 是 15 字符，超过 11 列宽 → 退化为两空格分隔（spec 示例形态）。
         let plan = Plan {
+            unattached: Vec::new(),
             harnesses: vec![hp(
                 "kimi-code",
                 true,
@@ -401,12 +444,30 @@ mod tests {
         );
     }
 
+    /// drift 行括号里那句话由 `compute` 按账本给出（「--prune 可删」/「只报不删」），
+    /// render 只负责排版：它手上没有账本，写死一句就必然与 `prune_plan` 的判据分家
+    /// （§9.3 不变式二）。
     #[test]
-    fn drift_line_carries_the_prune_hint() {
+    fn drift_line_takes_its_parenthetical_from_the_entry_note() {
         let out = render(&spec_plan());
         assert!(
-            out.contains("- drift    mcp/experimental-thing (未在清单中，--prune 可删)\n"),
+            out.contains("- drift    mcp/experimental-thing (未在清单中，只报不删)\n"),
             "{out}"
+        );
+
+        // 没有注记时退回中性说法，而不是凭空断言「可删」。
+        let bare = Plan {
+            harnesses: vec![HarnessPlan {
+                harness: "kimi-code".into(),
+                detected: true,
+                entries: vec![pe(Kind::Mcp, "experimental-thing", Action::Drift)],
+                actual_by_kind: BTreeMap::new(),
+            }],
+            unattached: Vec::new(),
+        };
+        assert!(
+            render(&bare).contains("- drift    mcp/experimental-thing (未在清单中)\n"),
+            "{bare:#?}"
         );
     }
 
@@ -442,6 +503,7 @@ mod tests {
     #[test]
     fn unknown_action_renders_a_line_with_question_mark() {
         let plan = Plan {
+            unattached: Vec::new(),
             harnesses: vec![hp(
                 "claude-code",
                 true,
@@ -465,6 +527,7 @@ mod tests {
     #[test]
     fn footer_counts_come_from_plan_and_include_conflicts() {
         let plan = Plan {
+            unattached: Vec::new(),
             harnesses: vec![hp(
                 "claude-code",
                 true,
@@ -505,6 +568,7 @@ mod tests {
     #[test]
     fn an_update_note_is_rendered_at_the_end_of_the_line() {
         let plan = Plan {
+            unattached: Vec::new(),
             harnesses: vec![hp(
                 "claude-code",
                 true,
@@ -536,6 +600,7 @@ mod tests {
     #[test]
     fn a_noted_install_is_not_merged_into_the_coalesced_line() {
         let plan = Plan {
+            unattached: Vec::new(),
             harnesses: vec![hp(
                 "claude-code",
                 true,
@@ -564,6 +629,7 @@ mod tests {
     #[test]
     fn a_noted_in_sync_is_not_folded_into_the_summary() {
         let plan = Plan {
+            unattached: Vec::new(),
             harnesses: vec![hp(
                 "claude-code",
                 true,
@@ -587,6 +653,7 @@ mod tests {
     #[test]
     fn a_note_does_not_break_install_coalescing() {
         let plan = Plan {
+            unattached: Vec::new(),
             harnesses: vec![hp(
                 "claude-code",
                 true,
@@ -615,6 +682,7 @@ mod tests {
     #[test]
     fn conflicts_render_before_installs() {
         let plan = Plan {
+            unattached: Vec::new(),
             harnesses: vec![hp(
                 "claude-code",
                 true,
@@ -633,5 +701,49 @@ mod tests {
         let conflict_at = out.find("! conflict").expect("conflict line");
         let install_at = out.find("+ install").expect("install line");
         assert!(conflict_at < install_at, "{out}");
+    }
+
+    /// §9.5 全局段：`unattached` 的行要渲染出来，段名 `(global)`。
+    ///
+    /// 这是「一家 harness 都没装」时那条 `undeliverable` 唯一的去处。没有全局段，
+    /// 它会被静默丢掉——`diff` 报 `0 undeliverable`，用户以为一切正常。
+    #[test]
+    fn an_unattached_entry_renders_under_the_global_section() {
+        let plan = Plan {
+            harnesses: vec![hp("codex", false, Vec::new(), Vec::new())],
+            unattached: vec![pe(
+                Kind::Plugin,
+                "superpowers",
+                Action::Undeliverable {
+                    reason: "源家没装".into(),
+                },
+            )],
+        };
+        let out = render(&plan);
+        assert!(out.contains("(global)"), "{out}");
+        assert!(out.contains("! undeliverable"), "{out}");
+        assert!(out.contains("plugin/superpowers"), "{out}");
+        assert!(
+            out.contains("1 undeliverable"),
+            "汇总要把全局段数进去：{out}"
+        );
+    }
+
+    /// §9.8：`- remove` 行。前缀必须与其余动作列对齐（与 golden 里
+    /// `- drift    ...` 同一套 `action_cell`）。
+    #[test]
+    fn a_remove_entry_renders_with_its_own_prefix() {
+        let plan = Plan {
+            harnesses: vec![hp(
+                "claude-code",
+                true,
+                vec![pe(Kind::Skill, "gone", Action::Remove)],
+                Vec::new(),
+            )],
+            unattached: Vec::new(),
+        };
+        let out = render(&plan);
+        assert!(out.contains("- remove   skill/gone"), "{out}");
+        assert!(out.contains("1 remove"), "汇总要数得到删除：{out}");
     }
 }

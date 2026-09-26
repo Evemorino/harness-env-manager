@@ -1,5 +1,5 @@
 use crate::adapters::claude_code::{
-    expect_bool, expect_object, expect_string, mcp_capability, optional_array, optional_object,
+    expect_object, expect_string, mcp_capability, optional_array, optional_bool, optional_object,
     optional_string, read_json_if_present,
 };
 use crate::adapters::{HarnessAdapter, KIMI_CODE};
@@ -77,14 +77,18 @@ impl KimiCode {
                 id: id.to_string(),
                 // `root` 是可选位：没写不是坏配置，只是没有 bundle 可扫（`install_path: None`）。
                 root: optional_string(record, "root", &file, &context)?.map(PathBuf::from),
-                // `enabled` 走第七个形状原语 `expect_bool`，**两步分开**：
-                // 「缺键 = 未表态 = 启用」（与 claude 的门禁默认、codex 的 `toml_optional_bool`
-                // 默认同语义），「键在但不是布尔」是故障。写成
-                // `.and_then(Value::as_bool).unwrap_or(true)` 就把用户关掉的 plugin 报成已启用。
-                enabled: match record.get("enabled") {
-                    Some(v) => expect_bool(v, &file, &format!("{context} field `enabled`"))?,
-                    None => true,
-                },
+                // `enabled` 走第七个形状原语 `optional_bool`，**两步分开**：
+                // 「缺键 = 未表态 = 启用」（与 claude 的门禁默认、codex 的
+                // `toml_optional_bool` 默认同语义），「显式 `null` = 同样没表态」，
+                // 「键在但不是布尔」才是故障。三者必须分开——写成一个
+                // `.and_then(Value::as_bool).unwrap_or(true)` 就把用户关掉的 plugin
+                // 报成已启用，写成一个裸 `expect_bool` 就把合法的 `null` 报成坏文件。
+                enabled: optional_bool(
+                    record.get("enabled"),
+                    &file,
+                    &format!("{context} field `enabled`"),
+                )?
+                .unwrap_or(true),
                 marketplace,
                 version,
                 sha,
@@ -146,8 +150,9 @@ impl KimiCode {
     /// kimi 没有用户级 skills 目录：skill 只随 plugin bundle 分发在
     /// `<root>/skills/`（spec §2.1 第 4 条）。所以这里的来源一律是
     /// `SkillSource::PluginBundle` + `Origin::Plugin`，而不是 claude/codex 那两家的
-    /// `Adopted`——Task 12 的 `supports()` 例外正认这一位：`Origin::Plugin` 的 bundle
-    /// skill 判 Native，其余（散装）skill 判 Unsupported。
+    /// `Adopted`。扫出来的每条都是**现状**（`Origin::Plugin` 表示「随着那个 plugin 装进来的」），
+    /// 不是「henv 能往 kimi 写 skill」的证据——kimi 没有用户级 skills 目录，
+    /// `supports()` 对这类能力一律 `Unsupported`（§9.5）。
     ///
     /// 返回 `Result` 而不是计划示例里的 `Vec`：生产入口 `try_read_skill_entries` 可失败，
     /// 把「读不出这个目录」吞成空表就是破坏失败隔离契约。
@@ -243,16 +248,19 @@ impl HarnessAdapter for KimiCode {
         })
     }
 
+    /// kimi 原生接纳 MCP 与 Plugin 两种 kind；Skill/Hook/Command/Agent 在这家
+    /// **没有用户级落点**，一律 `Unsupported`——**不论它来自哪里**。
+    ///
+    /// 判据是「这家有没有那个目录」，不是「它是不是来自 bundle」
+    /// （`Origin::Plugin` 曾经在这里换到 `Native`，那是错的：kimi 的
+    /// `skills_target_dir()` 是 `None`，判 `Native` 会让 `deliver_skills`
+    /// 提前返回空报告，报告写着 `+ install` 而盘上什么都没写）。
+    /// 拆解出的 skill 正是带着 `Origin::Plugin` 来的，所以这条判据必须落对。
     fn supports(&self, cap: &Capability) -> Support {
-        // bundle 携带的能力随 kimi 原生 plugin 安装一起落地
-        // （实测 kimi 读 .kimi-plugin/plugin.json 的 skills / sessionStart）
-        if matches!(cap.origin, Origin::Plugin { .. }) {
-            return Support::Native;
-        }
         match cap.id.kind {
             Kind::Mcp | Kind::Plugin => Support::Native,
             Kind::Skill => Support::Unsupported {
-                reason: "kimi-code 无用户级 skills 目录，散装 skill 只能随 plugin bundle 分发"
+                reason: "kimi-code 无用户级 skills 目录，拆解出的 skill 在它这儿没有落点"
                     .to_string(),
             },
             Kind::Hook => Support::Unsupported {
@@ -497,6 +505,33 @@ mod tests {
         let caps = KimiCode::new(t.home.clone()).read_state().unwrap();
         match &find(&caps, Kind::Plugin, "p").unwrap().spec {
             Spec::Plugin { enabled, .. } => assert!(*enabled, "缺键是没表态，不是「已禁用」"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `enabled: null` 是合法的「没表态」——不是布尔、也不是坏值。
+    /// 今天它走 `expect_bool` 硬错，`read_plugins` 整个上抛：
+    /// 写坏一条记录，这家**一个 plugin 都读不出来**——而这条记录恰恰是
+    /// `source_harness: kimi-code` 要去定位的那一条。
+    #[test]
+    fn a_null_enabled_reads_as_unset_not_as_a_broken_record() {
+        let t = TempHome::new();
+        write_installed(
+            &t,
+            &installed_doc(r#"{ "id": "p", "root": "/nope", "enabled": null }"#),
+        );
+        let caps = KimiCode::new(t.home.clone())
+            .read_state()
+            .expect("null 是「没表态」，不是坏值");
+
+        let plugin = caps
+            .iter()
+            .find(|c| c.id == CapId::new(Kind::Plugin, "p"))
+            .expect("这条 plugin 必须读得出来");
+        match &plugin.spec {
+            Spec::Plugin { enabled, .. } => {
+                assert!(*enabled, "没表态 = 启用，与 claude/codex 同默认")
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -1178,10 +1213,15 @@ mod tests {
         }
     }
 
-    /// 同一个 kind（Skill），散装判 Unsupported，bundle 携带（`Origin::Plugin`）判 Native——
-    /// kimi 原生装 plugin 时会随 bundle 一起落地 skills（实测读 `.kimi-plugin/plugin.json`）。
+    /// §9.5 的 degrade 第一处生效点：kimi 作目标时，拆解出的 skill 判 `Unsupported`，
+    /// 由 `degrade.skills` 决定进报告还是静默丢弃。
+    ///
+    /// **判据落在「这家有没有用户级 skills 目录」，不是「它是不是来自 bundle」。**
+    /// kimi 没有；于是散装的与 bundle 里拆出来的同判——这正是 B3b 要修的那件事：
+    /// 旧行为凭 `Origin::Plugin` 判 `Native`，而 `skills_target_dir()` 是 `None`，
+    /// `deliver_skills` 会提前返回空报告，报告写着 `+ install skill/x`、盘上什么都没写。
     #[test]
-    fn loose_skill_is_refused_but_bundled_skill_is_native() {
+    fn every_skill_is_refused_because_kimi_has_no_user_level_skills_dir() {
         let t = TempHome::new();
         let a = KimiCode::new(t.home.clone());
 
@@ -1196,7 +1236,7 @@ mod tests {
         );
         assert!(matches!(a.supports(&loose), Support::Unsupported { .. }));
 
-        // 同一个 kind，但由 bundle 携带 → 随原生 plugin 安装一起落地
+        // 同一个 kind、来自 bundle 的 skill：**同样 Unsupported**。
         let bundled = Capability {
             id: CapId::new(Kind::Skill, "brainstorming"),
             origin: Origin::Plugin {
@@ -1210,13 +1250,25 @@ mod tests {
             },
             targets: Targets::All,
         };
-        assert_eq!(a.supports(&bundled), Support::Native);
+        match a.supports(&bundled) {
+            Support::Unsupported { reason } => assert!(
+                reason.contains("kimi-code") && reason.contains("skills"),
+                "理由要能自解释，且指的方向是「没有落点」：{reason}"
+            ),
+            other => panic!("bundle 里的 skill 也必须 Unsupported，得到 {other:?}"),
+        }
+        assert!(
+            a.skills_target_dir().is_none(),
+            "判据的依据就在这里：这家没有用户级 skills 目录"
+        );
     }
 
-    /// bundle 携带的 Hook 同样判 Native（kimi 读 `.kimi-plugin/plugin.json` 的
-    /// `sessionStart` 那一类配置），与散装 Hook 的 Unsupported 相对。
+    /// 同一条道理推到 Hook：`Origin::Plugin` 不授予任何特权。
+    /// `skills_target_dir()` 那条注释（`src/adapters/mod.rs`）说 kimi 的散装 skill
+    /// 「只能随 plugin bundle 分发」——那是**关于 kimi 怎么装东西**的事实，
+    /// 不是**关于 henv 能不能往里写**的事实。henv 不装原生 plugin（§9.1）。
     #[test]
-    fn bundled_hook_is_native_too() {
+    fn a_bundled_hook_is_refused_too() {
         let t = TempHome::new();
         let a = KimiCode::new(t.home.clone());
         let bundled_hook = Capability {
@@ -1230,6 +1282,9 @@ mod tests {
             },
             targets: Targets::All,
         };
-        assert_eq!(a.supports(&bundled_hook), Support::Native);
+        assert!(matches!(
+            a.supports(&bundled_hook),
+            Support::Unsupported { .. }
+        ));
     }
 }

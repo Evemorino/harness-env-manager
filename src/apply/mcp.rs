@@ -53,6 +53,7 @@ pub fn deliver_mcps(
     let mut report = HarnessReport {
         harness: harness.to_string(),
         delivered: Vec::new(),
+        removed: Vec::new(),
         failure: None,
     };
     let Some(target) = target else {
