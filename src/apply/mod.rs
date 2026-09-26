@@ -521,6 +521,7 @@ mod tests {
             &content,
             &Ledger::default(),
             &crate::lower::SourceHarnessTable::default(),
+            &crate::lower::SnapshotTable::default(),
         );
         (plan, desired, content)
     }

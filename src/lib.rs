@@ -142,6 +142,8 @@ pub(crate) fn plan_for(
     let mut desired = lower::lower(&manifest);
     let degrade = lower::DegradeTable::new(&manifest);
     let sources = lower::SourceHarnessTable::new(&manifest);
+    // §10.3：记录型 plugin 的逐家版本。与上面两张表同源、同一次清单解析。
+    let snapshots = lower::SnapshotTable::new(&manifest);
 
     let registry = adapters::registry(home);
     // §9.8 的 `--harness <name>`：**只过滤目标 pairs**。源扫描在下面，
@@ -223,7 +225,9 @@ pub(crate) fn plan_for(
     }
 
     let ledger = store::provenance::Ledger::load(home)?;
-    let plan = diff::compute(&desired, &inputs, &degrade, &content, &ledger, &sources);
+    let plan = diff::compute(
+        &desired, &inputs, &degrade, &content, &ledger, &sources, &snapshots,
+    );
     Ok(Planned {
         plan,
         desired,

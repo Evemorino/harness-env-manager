@@ -9,10 +9,10 @@
 
 use crate::adapters::HarnessAdapter;
 use crate::capability::{
-    CapId, Capability, Kind, Origin, SkillSource, Spec, Support, VersionMatch, compare_versions,
-    mcp_summary,
+    CapId, Capability, Kind, Origin, RecordedMatch, SkillSource, Spec, Support, VersionMatch,
+    compare_recorded_version, compare_versions, mcp_summary,
 };
-use crate::lower::{DegradeTable, SourceHarnessTable};
+use crate::lower::{DegradeTable, SnapshotTable, SourceHarnessTable};
 use crate::manifest::DegradeAction;
 use crate::store::hash::hash_mcp_spec;
 use crate::store::provenance::Ledger;
@@ -55,10 +55,28 @@ pub enum Action {
     Drift,
     /// 版本判不了（spec §2.1 第 3 条）：不改装、不报 update，但也**不**假装同步。
     Unknown,
+    /// 记录型 plugin（§10.3，`source: snapshot`）的对账行：清单记的版本与本机不符，
+    /// 或者本机根本没装。
+    ///
+    /// **不是可执行动作**：`apply` 只认 `install`/`update`/`remove`（`apply/mod.rs`
+    /// 的 filter），这个变体天然落在它外面——记录型条目一个字节都不写。`doctor` 把它
+    /// 算**警告**：记录与现实不符是提醒，不是门禁（本机没装它可以是正常状态）。
+    Snapshot {
+        /// 清单 `versions.<harness>` 记的那个串（原值，未归一）
+        recorded: String,
+        /// 本机 `version` 位；`None` = 本机没装。
+        /// 装着但版本读不出（codex 恒如此）走 `Incomparable`，**不产这一行**。
+        actual: Option<String>,
+    },
 }
 
 impl Action {
-    /// 输出分组顺序：conflict → remove → install → update → undeliverable → drift → unknown → in-sync
+    /// 输出分组顺序：conflict → remove → install → update → undeliverable → drift → unknown
+    /// → snapshot → in-sync
+    ///
+    /// `snapshot` 排在最后两个之间：它排在所有「盘上的事」之后（它不是盘面，
+    /// 是清单侧的记录），又必须排在 in-sync 之前（in-sync 会被折进汇总行，
+    /// 记录不符不能被折掉）。
     pub fn rank(&self) -> u8 {
         match self {
             Action::Conflict { .. } => 0,
@@ -68,7 +86,8 @@ impl Action {
             Action::Undeliverable { .. } => 4,
             Action::Drift => 5,
             Action::Unknown => 6,
-            Action::InSync => 7,
+            Action::Snapshot { .. } => 7,
+            Action::InSync => 8,
         }
     }
 }
@@ -140,6 +159,9 @@ pub struct Counts {
     pub undeliverable: usize,
     pub drift: usize,
     pub unknown: usize,
+    /// 记录型 plugin 的对账行。**不进 `is_clean()`**：`apply` 对它无事可做
+    /// （不是待办），但 `render` 的汇总行要数它——不然这行就没人看得见。
+    pub snapshot: usize,
 }
 
 impl Plan {
@@ -159,6 +181,7 @@ impl Plan {
                 Action::Undeliverable { .. } => c.undeliverable += 1,
                 Action::Drift => c.drift += 1,
                 Action::Unknown => c.unknown += 1,
+                Action::Snapshot { .. } => c.snapshot += 1,
                 Action::InSync => {}
             }
         }
@@ -486,6 +509,9 @@ const NO_NATIVE_INSTALL: &str =
 ///
 /// `sources` 是 §9.5 的旁路表：这一条 plugin 的内容从哪一家取。
 /// 它只回答「拆不拆、从哪拆」，不进 `Spec`、不参与版本判决。
+///
+/// `snapshots` 是 §10.3 的旁路表：哪些 plugin 条目是**记录型**、逐家版本记的是什么。
+/// 它回答「这条只对账、不交付」，同样不进 `Spec`。
 pub fn compute(
     desired: &[Capability],
     inputs: &[HarnessInput],
@@ -493,6 +519,7 @@ pub fn compute(
     content: &ContentIndex,
     ledger: &Ledger,
     sources: &SourceHarnessTable,
+    snapshots: &SnapshotTable,
 ) -> Plan {
     // §9.5：拆解条目的报错行按落点分好，等各节出场时取走。
     let DetachedRows {
@@ -533,6 +560,55 @@ pub fn compute(
             .collect();
 
         for cap in desired {
+            // §10.3：记录型条目（`source: snapshot`）**只对账、不交付**。分岔必须在
+            // 任何 `supports()` / 版本比较**之前**：那两条路都会把一条 henv 修不了的
+            // 要求变成 `install`/`update`→`undeliverable`（§9.5 说的那种「假成功」）。
+            //
+            // 吸收（`matched`）跟着 `targets` 走，与别的条目同一条判据：清单说
+            // 「只记在 claude」而 kimi 也装着一份时，kimi 那份照旧报 drift——
+            // 那是「它铺到别的家去了」，是该看见的事。
+            if cap.id.kind == Kind::Plugin {
+                if let Some(recorded_versions) = snapshots.get(&cap.id.name) {
+                    if cap.targets.includes(&harness) {
+                        matched.insert(cap.id.clone());
+                        if let Some(recorded) = recorded_versions.get(&harness) {
+                            let actual = state.actual.iter().find(|a| a.id == cap.id);
+                            match actual {
+                                // 清单记着它，本机没有：记录过期了。仍然只是警告
+                                // （本机没装可以是正常状态，§10.1）。
+                                None => entries.push(PlanEntry::new(
+                                    cap.id.clone(),
+                                    Action::Snapshot {
+                                        recorded: recorded.clone(),
+                                        actual: None,
+                                    },
+                                )),
+                                Some(a) => {
+                                    let actual_version = match &a.spec {
+                                        Spec::Plugin { version, .. } => version.as_deref(),
+                                        _ => None,
+                                    };
+                                    // `Same` 与 `Incomparable` 都安静：后者是 sha 形目录名、
+                                    // 分支名、哨兵、codex 的「版本恒 None」——报它就是报一条
+                                    // **永远修不掉**的 warning（§2.1 第 3 条）。
+                                    if compare_recorded_version(recorded, actual_version)
+                                        == RecordedMatch::Different
+                                    {
+                                        entries.push(PlanEntry::new(
+                                            cap.id.clone(),
+                                            Action::Snapshot {
+                                                recorded: recorded.clone(),
+                                                actual: actual_version.map(str::to_string),
+                                            },
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
             // §9.5：写了 `source_harness:` 的条目**不产生 `Kind::Plugin` 行**——
             // 顺利拆解时由拆出来的 skill 行承担，不顺利时由上面那批挂着的行承担。
             //
@@ -825,6 +901,7 @@ mod tests {
             &ContentIndex::default(),
             &Ledger::default(),
             &sources,
+            &SnapshotTable::default(),
         );
 
         for h in &plan.harnesses {
@@ -857,6 +934,7 @@ mod tests {
             &ContentIndex::default(),
             &Ledger::default(),
             &sources,
+            &SnapshotTable::default(),
         );
 
         let claude = plan
@@ -913,6 +991,7 @@ mod tests {
             &ContentIndex::default(),
             &Ledger::default(),
             &sources,
+            &SnapshotTable::default(),
         );
 
         assert!(
@@ -946,6 +1025,7 @@ mod tests {
             &ContentIndex::default(),
             &Ledger::default(),
             &sources,
+            &SnapshotTable::default(),
         );
         let row = plan
             .harnesses
@@ -979,6 +1059,7 @@ mod tests {
             &content,
             &Ledger::default(),
             &sources,
+            &SnapshotTable::default(),
         );
         let row = plan
             .harnesses
@@ -1014,6 +1095,7 @@ mod tests {
             &ContentIndex::default(),
             &Ledger::default(),
             &sources,
+            &SnapshotTable::default(),
         );
         let claude = plan
             .harnesses
@@ -1054,6 +1136,7 @@ mod tests {
             &ContentIndex::default(),
             &Ledger::default(),
             &sources,
+            &SnapshotTable::default(),
         );
         let claude = plan
             .harnesses
@@ -1088,6 +1171,7 @@ mod tests {
             &ContentIndex::default(),
             &Ledger::default(),
             &sources,
+            &SnapshotTable::default(),
         );
         let kimi = plan
             .harnesses
@@ -1129,6 +1213,7 @@ mod tests {
             &content,
             &Ledger::default(),
             &sources,
+            &SnapshotTable::default(),
         );
         let note = plan.notes.get("p").expect("拆不出 skill 也得留话");
         assert!(note.contains("hook"), "{note}");
@@ -1168,6 +1253,7 @@ mod tests {
             &ContentIndex::default(),
             &Ledger::default(),
             &no_source_harness(),
+            &SnapshotTable::default(),
         );
         match &plan.harnesses[0].entries[0].action {
             Action::Undeliverable { reason } => {
@@ -1201,6 +1287,7 @@ mod tests {
             &ContentIndex::default(),
             &Ledger::default(),
             &no_source_harness(),
+            &SnapshotTable::default(),
         );
         match &plan.harnesses[0].entries[0].action {
             Action::Undeliverable { reason } => {
@@ -1234,6 +1321,7 @@ mod tests {
             &ContentIndex::default(),
             &Ledger::default(),
             &no_source_harness(),
+            &SnapshotTable::default(),
         );
         assert_eq!(plan.harnesses[0].entries[0].action, Action::InSync);
 
@@ -1249,8 +1337,169 @@ mod tests {
             &ContentIndex::default(),
             &Ledger::default(),
             &no_source_harness(),
+            &SnapshotTable::default(),
         );
         assert_eq!(plan.harnesses[0].entries[0].action, Action::Unknown);
+    }
+
+    /// 造一份记录型清单 + 它的旁路表。`versions` 是 YAML 片段（缩进由调用方给）。
+    fn snapshot_manifest(body: &str) -> (crate::manifest::Manifest, SnapshotTable) {
+        let m = crate::manifest::Manifest::parse(&format!(
+            "version: 1\n\nplugins:\n  p:\n    source: snapshot\n{body}"
+        ))
+        .expect("清单合法");
+        let t = SnapshotTable::new(&m);
+        (m, t)
+    }
+
+    fn run_with_snapshots(
+        m: &crate::manifest::Manifest,
+        snapshots: &SnapshotTable,
+        adapters: Vec<FakeAdapter>,
+    ) -> Plan {
+        let desired = crate::lower::lower(m);
+        let (states, adapters) = harness_states(adapters);
+        let inputs = harness_inputs(&states, &adapters);
+        compute(
+            &desired,
+            &inputs,
+            &no_degrade(),
+            &ContentIndex::default(),
+            &Ledger::default(),
+            &no_source_harness(),
+            snapshots,
+        )
+    }
+
+    /// §10.3 的核心不变式：记录型条目**永不交付**。本机装着同版本时安静地
+    /// 被吸收（不再是 drift），任何一条 `install`/`update`/`undeliverable`
+    /// 都不许出现（Review Focus 1）。
+    #[test]
+    fn a_snapshot_entry_never_delivers_and_absorbs_the_copy() {
+        let (m, snapshots) = snapshot_manifest("    versions:\n      codex: v1.0\n");
+        let plan = run_with_snapshots(
+            &m,
+            &snapshots,
+            vec![fake("codex").with_caps(vec![FakeAdapter::plugin("p", Some("v1.0"), None)])],
+        );
+        let c = plan.counts();
+        assert_eq!(c.install, 0, "{plan:?}");
+        assert_eq!(c.update, 0, "{plan:?}");
+        assert_eq!(c.undeliverable, 0, "{plan:?}");
+        assert_eq!(c.drift, 0, "本机那份是清单记的，不该再报 drift：{plan:?}");
+        assert_eq!(c.snapshot, 0, "版本对上了就没有对账行：{plan:?}");
+        assert_eq!(plan.harnesses[0].entries, vec![]);
+    }
+
+    /// 版本不符 → 一条对账行，两边都是原值。
+    #[test]
+    fn a_recorded_version_that_differs_produces_one_snapshot_line() {
+        let (m, snapshots) = snapshot_manifest("    versions:\n      codex: v1.0\n");
+        let plan = run_with_snapshots(
+            &m,
+            &snapshots,
+            vec![fake("codex").with_caps(vec![FakeAdapter::plugin("p", Some("v2.0"), None)])],
+        );
+        assert_eq!(
+            plan.harnesses[0].entries[0].action,
+            Action::Snapshot {
+                recorded: "v1.0".into(),
+                actual: Some("v2.0".into()),
+            }
+        );
+        assert_eq!(plan.counts().snapshot, 1);
+    }
+
+    /// 版本**逐家**对账（§2.2 第 6 条）：同一个 plugin 在两家可以是两个版本，
+    /// 各自记、各自比。`6.4.1` 与 `v6.3.0` 都做归一化后相等 ⇒ 两家都安静。
+    #[test]
+    fn a_recorded_version_is_compared_per_harness() {
+        let (m, snapshots) =
+            snapshot_manifest("    versions:\n      claude-code: 6.4.1\n      kimi-code: v6.3.0\n");
+        let plan = run_with_snapshots(
+            &m,
+            &snapshots,
+            vec![
+                fake("claude-code").with_caps(vec![FakeAdapter::plugin("p", Some("6.4.1"), None)]),
+                fake("kimi-code").with_caps(vec![FakeAdapter::plugin("p", Some("6.3.0"), None)]),
+            ],
+        );
+        assert_eq!(plan.counts().snapshot, 0, "两家都该安静：{plan:?}");
+        assert_eq!(plan.counts().drift, 0);
+    }
+
+    /// 清单记着它、本机没有 → 一条行（`actual: None`）。记录过期了要说出来，
+    /// 但它在 doctor 里是警告（Task 3），不是门禁。
+    #[test]
+    fn a_snapshot_entry_recorded_but_not_installed_reports_missing() {
+        let (m, snapshots) = snapshot_manifest("    versions:\n      codex: v1.0\n");
+        let plan = run_with_snapshots(&m, &snapshots, vec![fake("codex")]);
+        assert_eq!(
+            plan.harnesses[0].entries[0].action,
+            Action::Snapshot {
+                recorded: "v1.0".into(),
+                actual: None,
+            }
+        );
+    }
+
+    /// 不可比的版本一律安静（Review Focus 3）：sha 形、哨兵、本机读不出（codex）
+    /// 都不许变成一条**永远修不掉**的 warning。
+    #[test]
+    fn an_incomparable_recorded_version_stays_quiet() {
+        for record in ["db467cc56673", "unknown", "main"] {
+            let (m, snapshots) =
+                snapshot_manifest(&format!("    versions:\n      codex: {record}\n"));
+            // 本机装了、版本是 version 形：只要清单那侧不可比就必须安静。
+            let plan = run_with_snapshots(
+                &m,
+                &snapshots,
+                vec![fake("codex").with_caps(vec![FakeAdapter::plugin("p", Some("v1.0"), None)])],
+            );
+            assert_eq!(plan.counts().snapshot, 0, "`{record}` 不该产行：{plan:?}");
+            assert_eq!(plan.counts().drift, 0, "`{record}` 仍在清单里：{plan:?}");
+        }
+
+        // 反向：清单记的是 version 形、本机读不出（codex 恒 `None`）→ 同样安静。
+        let (m, snapshots) = snapshot_manifest("    versions:\n      codex: v1.0\n");
+        let plan = run_with_snapshots(
+            &m,
+            &snapshots,
+            vec![fake("codex").with_caps(vec![FakeAdapter::plugin("p", None, None)])],
+        );
+        assert_eq!(plan.counts().snapshot, 0, "{plan:?}");
+    }
+
+    /// 吸收范围跟着 `targets` 走（与别的条目同一条判据）：清单说「只记在
+    /// claude」，而 kimi 也装着一份 → kimi 那份照旧 drift。那是「它铺到别的家
+    /// 去了」，是该看见的事，不是记录型条目要吞掉的噪音。
+    #[test]
+    fn a_snapshot_entry_only_absorbs_the_harnesses_it_records() {
+        let (m, snapshots) = snapshot_manifest(
+            "    targets: [claude-code]\n    versions:\n      claude-code: v1.0\n",
+        );
+        let plugin = || FakeAdapter::plugin("p", Some("v1.0"), None);
+        let plan = run_with_snapshots(
+            &m,
+            &snapshots,
+            vec![
+                fake("claude-code").with_caps(vec![plugin()]),
+                fake("kimi-code").with_caps(vec![plugin()]),
+            ],
+        );
+        let kimi = plan
+            .harnesses
+            .iter()
+            .find(|h| h.harness == "kimi-code")
+            .expect("kimi 有一节");
+        assert_eq!(kimi.entries.len(), 1, "{kimi:?}");
+        assert_eq!(kimi.entries[0].action, Action::Drift);
+        let claude = plan
+            .harnesses
+            .iter()
+            .find(|h| h.harness == "claude-code")
+            .expect("claude 有一节");
+        assert_eq!(claude.entries, vec![]);
     }
 
     /// §9.5「交付什么」：bundle 里装不下的部分（hooks/commands/...）进的是
@@ -1287,6 +1536,7 @@ mod tests {
             &content,
             &Ledger::default(),
             &sources,
+            &SnapshotTable::default(),
         );
         let note = plan.notes.get("p").expect("装不下的部分要留话");
         assert!(note.contains("hook"), "{note}");
@@ -1305,6 +1555,7 @@ mod tests {
             &ContentIndex::default(),
             &Ledger::default(),
             &no_source_harness(),
+            &SnapshotTable::default(),
         )
     }
 
@@ -1337,6 +1588,7 @@ mod tests {
             &ContentIndex::default(),
             ledger,
             &no_source_harness(),
+            &SnapshotTable::default(),
         )
     }
 
@@ -1376,6 +1628,7 @@ mod tests {
                         Action::Undeliverable { .. } => "undeliverable".to_string(),
                         Action::Drift => "drift".to_string(),
                         Action::Unknown => "unknown".to_string(),
+                        Action::Snapshot { .. } => "snapshot".to_string(),
                     },
                 )
             })
@@ -1741,6 +1994,7 @@ mod tests {
             &ContentIndex::default(),
             &Ledger::default(),
             &no_source_harness(),
+            &SnapshotTable::default(),
         );
         assert!(plan.harnesses[0].entries.is_empty(), "skip means silent");
     }
@@ -1781,6 +2035,7 @@ mod tests {
             &ContentIndex::default(),
             &Ledger::default(),
             &no_source_harness(),
+            &SnapshotTable::default(),
         );
         assert_eq!(plan.harnesses[0].entries.len(), 1);
         assert_eq!(plan.counts().undeliverable, 1);
@@ -2282,6 +2537,7 @@ mod tests {
             content,
             ledger,
             &no_source_harness(),
+            &SnapshotTable::default(),
         )
     }
 

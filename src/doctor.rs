@@ -120,6 +120,19 @@ fn plan_checks(plan: &Plan) -> Vec<Check> {
                 kind: CheckKind::Warning,
                 text: detail_line("- unknown", &subject, "版本无法判定"),
             }),
+            // §10.3：记录型条目的对账。**警告**不是问题——本机没装这个 plugin 可以是
+            // 正常状态（§10.1 把「清单里启用了但本机没装的家」判成警告的同一个理由：
+            // 先写清单、后装东西是正常流程）。它挡不住任何东西：`apply` 对这条无事可做。
+            Action::Snapshot { recorded, actual } => {
+                let detail = match actual {
+                    Some(a) => format!("只记录不交付；清单记 {recorded}，本机 {a}"),
+                    None => format!("只记录不交付；清单记 {recorded}，本机没装"),
+                };
+                checks.push(Check {
+                    kind: CheckKind::Warning,
+                    text: detail_line("~ snapshot", &subject, &detail),
+                });
+            }
             // **已经交付过**、但内容与源不同 = 环境里有过期物（§9.4）。警告，不是问题：
             // 过期是 apply 的正常输入，不是事故。
             //
@@ -593,6 +606,48 @@ mod tests {
             notes: BTreeMap::new(),
         };
         assert!(plan_checks(&plan).is_empty());
+    }
+
+    /// §10.3：记录型条目的对账行在 doctor 里是**警告**，不是问题。本机没装那个
+    /// plugin 可以是正常状态，把它当问题会让 doctor 在每台新机器上恒红——
+    /// 与「清单里启用了但本机没装的家」判成警告是同一条理由（§10.1）。
+    #[test]
+    fn a_snapshot_row_is_a_warning_never_a_problem() {
+        use crate::capability::{CapId, Kind};
+        use crate::diff::{HarnessPlan, PlanEntry};
+        use std::collections::BTreeMap;
+
+        let plan = Plan {
+            harnesses: vec![HarnessPlan {
+                harness: "claude-code".into(),
+                detected: true,
+                entries: vec![PlanEntry::new(
+                    CapId::new(Kind::Plugin, "superpowers"),
+                    Action::Snapshot {
+                        recorded: "6.4.1".into(),
+                        actual: None,
+                    },
+                )],
+                actual_by_kind: BTreeMap::new(),
+            }],
+            unattached: Vec::new(),
+            notes: BTreeMap::new(),
+        };
+        let report = DoctorReport {
+            harnesses: Vec::new(),
+            checks: plan_checks(&plan),
+        };
+        assert!(report.healthy(), "记录与现实不符不该挡路");
+        assert_eq!(report.problems(), 0);
+        assert_eq!(report.warnings(), 1);
+        assert!(
+            report.checks[0]
+                .text
+                .contains("plugin/superpowers@claude-code")
+                && report.checks[0].text.contains("本机没装"),
+            "{:?}",
+            report.checks[0].text
+        );
     }
 
     /// 同一条能力在两家的两行**必须能区分开**：doctor 的报告是扁平的，没有

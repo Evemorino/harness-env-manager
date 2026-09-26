@@ -350,6 +350,32 @@ fn compare_plugins(desired: &Spec, actual: &Spec) -> VersionMatch {
     }
 }
 
+/// 记录型 plugin（§10.3）的版本对账结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecordedMatch {
+    Same,
+    Different,
+    /// 有一边不是 version 形（sha 形目录名、分支名、哨兵、本机版本读不出）——
+    /// 按 §2.1 第 3 条**不报假 drift**。
+    Incomparable,
+}
+
+/// 清单记的版本（`source: snapshot` 的 `versions.<harness>`）vs 本机 `version` 位。
+///
+/// 与 [`compare_plugins`] 共用 [`normalize_version`]：**可比性只有一份定义**。
+/// 分开写两份必然出现「scan 记了、diff 说不可比」的两套话——`normalize_version`
+/// 的 rustdoc 里就是这么约定的。
+pub(crate) fn compare_recorded_version(recorded: &str, actual: Option<&str>) -> RecordedMatch {
+    match (
+        normalize_version(recorded),
+        actual.and_then(normalize_version),
+    ) {
+        (Some(r), Some(a)) if r == a => RecordedMatch::Same,
+        (Some(_), Some(_)) => RecordedMatch::Different,
+        _ => RecordedMatch::Incomparable,
+    }
+}
+
 /// 归一化 version 串：去前导 `v`/`V`；仅当结果含小数点（`6.3.0` 形）才返回 Some，
 /// sha 形目录名（`db467cc56673`）、分支名（`main`）等不含小数点 → None（不可比，落 Unknown）。
 ///

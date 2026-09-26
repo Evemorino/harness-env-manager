@@ -36,11 +36,16 @@ pub fn render(plan: &Plan) -> String {
         out.push('\n');
     }
     let c = plan.counts();
-    let _ = writeln!(
-        out,
+    let mut line = format!(
         "Plan: {} conflict, {} install, {} update, {} remove, {} undeliverable, {} drift, {} unknown",
         c.conflict, c.install, c.update, c.remove, c.undeliverable, c.drift, c.unknown
     );
+    // §10.3：`snapshot` 只有**非零**时才追加。零是绝大多数清单的样子，
+    // 而汇总行是既有 golden 的一部分——多一个恒为 0 的字段就是改了所有人的报告。
+    if c.snapshot > 0 {
+        let _ = write!(line, ", {} snapshot", c.snapshot);
+    }
+    let _ = writeln!(out, "{line}");
     out
 }
 
@@ -150,6 +155,20 @@ fn render_entries(pending: &[&PlanEntry], head: &str, out: &mut String) {
                     e.id.label()
                 );
                 let _ = writeln!(out, "{line}");
+            }
+            // §10.3：记录型条目的对账行。它**不是交付动作**——句子里写死
+            // 「只记录不交付」，好让人不必回头翻清单就知道 `apply` 不会碰它。
+            Action::Snapshot { recorded, actual } => {
+                let detail = match actual {
+                    Some(a) => format!("只记录不交付；清单记 {recorded}，本机 {a}"),
+                    None => format!("只记录不交付；清单记 {recorded}，本机没装"),
+                };
+                let line = format!(
+                    "{lead}{}{} ({detail})",
+                    action_cell("~ snapshot"),
+                    e.id.label()
+                );
+                let _ = writeln!(out, "{}", with_note(line, e.note.as_ref()));
             }
             Action::Unknown => {
                 let line = format!(
@@ -557,6 +576,77 @@ mod tests {
             ),
             "{out}"
         );
+    }
+
+    /// §10.3：记录型条目的对账行。句子里写死「只记录不交付」，且在
+    /// `snapshot > 0` 时才出现在汇总行里。
+    #[test]
+    fn a_snapshot_line_says_it_records_and_never_delivers() {
+        let plan = Plan {
+            unattached: Vec::new(),
+            notes: BTreeMap::new(),
+            harnesses: vec![hp(
+                "claude-code",
+                true,
+                vec![
+                    pe(
+                        Kind::Plugin,
+                        "superpowers",
+                        Action::Snapshot {
+                            recorded: "6.4.1".into(),
+                            actual: Some("6.3.0".into()),
+                        },
+                    ),
+                    pe(
+                        Kind::Plugin,
+                        "gone",
+                        Action::Snapshot {
+                            recorded: "v1.0".into(),
+                            actual: None,
+                        },
+                    ),
+                ],
+                vec![(Kind::Plugin, 2)],
+            )],
+        };
+        let out = render(&plan);
+        assert!(
+            out.contains(
+                "claude-code   ~ snapshot plugin/superpowers (只记录不交付；清单记 6.4.1，本机 6.3.0)\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("plugin/gone (只记录不交付；清单记 v1.0，本机没装)\n"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with(
+                "Plan: 0 conflict, 0 install, 0 update, 0 remove, 0 undeliverable, 0 drift, 0 unknown, 2 snapshot\n"
+            ),
+            "{out}"
+        );
+    }
+
+    /// 硬约束：`snapshot = 0` 时汇总行**逐字节**是过去那一行（既有 golden 就是
+    /// 这条证据）。这里再钉一次，免得将来顺手把字段变成恒显。
+    #[test]
+    fn a_zero_snapshot_count_leaves_the_footer_alone() {
+        let plan = Plan {
+            unattached: Vec::new(),
+            notes: BTreeMap::new(),
+            harnesses: vec![hp(
+                "claude-code",
+                true,
+                vec![pe(Kind::Mcp, "context7", Action::InSync)],
+                vec![(Kind::Mcp, 1)],
+            )],
+        };
+        let out = render(&plan);
+        assert!(out.ends_with(
+            "Plan: 0 conflict, 0 install, 0 update, 0 remove, 0 undeliverable, 0 drift, 0 unknown\n"
+        ), "{out}");
+        assert!(!out.contains("snapshot"), "{out}");
     }
 
     #[test]
