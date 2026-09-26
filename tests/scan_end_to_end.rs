@@ -101,6 +101,10 @@ fn a_second_run_has_nothing_left_to_adopt() {
     let (code, out, err) = scan(&home, &after_first, false);
     assert_eq!(code, 0, "stdout={out} stderr={err}");
     assert!(out.contains("nothing to adopt"), "{out}");
+    assert!(
+        out.contains("(nothing written)"),
+        "零收养时不许说「已追加」（清单与 .bak 都没动）：{out}"
+    );
     assert_eq!(manifest_text(&home), after_first, "第二次不许再改清单");
 }
 

@@ -88,7 +88,11 @@ pub fn adoptions(manifest: &Manifest, states: &[HarnessState]) -> AdoptionReport
     let existing = declared_ids(manifest);
     // 同一个 `(kind, name)` 在多家扫到只产一条：`targets` 是发现它的那些家的并集。
     // `BTreeMap` 让输出稳定（skill → mcp → plugin，名字升序），不随 registry 顺序抖。
-    let mut found: BTreeMap<(Kind, String), (BTreeSet<String>, Capability)> = BTreeMap::new();
+    //
+    // 值是**逐家那一份能力**（不是并集 + 一份代表）：plugin 的载荷（§10.3 的版本）
+    // 是**逐家**的——§2.2 第 6 条实测同一个 plugin 在本机可以有两个版本，
+    // 记成一份就必须挑一个扔另一个。skill/mcp 只用到它的键（家名）。
+    let mut found: BTreeMap<(Kind, String), BTreeMap<String, Capability>> = BTreeMap::new();
     let mut skips: BTreeMap<(String, String, String), Skip> = BTreeMap::new();
 
     for state in states {
@@ -118,7 +122,11 @@ pub fn adoptions(manifest: &Manifest, states: &[HarnessState]) -> AdoptionReport
     AdoptionReport {
         adoptions: found
             .into_values()
-            .map(|(harnesses, cap)| shape(&cap, &harnesses))
+            .map(|by_harness| {
+                // 代表那份只用来取身份与 kind；载荷（plugin 的版本）逐家从表里取。
+                let representative = by_harness.values().next().expect("filled 至少插一条");
+                shape(representative, &by_harness)
+            })
             .collect(),
         skips: skips.into_values().collect(),
     }
@@ -133,8 +141,11 @@ fn declared_ids(manifest: &Manifest) -> BTreeSet<(Kind, String)> {
     for name in manifest.mcps.keys() {
         out.insert((Kind::Mcp, name.clone()));
     }
-    for name in manifest.plugins.keys() {
-        out.insert((Kind::Plugin, name.clone()));
+    for (key, p) in &manifest.plugins {
+        // §10.3：plugin 的身份是 `entry`（缺省才是 key，`plugin_identity` 是唯一
+        // 定义）。按 key 判会把 `{key: superpowers-bundle, entry: superpowers}`
+        // 与扫到的 `superpowers` 当成两条不同的东西，收养出一条重复条目。
+        out.insert((Kind::Plugin, crate::lower::plugin_identity(key, p)));
     }
     out
 }
@@ -158,13 +169,11 @@ fn adoptable(cap: &Capability) -> Result<(), String> {
             SkillSource::Git { .. } => Err("来源是 git，但读不到 repo/ref，记不出这两格".into()),
         },
         Spec::Mcp { .. } => Ok(()),
-        // plugin **不收养**。清单里的 plugin 条目含义是**交付请求**（§9.5：`source_harness:`
-        // 请求拆解、`targets` 决定送到哪几家），不是「本机装着它」的快照。收养只可能记
-        // 「它装在这一家」，于是两种写法都错：
-        // `targets` 只有源家 → 交付目标 = targets − 源家 = 空 → 恒 `undeliverable`（实测）；
-        // `targets: all` → 把这家 bundle 的内容拆到另外两家 → 静默扩范围。
-        // 要记「装过什么版本」，清单得先长出「只记录、不交付」的 source 形态（本轮不做）。
-        Spec::Plugin { .. } => Err("清单里的 plugin 条目是交付请求、不是快照（§9.5）".into()),
+        // §10.3：plugin 收养成**记录型**条目（`source: snapshot`）——只记身份与逐家
+        // 版本，不请求交付。它不再落进「交付请求」那套语义（`source_harness:` 拆解、
+        // `targets` 决定送到哪几家），所以旧的那两难（恒 undeliverable / 静默扩范围）
+        // 整类消失。
+        Spec::Plugin { .. } => Ok(()),
         // §4 的清单只有 skills / mcps / plugins 三段，这三种 kind 表达不了。
         Spec::Command { .. } | Spec::Agent { .. } | Spec::Hook { .. } => Err(format!(
             "清单 schema 表达不了 `{}` 这个 kind",
@@ -191,24 +200,27 @@ fn record_skip(
 }
 
 fn filled(
-    found: &mut BTreeMap<(Kind, String), (BTreeSet<String>, Capability)>,
+    found: &mut BTreeMap<(Kind, String), BTreeMap<String, Capability>>,
     state: &HarnessState,
     cap: &Capability,
 ) {
-    let entry = found
+    found
         .entry((cap.id.kind, cap.id.name.clone()))
-        .or_insert_with(|| (BTreeSet::new(), cap.clone()));
-    entry.0.insert(state.name.clone());
+        .or_default()
+        .insert(state.name.clone(), cap.clone());
 }
 
-/// 一条能力 + 发现它的家 → 条目文本。
-fn shape(cap: &Capability, harnesses: &BTreeSet<String>) -> Adoption {
+/// 一条能力 + 发现它的家（家名 → 那一份能力）→ 条目文本。
+///
+/// 传整张表而不是一个家名集合，是因为 plugin 的载荷**逐家**不同（§10.3 的版本，
+/// §2.2 第 6 条：同一个 plugin 在本机可以有两个版本）。skill/mcp 只用它的键。
+fn shape(cap: &Capability, harnesses: &BTreeMap<String, Capability>) -> Adoption {
     let kind = cap.id.kind;
     let section = Section::of(kind).expect("adoptable kinds all have a section");
     // 目标按 `KNOWN_HARNESSES` 的顺序写：清单是人读的，顺序不该随扫描顺序抖。
     let targets: Vec<String> = crate::manifest::KNOWN_HARNESSES
         .iter()
-        .filter(|h| harnesses.contains(**h))
+        .filter(|h| harnesses.contains_key(**h))
         .map(|h| (*h).to_string())
         .collect();
     let targets_line = format!("  targets: [{}]", targets.join(", "));
@@ -253,9 +265,47 @@ fn shape(cap: &Capability, harnesses: &BTreeSet<String>) -> Adoption {
             };
             (out, summary)
         }
-        // `adoptable` 一律拒绝 plugin（理由见那里）。这里留一个说得出原因的兜底而不是空实现：
-        // 真有人放开那条判据时，会立刻炸在他眼前。
-        Spec::Plugin { .. } => unreachable!("plugin adoption is refused by `adoptable`"),
+        // §10.3：plugin 收养成记录型条目。**逐家**记版本，且**只记 version 形**的
+        // （Review Focus 5）：sha 形的目录名（`db467cc56673`）记进去就是一条 diff
+        // 说「不可比」的死值，比不记更坏——它看起来像是记下了什么。
+        Spec::Plugin { .. } => {
+            let mut recorded: Vec<(String, String)> = Vec::new();
+            let mut unrecorded: Vec<String> = Vec::new();
+            for h in crate::manifest::KNOWN_HARNESSES {
+                let Some(c) = harnesses.get(h) else { continue };
+                let Spec::Plugin { version, .. } = &c.spec else {
+                    unreachable!("kind 与 spec 同源")
+                };
+                match version {
+                    Some(v) if crate::capability::normalize_version(v).is_some() => {
+                        recorded.push(((*h).to_string(), v.clone()));
+                    }
+                    // 观测到的不是 version 形（sha 形目录名、分支名），或本机读不出
+                    // （codex 恒 `None`）：家仍然进 `targets`（它确实装着），版本不记。
+                    _ => unrecorded.push((*h).to_string()),
+                }
+            }
+            let mut out = String::from("  source: snapshot\n");
+            if !recorded.is_empty() {
+                out.push_str("  versions:\n");
+                for (h, v) in &recorded {
+                    let _ = writeln!(out, "    {h}: {}", scalar(v));
+                }
+            }
+            let mut summary = String::from("source=snapshot");
+            if !recorded.is_empty() {
+                let list: Vec<String> = recorded.iter().map(|(h, v)| format!("{h} {v}")).collect();
+                let _ = write!(summary, " versions=[{}]", list.join(", "));
+            }
+            if !unrecorded.is_empty() {
+                let _ = write!(
+                    summary,
+                    "（{} 的版本不是 version 形，未记）",
+                    unrecorded.join(", ")
+                );
+            }
+            (out, summary)
+        }
         Spec::Command { .. } | Spec::Agent { .. } | Spec::Hook { .. } => {
             unreachable!("not adoptable: {:?}", cap.id.kind)
         }
@@ -562,6 +612,11 @@ pub fn render_scan(report: &AdoptionReport, dry_run: bool) -> String {
     };
     let mode = if dry_run {
         "(dry run)"
+    } else if adopted == 0 {
+        // 没有条目可插时 `insert_entries` 直接返回 `None`：清单与 `.henv.bak` 都不动
+        // （`run_scan` 那一支根本不会走到 `write_config`）。说「已追加」就是一句假话，
+        // 而报告是唯一告诉用户「刚才到底发生了什么」的地方。
+        "(nothing written)"
     } else {
         "(appended to env.yaml)"
     };
@@ -806,11 +861,13 @@ mod tests {
         assert_eq!(entry.targets, Targets::Only(vec!["codex".into()]));
     }
 
-    /// plugin **一律不收养**：清单里的 plugin 条目是交付请求（§9.5），收养它要么恒
-    /// `undeliverable`（`targets` 只有源家 → 差集为空），要么把 bundle 拆到别的家。
-    /// 这条钉住「每一支 plugin 都走 skip」，并钉住理由里说清了为什么。
+    /// §10.3：plugin 收养成**记录型**条目——`source: snapshot` + 逐家版本，
+    /// **没有** `source_harness:`（它不再是一条交付请求）。三种形态都给同一份
+    /// 记录：有没有 marketplace 与「记不记得住」无关，`enabled: false` 的也装着。
+    ///
+    /// 生成的文本必须自己解得出（与别的条目共用 `parse_with`）。
     #[test]
-    fn marketplace_plugins_are_skipped_because_the_manifest_cannot_snapshot_them() {
+    fn marketplace_plugins_are_adopted_as_snapshot_records() {
         let manifest = Manifest::parse("version: 1\n").unwrap();
         let plugin = |entry: &str, marketplace: Option<&str>, enabled| Spec::Plugin {
             marketplace: marketplace.map(str::to_string),
@@ -842,19 +899,103 @@ mod tests {
         )];
 
         let report = adoptions(&manifest, &states);
-        assert!(
-            report.adoptions.is_empty(),
-            "plugin 一条都不许收养：{:?}",
-            report.adoptions
-        );
-        assert_eq!(report.skips.len(), 3);
-        for skip in &report.skips {
-            assert!(
-                skip.reason.contains("交付请求"),
-                "理由要说清「清单里的 plugin 条目是交付请求」：{}",
-                skip.reason
+        assert!(report.skips.is_empty(), "{:?}", report.skips);
+        assert_eq!(report.adoptions.len(), 3);
+        for a in &report.adoptions {
+            assert_eq!(a.section, Section::Plugins);
+            assert_eq!(a.targets, vec!["claude-code".to_string()]);
+            let parsed = parse_with(a.section, &a.name, &a.body);
+            let entry = &parsed.plugins[&a.name];
+            assert_eq!(
+                entry.source,
+                crate::manifest::PluginSourceKind::Snapshot,
+                "收养来的 plugin 只能是记录型：{a:?}"
+            );
+            assert_eq!(entry.source_harness, None, "它不是交付请求：{a:?}");
+            assert_eq!(
+                entry.versions.as_ref().unwrap()["claude-code"],
+                "v6.3.0",
+                "原值记，不做归一化：{a:?}"
             );
         }
+    }
+
+    /// Review Focus 5：**只记 version 形**的版本。sha 形的目录名（`db467cc56673`）
+    /// 记进去就是一条 diff 说「不可比」的死值——它看起来像记下了什么，实际不会
+    /// 被对账。这台家仍然进 `targets`（它确实装着），版本不记。
+    #[test]
+    fn a_plugin_version_that_cannot_be_compared_is_not_recorded() {
+        let manifest = Manifest::parse("version: 1\n").unwrap();
+        let plugin = |entry: &str, version: Option<&str>| Spec::Plugin {
+            marketplace: None,
+            entry: entry.into(),
+            version: version.map(str::to_string),
+            sha: None,
+            install_path: None,
+            enabled: true,
+        };
+        let states = vec![
+            state(
+                "claude-code",
+                vec![cap(
+                    "sha-shaped",
+                    "claude-code",
+                    plugin("sha-shaped", Some("db467cc56673")),
+                )],
+            ),
+            state(
+                "codex",
+                vec![cap("sha-shaped", "codex", plugin("sha-shaped", None))],
+            ),
+        ];
+
+        let report = adoptions(&manifest, &states);
+        assert_eq!(report.adoptions.len(), 1);
+        let a = &report.adoptions[0];
+        let parsed = parse_with(a.section, &a.name, &a.body);
+        let entry = &parsed.plugins["sha-shaped"];
+        assert_eq!(
+            entry.versions, None,
+            "没有可比版本就不写 `versions:`：{a:?}"
+        );
+        assert_eq!(a.targets, vec!["claude-code", "codex"]);
+        assert!(a.summary.contains("未记"), "不记也要说出来：{}", a.summary);
+    }
+
+    /// Review Focus 4：清单里已有同**身份**的条目（哪怕是交付型、哪怕 key 不一致）
+    /// 就不收养——按 key 判会收养出一条重复条目。
+    #[test]
+    fn a_plugin_already_declared_under_another_key_is_not_adopted() {
+        let manifest = Manifest::parse(
+            "version: 1\nplugins:\n  superpowers-bundle:\n    source: claude-marketplace\n    marketplace: official\n    entry: superpowers\n",
+        )
+        .unwrap();
+        let states = vec![state(
+            "claude-code",
+            vec![cap(
+                "superpowers",
+                "claude-code",
+                Spec::Plugin {
+                    marketplace: Some("official".into()),
+                    entry: "superpowers".into(),
+                    version: Some("v6.3.0".into()),
+                    sha: None,
+                    install_path: None,
+                    enabled: true,
+                },
+            )],
+        )];
+        let report = adoptions(&manifest, &states);
+        assert!(
+            report.adoptions.is_empty(),
+            "identity 已在清单里就不收养：{:?}",
+            report.adoptions
+        );
+        assert!(
+            report.skips.is_empty(),
+            "那是正常情况，不是 skip：{:?}",
+            report.skips
+        );
     }
 
     /// 名字里的 `:`、`#`、空格、前导数字都会让裸标量解成别的东西（或解不开）。
