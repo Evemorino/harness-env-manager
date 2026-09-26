@@ -83,6 +83,12 @@ pub enum PluginSourceKind {
     ClaudeMarketplace,
     Github,
     ZipUrl,
+    /// 记录型（§10.3）：清单只记「本机装着它」，**不请求交付**。
+    ///
+    /// 它不是「从哪儿装」的第四种答案，而是**另一种条目语义**：`scan` 收养来的
+    /// 原生安装只能是这一种——没有 marketplace / repo 可写（现状侧读不到），
+    /// 也不该由 henv 去装。
+    Snapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -115,6 +121,15 @@ pub struct PluginEntry {
     /// 反推必然挑错版本。
     #[serde(default)]
     pub source_harness: Option<String>,
+    /// 记录型（`source: snapshot`）的**逐家**版本：harness → 观测到的版本串（§10.3）。
+    ///
+    /// **逐家、不是单值**：§2.2 第 6 条实测同一个 plugin 在本机可以有两个版本
+    /// （claude 6.4.1 / kimi 6.3.0）。单值必然有一家永远对不上，而且**改不掉**。
+    ///
+    /// 值的形态不校验成 semver：它就是「本机读到的那个串」，可比性归
+    /// `capability::compare_recorded_version` 判（§2.1 第 3 条）。`unknown` 哨兵合法。
+    #[serde(default)]
+    pub versions: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -611,6 +626,35 @@ impl Manifest {
                     ));
                 }
             }
+            // §10.3：`versions` 是记录型条目的载荷，别的来源读它就是在表达一个
+            // 不会被读到的意图——宁可在这里骂，也不要让它静默无效。
+            if p.versions.is_some() && p.source != PluginSourceKind::Snapshot {
+                e.push(format!(
+                    "{at}: `versions` is only read on `source: snapshot`"
+                ));
+            }
+            if let Some(versions) = &p.versions {
+                for (harness, v) in versions {
+                    if !KNOWN_HARNESSES.contains(&harness.as_str()) {
+                        e.push(format!(
+                            "{at}.versions: unknown harness `{harness}` (known: {})",
+                            KNOWN_HARNESSES.join(", ")
+                        ));
+                    } else if !p.targets.includes(harness) {
+                        // 「记了版本却不认它是记录范围」是自相矛盾：那条记录会被
+                        // 目标过滤掉，用户却以为自己记下了。
+                        e.push(format!(
+                            "{at}.versions.{harness}: not in `targets` (a recorded version \
+                             must sit inside the recorded scope)"
+                        ));
+                    }
+                    // 空白是打错；`unknown` 是既有的「没有版本」哨兵（§2.2 第 7 条），
+                    // 合法——它由 `compare_recorded_version` 归一成「不可比」。
+                    if v.trim().is_empty() {
+                        e.push(format!("{at}.versions.{harness}: must not be empty"));
+                    }
+                }
+            }
             match p.source {
                 PluginSourceKind::ClaudeMarketplace => {
                     if p.marketplace.is_none() {
@@ -628,6 +672,20 @@ impl Manifest {
                     }
                 }
                 PluginSourceKind::ZipUrl => {}
+                // §10.3：记录型条目**不拿内容**——这四格都在描述「从哪儿拿」，
+                // 写了就是把它当成一条交付请求（那正是本形态要避免的）。
+                PluginSourceKind::Snapshot => {
+                    if p.marketplace.is_some()
+                        || p.repo.is_some()
+                        || p.git_ref.is_some()
+                        || p.source_harness.is_some()
+                    {
+                        e.push(format!(
+                            "{at}: source snapshot takes no marketplace/repo/ref/source_harness \
+                             (it only records, it never delivers)"
+                        ));
+                    }
+                }
             }
         }
 
@@ -1099,6 +1157,106 @@ plugins:
         assert!(err.contains("repo"), "{err}");
     }
 
+    /// §10.3：记录型条目——`source: snapshot` + 逐家版本。它只记身份与版本，
+    /// 不请求交付，所以既不需要 marketplace/repo，也不需要 `source_harness:`。
+    #[test]
+    fn a_snapshot_plugin_records_per_harness_versions() {
+        let m = Manifest::parse(
+            "version: 1\n\n\
+             plugins:\n  superpowers:\n    source: snapshot\n    versions:\n      claude-code: 6.4.1\n      kimi-code: v6.3.0\n",
+        )
+        .expect("记录型条目是正常清单");
+        let p = &m.plugins["superpowers"];
+        assert_eq!(p.source, PluginSourceKind::Snapshot);
+        let v = p.versions.as_ref().expect("versions 要解出来");
+        assert_eq!(v["claude-code"], "6.4.1");
+        assert_eq!(v["kimi-code"], "v6.3.0");
+        // `targets` 缺省 = all：只记身份不限制范围。
+        assert!(p.targets.includes("codex"));
+    }
+
+    /// 只记身份、不记版本也是合法形态（本机读不到版本时 scan 就会这么写）。
+    #[test]
+    fn a_snapshot_plugin_may_record_no_version_at_all() {
+        let m = Manifest::parse("version: 1\nplugins:\n  a:\n    source: snapshot\n")
+            .expect("只有身份也是记录");
+        assert_eq!(m.plugins["a"].versions, None);
+    }
+
+    /// 这四格都在描述「从哪儿拿内容」。记录型条目**不拿内容**，写了就是把条目
+    /// 当成交付请求——那正是本形态要避免的事，所以要在校验期拦下。
+    #[test]
+    fn snapshot_rejects_every_field_that_implies_delivery() {
+        for extra in [
+            "marketplace: official",
+            "repo: obra/superpowers",
+            "ref: v6.3.0",
+            "source_harness: claude-code",
+        ] {
+            let yaml = format!("version: 1\nplugins:\n  a:\n    source: snapshot\n    {extra}\n");
+            let err = Manifest::parse(&yaml).unwrap_err().to_string();
+            assert!(
+                err.contains("source snapshot takes no"),
+                "`{extra}` 应该被拒：{err}"
+            );
+        }
+    }
+
+    /// 「记了版本却不认它是记录范围」是自相矛盾：那条版本会被目标过滤掉，
+    /// 用户却以为自己记下了。
+    #[test]
+    fn snapshot_rejects_a_version_outside_targets() {
+        let err = Manifest::parse(
+            "version: 1\nplugins:\n  a:\n    source: snapshot\n    targets: [claude-code]\n    versions:\n      kimi-code: 1.0.0\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("kimi-code"), "{err}");
+        assert!(err.contains("targets"), "{err}");
+    }
+
+    /// 拼错的家在校验期就拒——与 `source_harness:` 同一条理由。
+    #[test]
+    fn snapshot_rejects_an_unknown_harness_in_versions() {
+        let err = Manifest::parse(
+            "version: 1\nplugins:\n  a:\n    source: snapshot\n    versions:\n      claude_code: 1.0.0\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("claude_code"), "{err}");
+        assert!(err.contains("unknown harness"), "{err}");
+    }
+
+    /// 空白是打错；`unknown` 是既有的哨兵（§2.2 第 7 条）——前者拒，后者收。
+    #[test]
+    fn snapshot_rejects_a_blank_version_but_keeps_the_unknown_sentinel() {
+        let blank = Manifest::parse(
+            "version: 1\nplugins:\n  a:\n    source: snapshot\n    versions:\n      codex: \"\"\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(blank.contains("must not be empty"), "{blank}");
+
+        let sentinel = Manifest::parse(
+            "version: 1\nplugins:\n  a:\n    source: snapshot\n    versions:\n      codex: unknown\n",
+        )
+        .expect("unknown 是哨兵，不是打错");
+        let v = sentinel.plugins["a"].versions.as_ref().unwrap();
+        assert_eq!(v["codex"], "unknown");
+    }
+
+    /// 只有记录型条目读 `versions`。写在交付型来源上就是一句不会被读到的话——
+    /// 静默无效比报错更坏。
+    #[test]
+    fn versions_are_rejected_on_a_delivering_source() {
+        let err = Manifest::parse(
+            "version: 1\nplugins:\n  a:\n    source: github\n    repo: x/y\n    versions:\n      codex: 1.0.0\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("only read on `source: snapshot`"), "{err}");
+    }
+
     #[test]
     fn rejects_unknown_harness_name() {
         let err = Manifest::parse("version: 1\nharnesses:\n  cursor: { enabled: true }\n")
@@ -1238,7 +1396,7 @@ plugins:
             ),
             (
                 "version: 1\nplugins:\n  a:\n    source: sk-live-9f3a2b7c\n",
-                "failed to parse env.yaml: plugins.a.source: unknown variant (value not shown), expected one of `claude-marketplace`, `github`, `zip-url` at line 4 column 13",
+                "failed to parse env.yaml: plugins.a.source: unknown variant (value not shown), expected one of `claude-marketplace`, `github`, `zip-url`, `snapshot` at line 4 column 13",
             ),
             // 派单没点名的第 6 处同类：harnesses.*.enabled（bool），以及值里自带标记词的形态。
             (

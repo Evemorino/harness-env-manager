@@ -107,6 +107,10 @@ pub fn lower(m: &Manifest) -> Vec<Capability> {
             PluginSourceKind::ClaudeMarketplace => p.marketplace.clone(),
             PluginSourceKind::Github => p.repo.clone(),
             PluginSourceKind::ZipUrl => None,
+            // §10.3：记录型条目没有 marketplace 可言。它那格不是「未知」而是
+            // 「不适用」——`Spec::Plugin.marketplace` 恒 `None` 与「这条从哪来」
+            // 无关，因为比对只认 `entry`（身份）与 `version`。
+            PluginSourceKind::Snapshot => None,
         };
         out.push(Capability {
             id: CapId::new(Kind::Plugin, entry.clone()),
@@ -159,6 +163,40 @@ impl DegradeTable {
             Some(p) => p.action_for(cap.id.kind),
             None => DegradeAction::Report,
         }
+    }
+}
+
+/// 旁路表：plugin 身份 → 「记录型」条目的逐家版本（§10.3，`source: snapshot`）。
+///
+/// 与 [`DegradeTable`] / [`SourceHarnessTable`] 同一个先例，同一个理由：记录型的载荷
+/// **不进 `Spec`**。`Spec::Plugin` 回答「这条条目说的是哪个 plugin、装的是哪个版本」；
+/// 「清单只记录、不交付」是**条目语义**，不是装了什么的描述。
+///
+/// **`Some(空表)` 与「不在表里」是两件事**：前者是「记录了身份、没记任何版本」，
+/// 后者是「这条条目不是记录型」。前者照样吸收本家现状（它是清单要的），只是**没有
+/// 可对账的版本**——安静，而不是报一条永远修不掉的 warning。
+#[derive(Debug, Default)]
+pub struct SnapshotTable {
+    by_plugin: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+impl SnapshotTable {
+    pub fn new(m: &Manifest) -> Self {
+        let mut by_plugin = BTreeMap::new();
+        for (key, p) in &m.plugins {
+            if p.source == PluginSourceKind::Snapshot {
+                by_plugin.insert(
+                    plugin_identity(key, p),
+                    p.versions.clone().unwrap_or_default(),
+                );
+            }
+        }
+        Self { by_plugin }
+    }
+
+    /// `Some(逐家版本)` = 这条 plugin 条目是记录型（版本表可能为空）。
+    pub fn get(&self, plugin: &str) -> Option<&BTreeMap<String, String>> {
+        self.by_plugin.get(plugin)
     }
 }
 
