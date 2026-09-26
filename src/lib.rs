@@ -28,6 +28,7 @@ pub mod home;
 pub mod lower;
 pub mod manifest;
 pub mod render;
+pub mod scan;
 pub mod secrets;
 pub mod skills_dir;
 pub mod store;
@@ -73,6 +74,46 @@ impl Confirm for StdinConfirm {
     }
 }
 
+/// 逐家读现状。**只在这里发生**：`diff`/`apply`/`doctor`/`scan` 共用同一次观察——
+/// 两次 `read_state()` 之间盘面会变，共用一份才让各命令看到的「现状」是同一个东西。
+///
+/// `registry` 由调用方传进来：它是有序表，顺序决定 `pairs` 的配对，不要在函数里重建
+/// 第二份。未安装的家不 `read_state`（对不存在的目录做无谓 IO），现状记空。
+///
+/// `only` 是 §9.8 的 `--harness <name>`：**只过滤目标**。源扫描不走这里。
+pub(crate) fn read_harness_states(
+    registry: &[Box<dyn HarnessAdapter>],
+    manifest: &Manifest,
+    only: Option<&str>,
+) -> anyhow::Result<Vec<diff::HarnessState>> {
+    let mut states = Vec::new();
+    for a in registry {
+        if !is_enabled(manifest, a.name()) {
+            continue;
+        }
+        if let Some(only) = only {
+            if a.name() != only {
+                continue;
+            }
+        }
+        let detected = a.detect();
+        // 未安装 → 空现状 + detected=false，由 render 显示跳过原因；
+        // 不去 read_state，免得对不存在的目录做无谓 IO。
+        let actual = if detected {
+            a.read_state()
+                .with_context(|| format!("cannot scan {} state", a.name()))?
+        } else {
+            Vec::new()
+        };
+        states.push(diff::HarnessState {
+            name: a.name().to_string(),
+            detected,
+            actual,
+        });
+    }
+    Ok(states)
+}
+
 /// 一次规划的全部产物。`diff` 与 `apply` 共用**同一个**规划函数——
 /// 两个规划器能互相不一致，正是这个项目存在要消灭的「假同步」。
 pub(crate) struct Planned {
@@ -103,39 +144,19 @@ pub(crate) fn plan_for(
     let sources = lower::SourceHarnessTable::new(&manifest);
 
     let registry = adapters::registry(home);
+    // §9.8 的 `--harness <name>`：**只过滤目标 pairs**。源扫描在下面，
+    // 走的是 `scan_source_harnesses(&sources, &registry)`，不接收 `only`——
+    // `source_harness:` 那家哪怕被排除也照样要被读，否则它的 bundle
+    // 会凭空变成「定位不到」，用户得到一份假的 undeliverable。
+    let states = read_harness_states(&registry, &manifest, only)?;
     // state 与它的 adapter 必须成对交给 compute，故先收进同一个 Vec 再借用。
-    let mut pairs: Vec<(diff::HarnessState, &dyn HarnessAdapter)> = Vec::new();
-    for a in &registry {
-        if !is_enabled(&manifest, a.name()) {
-            continue;
-        }
-        // §9.8 的 `--harness <name>`：**只过滤目标 pairs**。源扫描在下面，
-        // 走的是 `scan_source_harnesses(&sources, &registry)`，不接收 `only`——
-        // `source_harness:` 那家哪怕被排除也照样要被读，否则它的 bundle
-        // 会凭空变成「定位不到」，用户得到一份假的 undeliverable。
-        if let Some(only) = only {
-            if a.name() != only {
-                continue;
-            }
-        }
-        let detected = a.detect();
-        // 未安装 → 空现状 + detected=false，由 render 显示跳过原因；
-        // 不去 read_state，免得对不存在的目录做无谓 IO。
-        let actual = if detected {
-            a.read_state()
-                .with_context(|| format!("cannot scan {} state", a.name()))?
-        } else {
-            Vec::new()
-        };
-        pairs.push((
-            diff::HarnessState {
-                name: a.name().to_string(),
-                detected,
-                actual,
-            },
-            &**a,
-        ));
-    }
+    let pairs: Vec<(diff::HarnessState, &dyn HarnessAdapter)> = states
+        .into_iter()
+        .map(|state| {
+            let adapter = adapters::lookup(&registry, &state.name);
+            (state, adapter.expect("read_harness_states only yields registered names"))
+        })
+        .collect();
 
     // 源 harness 按需扫（§9.5）：**不进 `pairs`**——`source_harness:` 只请求读它，
     // 不请求往它写，也不请求它多出一节 diff。它在 `harnesses:` 里很可能是关掉的，

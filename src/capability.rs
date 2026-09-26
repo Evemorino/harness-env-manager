@@ -352,7 +352,10 @@ fn compare_plugins(desired: &Spec, actual: &Spec) -> VersionMatch {
 
 /// 归一化 version 串：去前导 `v`/`V`；仅当结果含小数点（`6.3.0` 形）才返回 Some，
 /// sha 形目录名（`db467cc56673`）、分支名（`main`）等不含小数点 → None（不可比，落 Unknown）。
-fn normalize_version(value: &str) -> Option<String> {
+///
+/// `pub(crate)` 是因为 `scan` 收养 plugin 时要判「这个 version 值不值得记进 `ref:`」——
+/// 那必须与 diff 的「可比」判据同源，否则会出现「scan 记了、diff 说不可比」的两套话。
+pub(crate) fn normalize_version(value: &str) -> Option<String> {
     let v = value.trim();
     let v = v
         .strip_prefix('v')
