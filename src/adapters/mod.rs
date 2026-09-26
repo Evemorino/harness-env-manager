@@ -5,6 +5,7 @@ pub mod codex;
 pub mod kimi_code;
 
 use crate::apply::HarnessReport;
+use crate::apply::mcp::McpTarget;
 use crate::capability::{Capability, Support};
 use crate::diff::HarnessPlan;
 use crate::home::Home;
@@ -75,6 +76,12 @@ pub trait HarnessAdapter {
     /// 否则一个默认的 `None` 会让它的 skill 交付静默变成空操作。
     fn skills_target_dir(&self) -> Option<PathBuf>;
 
+    /// 这家把 MCP 写在哪、用什么机制写（§9.6）。`None` = 这家没有用户级 MCP 配置。
+    ///
+    /// 与 `skills_target_dir` 一样**没有默认实现**：默认实现会让「新加的 adapter 忘了
+    /// 说自己写在哪」编译通过，然后静默地什么都不交付。
+    fn mcp_target(&self) -> Option<McpTarget>;
+
     /// 执行层的第 2 步（spec §9.2）：把**已经解析好的**内容交付到本家。
     /// 不碰网络、不解析来源——那些在 `store` 的前置步骤里已经做完了。
     ///
@@ -89,16 +96,26 @@ pub trait HarnessAdapter {
     fn apply(
         &self,
         slice: &HarnessPlan,
+        desired: &[Capability],
         content: &ContentIndex,
         ledger: &mut Ledger,
     ) -> anyhow::Result<HarnessReport> {
-        crate::apply::deliver_skills(
+        let mut report = crate::apply::deliver_skills(
             self.name(),
             self.skills_target_dir().as_deref(),
             slice,
             content,
             ledger,
-        )
+        )?;
+        let mcps = crate::apply::mcp::deliver_mcps(
+            self.name(),
+            self.mcp_target().as_ref(),
+            slice,
+            desired,
+            ledger,
+        )?;
+        report.absorb(mcps);
+        Ok(report)
     }
 }
 
@@ -138,6 +155,7 @@ pub fn lookup<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::apply::mcp::McpMechanism;
     use crate::capability::{Kind, SkillSource, Spec};
     use crate::diff::{Action, PlanEntry};
     use crate::manifest::KNOWN_HARNESSES;
@@ -414,20 +432,61 @@ mod tests {
         let mut ledger = crate::store::provenance::Ledger::default();
         let fake = FakeAdapter::native("claude-code").with_skills_dir(t.path(".claude/skills"));
         let report = fake
-            .apply(&slice, &content, &mut ledger)
+            .apply(&slice, std::slice::from_ref(&cap), &content, &mut ledger)
             .expect("default apply must work");
         assert_eq!(report.delivered, vec!["skill/foo".to_string()]);
         assert!(t.path(".claude/skills/foo/SKILL.md").exists());
-        assert_eq!(ledger.find("claude-code", "foo").unwrap().name, "foo");
+        assert_eq!(
+            ledger.find("claude-code", Kind::Skill, "foo").unwrap().name,
+            "foo"
+        );
 
         // 没有目标目录的那家：不交付、不报错、不写账本。
         let kimi = FakeAdapter::native("kimi-code");
         let mut ledger2 = crate::store::provenance::Ledger::default();
         let report = kimi
-            .apply(&slice, &content, &mut ledger2)
+            .apply(&slice, std::slice::from_ref(&cap), &content, &mut ledger2)
             .expect("kimi 不报错");
         assert!(report.delivered.is_empty());
         assert!(report.failure.is_none());
         assert!(ledger2.entries.is_empty());
+    }
+
+    /// §9.6：三家的 MCP 写目标必须**指向读路径读的那个文件**。
+    /// 这条测试是「写进去了、读不出来」这个故障类的结构防线——
+    /// 读路径用的是 `home.claude_json()` 等三个访问器，写路径拿到的必须是同一批。
+    #[test]
+    fn every_mcp_target_points_at_the_file_the_reader_reads() {
+        let t = TempHome::new();
+        let reg = registry(&t.home);
+        let by_name = |n: &str| {
+            reg.iter()
+                .find(|a| a.name() == n)
+                .unwrap_or_else(|| panic!("{n} 不在 registry 里"))
+                .mcp_target()
+                .unwrap_or_else(|| panic!("{n} 应当有 MCP 写目标"))
+        };
+
+        let claude = by_name(CLAUDE_CODE);
+        assert_eq!(
+            claude.path,
+            t.home.claude_json(),
+            "claude 写在 ~/.claude.json"
+        );
+        assert_eq!(
+            claude.mechanism,
+            McpMechanism::ClaudeCli {
+                binary: PathBuf::from("claude")
+            },
+            "生产里必须是裸 `claude`：走 PATH，与用户手敲的是同一件事"
+        );
+
+        let codex = by_name(CODEX);
+        assert_eq!(codex.path, t.home.codex_config());
+        assert_eq!(codex.mechanism, McpMechanism::CodexToml);
+
+        let kimi = by_name(KIMI_CODE);
+        assert_eq!(kimi.path, t.home.kimi_mcp());
+        assert_eq!(kimi.mechanism, McpMechanism::KimiJson);
     }
 }

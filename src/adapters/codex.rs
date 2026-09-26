@@ -1,5 +1,6 @@
 use crate::adapters::claude_code::split_plugin_key;
 use crate::adapters::{CODEX, HarnessAdapter};
+use crate::apply::mcp::{McpMechanism, McpTarget};
 use crate::capability::{CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets};
 use crate::home::Home;
 use crate::skills_dir::{SkillStore, plugin_from_path, try_read_skill_entries};
@@ -224,6 +225,13 @@ impl HarnessAdapter for Codex {
 
     fn skills_target_dir(&self) -> Option<PathBuf> {
         Some(self.home.codex_skills())
+    }
+
+    fn mcp_target(&self) -> Option<McpTarget> {
+        Some(McpTarget {
+            path: self.home.codex_config(),
+            mechanism: McpMechanism::CodexToml,
+        })
     }
 
     fn supports(&self, _cap: &Capability) -> Support {

@@ -75,6 +75,9 @@ impl Confirm for StdinConfirm {
 /// 两个规划器能互相不一致，正是这个项目存在要消灭的「假同步」。
 struct Planned {
     plan: diff::Plan,
+    /// 清单 lower 后的能力表。MCP 的交付要拿它的三段载荷——`plan` 里只有 id 与动作。
+    /// `diff` 不看它（它只读），但两个入口共用 `plan_for`，所以它跟着一起返回。
+    desired: Vec<capability::Capability>,
     content: store::skills::ContentIndex,
     ledger: store::provenance::Ledger,
 }
@@ -150,6 +153,7 @@ fn plan_for(
     let plan = diff::compute(&desired, &inputs, &degrade, &content, &ledger);
     Ok(Planned {
         plan,
+        desired,
         content,
         ledger,
     })
@@ -184,10 +188,18 @@ pub fn run_skills_list(
         // 空结果与「命令失败」是两回事：看过了，只是里面没有 skill。
         return Ok(format!("没有找到含 SKILL.md 的目录（看了 {repo}）\n"));
     }
-    let width = found.iter().map(|(n, _)| n.chars().count()).max().unwrap_or(0);
+    let width = found
+        .iter()
+        .map(|(n, _)| n.chars().count())
+        .max()
+        .unwrap_or(0);
     let mut out = String::new();
     for (name, rel) in found {
-        let _ = writeln!(out, "{name}{}  {rel}", " ".repeat(width - name.chars().count()));
+        let _ = writeln!(
+            out,
+            "{name}{}  {rel}",
+            " ".repeat(width - name.chars().count())
+        );
     }
     Ok(out)
 }
@@ -250,7 +262,13 @@ pub fn run_apply(
         return Ok(());
     }
 
-    let report = apply::execute(&planned.plan, &planned.content, &mut planned.ledger, home)?;
+    let report = apply::execute(
+        &planned.plan,
+        &planned.desired,
+        &planned.content,
+        &mut planned.ledger,
+        home,
+    )?;
     for h in &report.harnesses {
         for id in &h.delivered {
             let _ = writeln!(out, "{:<13} delivered {}", h.harness, id);
@@ -278,6 +296,7 @@ fn is_enabled(m: &Manifest, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capability::Kind;
     use crate::testutil::TempHome;
 
     #[test]
@@ -532,10 +551,13 @@ mod tests {
 
         // §9.3：账本落在任何内容目录之外。
         let ledger = crate::store::provenance::Ledger::load(&t.home).unwrap();
-        assert!(ledger.find(CLAUDE_CODE, "foo").is_some());
-        assert!(ledger.find(CODEX, "foo").is_some());
+        assert!(ledger.find(CLAUDE_CODE, Kind::Skill, "foo").is_some());
+        assert!(ledger.find(CODEX, Kind::Skill, "foo").is_some());
         assert_eq!(
-            ledger.find(CLAUDE_CODE, "foo").unwrap().source_id,
+            ledger
+                .find(CLAUDE_CODE, Kind::Skill, "foo")
+                .unwrap()
+                .source_id,
             "agents-dir"
         );
         assert!(t.path(".local/state/henv/provenance.json").exists());

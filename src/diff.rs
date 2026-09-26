@@ -9,9 +9,11 @@
 use crate::adapters::HarnessAdapter;
 use crate::capability::{
     CapId, Capability, Kind, SkillSource, Spec, Support, VersionMatch, compare_versions,
+    mcp_summary,
 };
 use crate::lower::DegradeTable;
 use crate::manifest::DegradeAction;
+use crate::store::hash::hash_mcp_spec;
 use crate::store::provenance::Ledger;
 use crate::store::skills::{ContentIndex, ResolvedContent, TargetContent, Unresolved};
 use std::collections::{BTreeMap, HashSet};
@@ -196,7 +198,7 @@ fn content_verdict(
                 from: short_hash(h),
                 to: short_hash(&src.hash),
             };
-            match ledger.find(harness, &cap.id.name) {
+            match ledger.find(harness, cap.id.kind, &cap.id.name) {
                 // 账本记的就是盘上这个哈希：内容是 henv 放的，也没人动过。
                 Some(entry) if &entry.content_hash == h => Some(Verdict {
                     action,
@@ -225,6 +227,80 @@ fn content_verdict(
             }
         }
     }
+}
+
+/// 取出 MCP 的三段载荷；不是 MCP 就 `None`。
+fn mcp_fields(spec: &Spec) -> Option<(&str, &[String], &BTreeMap<String, String>)> {
+    match spec {
+        Spec::Mcp { command, args, env } => Some((command, args, env)),
+        _ => None,
+    }
+}
+
+/// 从账本层裁决一条 MCP（§9.6 的判定表）。
+///
+/// 「是谁放的」这件事，内容层（skill）从字节读得出来，MCP 读不出来——目标侧只有
+/// 一份配置，没有来源痕迹。所以这里的证据是账本：**本次交付时记下的哈希**。
+///
+/// 返回 `None` = 这条不是 MCP（或现状不是），交给原来的 `compare_versions`。
+fn mcp_verdict(
+    harness: &str,
+    cap: &Capability,
+    actual: &Capability,
+    ledger: &Ledger,
+) -> Option<Verdict> {
+    let (dc, da, de) = mcp_fields(&cap.spec)?;
+    let (ac, aa, ae) = mcp_fields(&actual.spec)?;
+
+    // 第一行：字节相同就不看账本。与 content_verdict 同一条道理——
+    // 目标已经是对的了，它当初是谁放的不改变这个事实。
+    if dc == ac && da == aa && de == ae {
+        return Some(Verdict {
+            action: Action::InSync,
+            note: None,
+        });
+    }
+
+    let to = mcp_summary(dc, da, de);
+    let from = mcp_summary(ac, aa, ae);
+    match ledger.find(harness, Kind::Mcp, &cap.id.name) {
+        // 不同 + 无账本：目标上有一个同名、内容不同、又不是我们放的东西。
+        // §9.3 不变式二：绝不覆盖，报出来让人自己决定。
+        None => Some(Verdict {
+            action: Action::Conflict {
+                reason: format!("目标已存在同名 MCP 且不是 henv 交付的（{from}），apply 不会覆盖"),
+            },
+            note: None,
+        }),
+        // 哈希算的是**现状**（从配置里读回来的那份），不是期望。
+        // 拿期望去比，改一次清单就会让所有 MCP 假报「被手改过」。
+        Some(entry) if entry.content_hash == hash_mcp_spec(ac, aa, ae) => Some(Verdict {
+            action: Action::Update { from, to },
+            note: None,
+        }),
+        Some(_) => Some(Verdict {
+            action: Action::Update { from, to },
+            note: Some("副本被手改过".to_string()),
+        }),
+    }
+}
+
+/// 内容层判得动就内容层，判不动就账本层（§9.6）。
+///
+/// 两层的适用面互斥：`content_verdict` 只认 `Spec::Skill`（第一行 `content.sources.get`），
+/// `mcp_verdict` 只认 `Spec::Mcp`——所以这个 `or_else` 不是「谁优先」的策略，
+/// 是「按 kind 分派」的写法。
+fn ownership_verdict(
+    harness: &str,
+    cap: &Capability,
+    actual: Option<&Capability>,
+    content: &ContentIndex,
+    ledger: &Ledger,
+) -> Option<Verdict> {
+    content_verdict(harness, cap, content, ledger).or_else(|| {
+        let actual = actual?;
+        mcp_verdict(harness, cap, actual, ledger)
+    })
 }
 
 /// 源这次是「沿用缓存」时给行尾的注记（§9.4）。它不参与任何判定，
@@ -301,20 +377,19 @@ pub fn compute(
                 }
                 Support::Native | Support::Degraded { .. } => {
                     matched.insert(cap.id.clone());
+                    // 实际条目先找出来：内容层（skill）与账本层（mcp）的裁决都需要它。
+                    let actual = state.actual.iter().find(|a| a.id == cap.id);
                     let (verdict_action, verdict_note) =
-                        match content_verdict(&state.name, cap, content, ledger) {
+                        match ownership_verdict(&state.name, cap, actual, content, ledger) {
                             Some(v) => (Some(v.action), v.note),
-                            // 内容层判不了（目标侧没扫到这条，或清单侧没解析出内容）不等于
+                            // 两层都判不了（不是 skill 也不是 mcp，或目标侧没扫到）不等于
                             // 「没什么好说的」：源这次是沿用没刷新的缓存时，「你看到的这份内容
                             // 没经过上游确认」照样成立，而且 install 是它最要紧的一条路——
                             // 要写盘的正是这些没确认过的字节。stale 是源的属性，不该因为
                             // 目标侧扫不到就消失。
-                            None => (
-                                None,
-                                content.sources.get(&cap.id).and_then(stale_note),
-                            ),
+                            None => (None, content.sources.get(&cap.id).and_then(stale_note)),
                         };
-                    let action = match state.actual.iter().find(|a| a.id == cap.id) {
+                    let action = match actual {
                         None => Action::Install,
                         Some(a) => match &a.spec {
                             // 装了但被禁用：plugin 的 skills/hooks/commands 一个都不生效，报 in-sync
@@ -441,7 +516,30 @@ mod tests {
         }
     }
 
+    /// 既有测试的默认入口：空账本。
     fn run(desired: &[Capability], adapter: FakeAdapter) -> HarnessPlan {
+        run_with_ledger(desired, adapter, &Ledger::default())
+    }
+
+    fn plan_a_with_ledger(
+        desired: &[Capability],
+        inputs: &[HarnessInput],
+        ledger: &Ledger,
+    ) -> Plan {
+        compute(
+            desired,
+            inputs,
+            &no_degrade(),
+            &ContentIndex::default(),
+            ledger,
+        )
+    }
+
+    fn run_with_ledger(
+        desired: &[Capability],
+        adapter: FakeAdapter,
+        ledger: &Ledger,
+    ) -> HarnessPlan {
         let state = HarnessState {
             name: adapter.name().to_string(),
             detected: adapter.detect(),
@@ -451,8 +549,11 @@ mod tests {
             state: &state,
             adapter: &adapter,
         }];
-        let plan = plan_a(desired, &inputs);
-        plan.harnesses.into_iter().next().unwrap()
+        plan_a_with_ledger(desired, &inputs, ledger)
+            .harnesses
+            .into_iter()
+            .next()
+            .unwrap()
     }
 
     fn labels(hp: &HarnessPlan) -> Vec<(String, String)> {
@@ -499,13 +600,70 @@ mod tests {
         );
     }
 
+    fn mcp_entry(harness: &str, name: &str, hash: &str) -> LedgerEntry {
+        LedgerEntry {
+            harness: harness.into(),
+            kind: Kind::Mcp,
+            name: name.into(),
+            path: PathBuf::from("/cfg").join(harness),
+            source_id: format!("manifest:mcp/{name}"),
+            content_hash: hash.into(),
+            delivered_at_unix: 1_700_000_000,
+        }
+    }
+
+    /// §9.6 表第一行：字节相同就不看账本。账本里有没有这条、是不是 henv 交付的，
+    /// 都不改变「它已经是对的了」。
     #[test]
-    fn changed_command_is_update_with_actual_then_desired() {
+    fn an_identical_mcp_is_in_sync_even_without_a_ledger_entry() {
         let hp = run(
             &[desired(Kind::Mcp, "context7", mcp_spec("npx"))],
-            FakeAdapter::native("codex").with_caps(vec![FakeAdapter::mcp("context7", "old")]),
+            FakeAdapter::native("codex").with_caps(vec![FakeAdapter::mcp("context7", "npx")]),
         );
-        assert_eq!(hp.entries.len(), 1);
+        assert_eq!(labels(&hp), vec![("mcp/context7".into(), "in-sync".into())]);
+    }
+
+    /// §9.6 表第二行：不同 + 无账本 = 不是 henv 交付的 → conflict。
+    /// 这条**取代**了 B1 时期那个「不同即 update」的旧结论。
+    #[test]
+    fn a_differing_mcp_without_a_ledger_entry_is_a_conflict() {
+        let hp = run(
+            &[desired(Kind::Mcp, "context7", mcp_spec("npx"))],
+            FakeAdapter::native("codex").with_caps(vec![FakeAdapter::mcp("context7", "other")]),
+        );
+        assert_eq!(
+            labels(&hp),
+            vec![("mcp/context7".into(), "conflict".into())]
+        );
+        match &hp.entries[0].action {
+            Action::Conflict { reason } => assert!(
+                reason.contains("不是 henv 交付的"),
+                "理由要说清为什么不动手：{reason}"
+            ),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// §9.6 表第三行：不同 + 有账本 + 账本哈希 == 现状 → 是我们交付的旧版本，放心 update。
+    /// 账本哈希算的是**现状**（从配置里读回来的那份），不是期望。
+    #[test]
+    fn a_differing_mcp_we_delivered_is_an_update() {
+        let actual = FakeAdapter::mcp("context7", "old");
+        let Spec::Mcp { command, args, env } = &actual.spec else {
+            unreachable!()
+        };
+        let mut l = Ledger::default();
+        l.record(mcp_entry(
+            "codex",
+            "context7",
+            &crate::store::hash::hash_mcp_spec(command, args, env),
+        ));
+
+        let hp = run_with_ledger(
+            &[desired(Kind::Mcp, "context7", mcp_spec("npx"))],
+            FakeAdapter::native("codex").with_caps(vec![actual]),
+            &l,
+        );
         match &hp.entries[0].action {
             Action::Update { from, to } => {
                 assert_eq!(from, "old", "from = 现状");
@@ -513,6 +671,75 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+        assert_eq!(hp.entries[0].note, None, "没被手改过就不该有注");
+    }
+
+    /// §9.6 表第四行：账本哈希 != 现状 → 交付之后有人改了它。仍然 update
+    /// （账本说这块地是我们的），但要把这件事说出来。
+    #[test]
+    fn a_delivered_mcp_edited_by_hand_gets_the_note() {
+        let mut l = Ledger::default();
+        l.record(mcp_entry("codex", "context7", "hash-of-something-else"));
+
+        let hp = run_with_ledger(
+            &[desired(Kind::Mcp, "context7", mcp_spec("npx"))],
+            FakeAdapter::native("codex").with_caps(vec![FakeAdapter::mcp("context7", "old")]),
+            &l,
+        );
+        assert!(matches!(hp.entries[0].action, Action::Update { .. }));
+        assert_eq!(hp.entries[0].note.as_deref(), Some("副本被手改过"));
+    }
+
+    /// 改造之后**不能再**拿期望的哈希去比账本：那样清单每改一次，
+    /// 所有 MCP 都会假报「被手改过」——这正是本 Task 最容易写错的一处。
+    /// 构造：账本记的是**旧期望**的哈希，而现状是同一份内容。
+    #[test]
+    fn changing_the_manifest_does_not_fake_a_hand_edit() {
+        let old_desired = FakeAdapter::mcp("context7", "npx");
+        let Spec::Mcp { command, args, env } = &old_desired.spec else {
+            unreachable!()
+        };
+        let mut l = Ledger::default();
+        l.record(mcp_entry(
+            "codex",
+            "context7",
+            &crate::store::hash::hash_mcp_spec(command, args, env),
+        ));
+
+        // 现状与账本哈希一致 → 没被手改过，尽管期望已经变了
+        let hp = run_with_ledger(
+            &[desired(Kind::Mcp, "context7", mcp_spec("uvx"))],
+            FakeAdapter::native("codex").with_caps(vec![FakeAdapter::mcp("context7", "npx")]),
+            &l,
+        );
+        assert_eq!(hp.entries[0].note, None, "改了清单不是「被手改过」");
+    }
+
+    /// 同名的一件事：skill 与 mcp 的账本槽不能串（Task 1 的签名在 diff 里的兑现）。
+    #[test]
+    fn an_mcp_verdict_does_not_read_the_skill_ledger_slot() {
+        let mut l = Ledger::default();
+        // 只记了 skill 那条，mcp 那条没有
+        l.record(LedgerEntry {
+            harness: "codex".into(),
+            kind: Kind::Skill,
+            name: "context7".into(),
+            path: PathBuf::from("/skills/context7"),
+            source_id: "agents-dir".into(),
+            content_hash: "skill-hash".into(),
+            delivered_at_unix: 1,
+        });
+
+        let hp = run_with_ledger(
+            &[desired(Kind::Mcp, "context7", mcp_spec("npx"))],
+            FakeAdapter::native("codex").with_caps(vec![FakeAdapter::mcp("context7", "other")]),
+            &l,
+        );
+        assert_eq!(
+            labels(&hp),
+            vec![("mcp/context7".into(), "conflict".into())],
+            "skill 的账本条目不许被当成 mcp 的交付凭证"
+        );
     }
 
     #[test]
@@ -1012,6 +1239,9 @@ mod tests {
             fn skills_target_dir(&self) -> Option<PathBuf> {
                 None
             }
+            fn mcp_target(&self) -> Option<crate::apply::mcp::McpTarget> {
+                None
+            }
         }
         let s = HarnessState {
             name: "codex".into(),
@@ -1107,7 +1337,12 @@ mod tests {
     }
 
     /// 与 `content_with` 同一份内容，只是这次是**沿用缓存**拿到的（§9.4）。
-    fn stale_content(name: &str, source_hash: &str, target: TargetContent, why: &str) -> ContentIndex {
+    fn stale_content(
+        name: &str,
+        source_hash: &str,
+        target: TargetContent,
+        why: &str,
+    ) -> ContentIndex {
         let mut idx = content_with(name, source_hash, target);
         idx.sources
             .get_mut(&CapId::new(Kind::Skill, name))
@@ -1166,10 +1401,8 @@ mod tests {
     fn a_failed_source_turns_a_promised_install_into_undeliverable() {
         // 清单说了要装，源却拿不到——这不是「跳过」，是「承诺了的事做不到」。
         // 计划里就必须看得见（§9.1），不能等交付层什么都不做、什么都不说。
-        let content = content_with_unresolved(
-            "foo",
-            Unresolved::Failed("源目录不存在：/nope".into()),
-        );
+        let content =
+            content_with_unresolved("foo", Unresolved::Failed("源目录不存在：/nope".into()));
         let plan = content_plan(vec![], &content, &Ledger::default());
         match &entry_of(&plan, "skill/foo").action {
             Action::Undeliverable { reason } => assert!(

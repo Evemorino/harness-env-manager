@@ -3,6 +3,7 @@ use crate::adapters::claude_code::{
     optional_string, read_json_if_present,
 };
 use crate::adapters::{HarnessAdapter, KIMI_CODE};
+use crate::apply::mcp::{McpMechanism, McpTarget};
 use crate::capability::{
     CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets, normalize_locator,
 };
@@ -233,6 +234,13 @@ impl HarnessAdapter for KimiCode {
     /// 这里返回 `None` 是与之一致的事实陈述，不是第二处独立的拒绝判定。
     fn skills_target_dir(&self) -> Option<PathBuf> {
         None
+    }
+
+    fn mcp_target(&self) -> Option<McpTarget> {
+        Some(McpTarget {
+            path: self.home.kimi_mcp(),
+            mechanism: McpMechanism::KimiJson,
+        })
     }
 
     fn supports(&self, cap: &Capability) -> Support {

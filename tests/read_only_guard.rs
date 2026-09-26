@@ -32,15 +32,21 @@ const WRITE_API: &[&str] = &[
 ///
 /// 为什么单独一张表：`src/store/` 允许写文件，而 shell out 比写文件强得多——它能做这个
 /// 进程权限内的任何事。目录级豁免会把「这个目录可以写文件」悄悄升级成「这个目录可以起
-/// 进程」。B2 的 git 与 B3 的 `claude mcp add-json` 是这个项目第一次真的调用外部程序，
-/// 绊线必须收紧到文件名。
+/// 进程」。B2 的 git 与 B3a 的 `claude mcp add-json` 是这个项目第一次真的调用外部程序，
+/// 绊线必须收紧到文件名——B3a 到了，表里因此多了第三个文件，而不是一个目录前缀。
 const PROCESS_CALLS: &[&str] = &["Command::new("];
 
 /// 允许 shell out 的文件，白名单精确到路径全等。
 ///
 /// - `src/store/git.rs`：git 源解析，整个模块的存在理由就是调 git（§9.12）。
-/// - `src/testutil.rs`：测试夹具要造本地 git 仓库，但它只在 `cfg(test)` 下编译。
-const PROCESS_ALLOWLIST: &[&str] = &["src/store/git.rs", "src/testutil.rs"];
+/// - `src/testutil.rs`：测试夹具要造本地 git 仓库与假 CLI，但它只在 `cfg(test)` 下编译。
+/// - `src/apply/mcp_claude.rs`：claude 的 MCP 写入交给它自己的 CLI——`~/.claude.json`
+///   被 harness 频繁整体重写，直接 merge 会与它并发写竞争（§9.6 第 1 行）。
+const PROCESS_ALLOWLIST: &[&str] = &[
+    "src/store/git.rs",
+    "src/testutil.rs",
+    "src/apply/mcp_claude.rs",
+];
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {

@@ -3,6 +3,7 @@
 
 use anyhow::Context as _;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// 目录（或单文件）的内容指纹，十六进制 SHA-256。
@@ -37,6 +38,35 @@ pub fn hash_dir(path: &Path) -> anyhow::Result<Option<String>> {
 pub fn hash_str(s: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(s.as_bytes());
+    hex(hasher.finalize().as_slice())
+}
+
+/// MCP 的三段载荷的规范化哈希，用作账本的 `content_hash`。
+///
+/// **为什么收三个字段而不是一个 `&Spec`**：`Spec` 没有 `Serialize`；为哈希去 derive
+/// serde 会把序列化形状变成对外契约。而 `&Spec` 版本还得为另外五个变体写永远走不到的
+/// arm——错误最喜欢住在那儿。三个原生字段顺带让「拿一个 skill spec 来算 mcp 哈希」
+/// 在类型上不可表达。
+///
+/// **env 的值参与哈希**，与 `capability::mcp_summary`（只渲染键名，§3 决策 3）不同：
+/// 摘要是给人看的，哈希是给 `compare_versions` 的 Same/Different 判定配套的账面。
+pub fn hash_mcp_spec(command: &str, args: &[String], env: &BTreeMap<String, String>) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update([0u8, 0]);
+    hasher.update(command.as_bytes());
+    hasher.update([0]);
+    hasher.update((args.len() as u64).to_le_bytes());
+    for a in args {
+        hasher.update((a.len() as u64).to_le_bytes());
+        hasher.update(a.as_bytes());
+    }
+    hasher.update((env.len() as u64).to_le_bytes());
+    for (k, v) in env {
+        hasher.update((k.len() as u64).to_le_bytes());
+        hasher.update(k.as_bytes());
+        hasher.update((v.len() as u64).to_le_bytes());
+        hasher.update(v.as_bytes());
+    }
     hex(hasher.finalize().as_slice())
 }
 
@@ -97,6 +127,56 @@ fn hex(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::testutil::TempHome;
+
+    /// 与 `mcp_summary` 的关键区别：**env 值参与哈希**。`compare_versions` 的 Mcp arm
+    /// 比的是 `dc == ac && da == aa && de == ae`——env 值不同就是 Different，
+    /// 所以哈希也必须把值算进去，否则账本会说「这是我交付的」而 diff 说不一致。
+    #[test]
+    fn hash_mcp_spec_covers_all_three_fields() {
+        let none = BTreeMap::new();
+        let a = hash_mcp_spec("npx", &["-y".into(), "pkg".into()], &none);
+        assert_eq!(
+            a,
+            hash_mcp_spec("npx", &["-y".into(), "pkg".into()], &none),
+            "同输入同哈希"
+        );
+        assert_ne!(
+            a,
+            hash_mcp_spec("npxx", &["-y".into(), "pkg".into()], &none),
+            "command 要算"
+        );
+        assert_ne!(a, hash_mcp_spec("npx", &["-y".into()], &none), "args 要算");
+        assert_ne!(
+            a,
+            hash_mcp_spec("npx", &["y".into(), "pkg".into()], &none),
+            "args 逐项比"
+        );
+
+        let mut e1 = BTreeMap::new();
+        e1.insert("K".to_string(), "${K}".to_string());
+        let mut e2 = BTreeMap::new();
+        e2.insert("K".to_string(), "${OTHER}".to_string());
+        assert_ne!(
+            hash_mcp_spec("npx", &[], &e1),
+            hash_mcp_spec("npx", &[], &e2),
+            "env 的**值**要算——只算键名会让两种不同的配置哈希相同"
+        );
+        assert_ne!(
+            hash_mcp_spec("npx", &[], &none),
+            hash_mcp_spec("npx", &[], &e1)
+        );
+    }
+
+    /// 长度前缀不可省：`("ab","c")` 与 `("a","bc")` 不许喂出同一串字节。
+    /// 这条测试对着 `feed` 的那条注释，注释里的承诺必须真的成立。
+    #[test]
+    fn hash_mcp_spec_is_not_confused_by_field_boundaries() {
+        let none = BTreeMap::new();
+        assert_ne!(
+            hash_mcp_spec("ab", &["c".into()], &none),
+            hash_mcp_spec("a", &["bc".into()], &none)
+        );
+    }
 
     #[test]
     fn missing_path_has_no_content_hash() {
@@ -216,7 +296,9 @@ mod tests {
         assert_ne!(hash_str("a"), hash_str("b"));
         assert_eq!(hash_str("").len(), 64, "空串也有指纹，不返回 None");
         assert!(
-            hash_str("x").chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            hash_str("x")
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "与 hash_dir 同一形态：小写十六进制"
         );
     }

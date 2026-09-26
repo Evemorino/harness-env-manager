@@ -106,18 +106,21 @@ impl Ledger {
         Ok(())
     }
 
-    pub fn find(&self, harness: &str, name: &str) -> Option<&LedgerEntry> {
+    /// 按 `(harness, kind, name)` 找。**kind 不可省**：同名的一个 skill 与一个 mcp
+    /// 落在不同的目标位置上（前者是 `~/.claude/skills/<n>`，后者是 `~/.claude.json`
+    /// 里的一个键），账本把它们当成一条记录的话，后交付的那个会把前一个顶掉。
+    pub fn find(&self, harness: &str, kind: Kind, name: &str) -> Option<&LedgerEntry> {
         self.entries
             .iter()
-            .find(|e| e.harness == harness && e.name == name)
+            .find(|e| e.harness == harness && e.kind == kind && e.name == name)
     }
 
-    /// 记一条（同 harness+name 覆盖旧的）。`apply` 交付成功后调用。
+    /// 按 `(harness, kind, name)` upsert。`apply` 交付成功后调用。
     pub fn record(&mut self, entry: LedgerEntry) {
         match self
             .entries
             .iter_mut()
-            .find(|e| e.harness == entry.harness && e.name == entry.name)
+            .find(|e| e.harness == entry.harness && e.kind == entry.kind && e.name == entry.name)
         {
             Some(slot) => *slot = entry,
             None => self.entries.push(entry),
@@ -132,9 +135,13 @@ mod tests {
     use crate::testutil::TempHome;
 
     fn entry(harness: &str, name: &str, hash: &str) -> LedgerEntry {
+        entry_of(harness, Kind::Skill, name, hash)
+    }
+
+    fn entry_of(harness: &str, kind: Kind, name: &str, hash: &str) -> LedgerEntry {
         LedgerEntry {
             harness: harness.into(),
-            kind: Kind::Skill,
+            kind,
             name: name.into(),
             path: PathBuf::from("/somewhere").join(name),
             source_id: "agents-dir".into(),
@@ -160,9 +167,15 @@ mod tests {
 
         let back = Ledger::load(&t.home).unwrap();
         assert_eq!(back, l);
-        assert_eq!(back.find("claude-code", "foo").unwrap().name, "foo");
-        assert!(back.find("claude-code", "bar").is_none());
-        assert!(back.find("codex", "foo").is_none(), "同名不同家不能串");
+        assert_eq!(
+            back.find("claude-code", Kind::Skill, "foo").unwrap().name,
+            "foo"
+        );
+        assert!(back.find("claude-code", Kind::Skill, "bar").is_none());
+        assert!(
+            back.find("codex", Kind::Skill, "foo").is_none(),
+            "同名不同家不能串"
+        );
     }
 
     #[test]
@@ -197,7 +210,52 @@ mod tests {
         l.record(entry("codex", "foo", "old"));
         l.record(entry("codex", "foo", "new"));
         assert_eq!(l.entries.len(), 1, "同 harness+name 是 upsert，不是追加");
-        assert_eq!(l.find("codex", "foo").unwrap().content_hash, "new");
+        assert_eq!(
+            l.find("codex", Kind::Skill, "foo").unwrap().content_hash,
+            "new"
+        );
+    }
+
+    /// B3a：同名的一个 skill 与一个 mcp 是**两件不同的东西**——
+    /// `~/.claude/skills/foo` 与 `~/.claude.json` 里的 `foo` 没有任何关系。
+    /// B1 的键只有 `(harness, name)`，mcp 一进来两边就会互相顶掉：
+    /// 记了 mcp 之后 diff 会以为那个 skill 没交付过，转头报成 conflict。
+    #[test]
+    fn a_skill_and_an_mcp_with_the_same_name_occupy_different_slots() {
+        let mut l = Ledger::default();
+        l.record(entry_of("claude-code", Kind::Mcp, "foo", "mcp-hash"));
+        l.record(entry_of("claude-code", Kind::Skill, "foo", "skill-hash"));
+
+        assert_eq!(l.entries.len(), 2, "同名不同 kind 是两条记录，不是一条");
+        assert_eq!(
+            l.find("claude-code", Kind::Skill, "foo")
+                .unwrap()
+                .content_hash,
+            "skill-hash"
+        );
+        assert_eq!(
+            l.find("claude-code", Kind::Mcp, "foo")
+                .unwrap()
+                .content_hash,
+            "mcp-hash"
+        );
+
+        // record 的覆盖也按三元组：同名 mcp 再记一次是替换那一条，不动 skill 那条
+        l.record(entry_of("claude-code", Kind::Mcp, "foo", "mcp-v2"));
+        assert_eq!(l.entries.len(), 2, "upsert 不该新增行");
+        assert_eq!(
+            l.find("claude-code", Kind::Mcp, "foo")
+                .unwrap()
+                .content_hash,
+            "mcp-v2"
+        );
+        assert_eq!(
+            l.find("claude-code", Kind::Skill, "foo")
+                .unwrap()
+                .content_hash,
+            "skill-hash",
+            "改 mcp 不能碰到同名 skill"
+        );
     }
 
     #[test]

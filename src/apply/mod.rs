@@ -1,6 +1,6 @@
 //! 执行层（spec §9.2/§9.7）。**这是全项目唯一落盘的地方**（§9.9 白名单）。
 
-use crate::capability::Kind;
+use crate::capability::{Capability, Kind};
 use crate::diff::{Action, HarnessPlan, Plan};
 use crate::home::Home;
 use crate::store::hash::hash_dir;
@@ -9,6 +9,10 @@ use crate::store::skills::ContentIndex;
 use anyhow::Context as _;
 use std::path::Path;
 
+pub mod mcp;
+pub mod mcp_claude;
+pub mod mcp_json;
+pub mod mcp_toml;
 pub mod write;
 
 pub use write::deliver_skill;
@@ -21,6 +25,23 @@ pub struct HarnessReport {
     pub delivered: Vec<String>,
     /// `Some` = 这家只做成了一部分（§9.7 失败隔离）。没有回滚，重跑就是修复路径。
     pub failure: Option<String>,
+}
+
+impl HarnessReport {
+    /// 把同一家的第二批交付并进第一批（§9.6：一家有两种写路径，报告只有一个）。
+    ///
+    /// `delivered` 合并后重排——「按 label 排好序」是这个类型的契约，
+    /// 两份各自有序不保证合并后有序。
+    pub fn absorb(&mut self, other: HarnessReport) {
+        self.delivered.extend(other.delivered);
+        self.delivered.sort();
+        if let Some(f) = other.failure {
+            self.failure = Some(match self.failure.take() {
+                Some(prev) => format!("{prev}; {f}"),
+                None => f,
+            });
+        }
+    }
 }
 
 /// 一家 harness 的 skill 交付（§9.2 第 2 步）。
@@ -136,8 +157,12 @@ impl ApplyReport {
 ///
 /// harness 级的失败进 `HarnessReport.failure` 而不上抛（失败隔离，§9.7）；
 /// 返回 `Err` 只留给冲突与「压根没法开始」。没有回滚命令——重跑就是修复路径。
+///
+/// `desired` 是清单 lower 后的能力表——MCP 的交付要拿它的三段载荷
+/// （`plan` 里只有 id 与动作，没有要写进去的字节）。
 pub fn execute(
     plan: &Plan,
+    desired: &[Capability],
     content: &ContentIndex,
     ledger: &mut Ledger,
     home: &Home,
@@ -171,7 +196,7 @@ pub fn execute(
         let Some(adapter) = crate::adapters::lookup(&registry, &hp.harness) else {
             continue;
         };
-        match adapter.apply(hp, content, ledger) {
+        match adapter.apply(hp, desired, content, ledger) {
             Ok(r) => report.harnesses.push(r),
             // adapter 级失败（连目标目录都建不出来）——也走 partial，不上抛。
             Err(e) => report.harnesses.push(HarnessReport {
@@ -240,7 +265,9 @@ mod tests {
 
         assert_eq!(report.delivered, vec!["skill/foo".to_string()]);
         assert!(report.failure.is_none());
-        let entry = ledger.find("claude-code", "foo").expect("must be recorded");
+        let entry = ledger
+            .find("claude-code", Kind::Skill, "foo")
+            .expect("must be recorded");
         assert_eq!(entry.source_id, "agents-dir");
         assert_eq!(entry.path, t.path(".claude/skills/foo"));
         assert_ne!(entry.content_hash, "ignored-on-purpose");
@@ -305,7 +332,7 @@ mod tests {
         assert!(failure.contains("skill/bad"), "{failure}");
         assert!(t.path(".claude/skills/ok/SKILL.md").exists());
         assert!(
-            ledger.find("claude-code", "bad").is_none(),
+            ledger.find("claude-code", Kind::Skill, "bad").is_none(),
             "失败的条目不记账"
         );
     }
@@ -425,7 +452,7 @@ mod tests {
     }
 
     /// 在一个 TempHome 上真的跑一次 execute：claude 装了、codex 装了、kimi 没装。
-    fn end_to_end(t: &TempHome) -> (Plan, ContentIndex) {
+    fn end_to_end(t: &TempHome) -> (Plan, Vec<Capability>, ContentIndex) {
         t.write("src/foo/SKILL.md", "# foo");
         t.mkdir(".claude").mkdir(".codex");
         let manifest = crate::manifest::Manifest::parse("version: 1\n").unwrap();
@@ -475,15 +502,15 @@ mod tests {
             &content,
             &Ledger::default(),
         );
-        (plan, content)
+        (plan, desired, content)
     }
 
     #[test]
     fn execute_delivers_to_both_harnesses_that_have_a_skills_directory() {
         let t = TempHome::new();
-        let (plan, content) = end_to_end(&t);
+        let (plan, desired, content) = end_to_end(&t);
         let mut ledger = Ledger::default();
-        let report = execute(&plan, &content, &mut ledger, &t.home).unwrap();
+        let report = execute(&plan, &desired, &content, &mut ledger, &t.home).unwrap();
 
         let names: Vec<&str> = report
             .harnesses
@@ -500,8 +527,8 @@ mod tests {
         assert!(t.path(".claude/skills/foo/SKILL.md").exists());
         assert!(t.path(".codex/skills/foo/SKILL.md").exists());
         assert!(!t.path(".kimi-code/skills").exists(), "kimi 没有这个目录");
-        assert!(ledger.find(CLAUDE_CODE, "foo").is_some());
-        assert!(ledger.find("codex", "foo").is_some());
+        assert!(ledger.find(CLAUDE_CODE, Kind::Skill, "foo").is_some());
+        assert!(ledger.find("codex", Kind::Skill, "foo").is_some());
     }
 
     #[test]
@@ -509,7 +536,7 @@ mod tests {
         // §9.3 不变式二 + 「停下」的字面意思：一个字节都不许写，
         // 包括别的 harness 那一份。
         let t = TempHome::new();
-        let (mut plan, content) = end_to_end(&t);
+        let (mut plan, desired, content) = end_to_end(&t);
         // 给 claude 造一个冲突，给 codex 造一个正常的 install。
         let conflict = PlanEntry::new(
             CapId::new(Kind::Skill, "taken"),
@@ -521,7 +548,7 @@ mod tests {
         let mut ledger = Ledger::default();
         let err = format!(
             "{:#}",
-            execute(&plan, &content, &mut ledger, &t.home).unwrap_err()
+            execute(&plan, &desired, &content, &mut ledger, &t.home).unwrap_err()
         );
         assert!(err.contains("skill/taken"), "{err}");
         assert!(
@@ -535,17 +562,62 @@ mod tests {
     fn one_harnesss_failure_leaves_the_other_alone() {
         // §9.7 失败隔离跨 harness 也成立。
         let t = TempHome::new();
-        let (plan, mut content) = end_to_end(&t);
+        let (plan, desired, mut content) = end_to_end(&t);
         // 把源换成不存在的路径：两家都会失败，但都只报 partial，不整体报错。
         for src in content.sources.values_mut() {
             src.path = t.path("src/gone");
         }
         let mut ledger = Ledger::default();
-        let report = execute(&plan, &content, &mut ledger, &t.home).unwrap();
+        let report = execute(&plan, &desired, &content, &mut ledger, &t.home).unwrap();
         assert_eq!(report.harnesses.len(), 2);
         assert_eq!(report.partial().len(), 2, "两家各自报自己的失败");
         assert_eq!(report.delivered_total(), 0);
         assert!(ledger.entries.is_empty());
+    }
+
+    /// §9.6：一家有两种写路径，报告只有一个。合并后 `delivered` 必须重排——
+    /// 两份各自有序不保证合并后有序，而「按 label 排好序」是这个类型的契约。
+    #[test]
+    fn absorb_merges_two_reports_of_the_same_harness() {
+        let mut skills = HarnessReport {
+            harness: "claude-code".into(),
+            delivered: vec!["skill/z".into()],
+            failure: Some("skill/a: boom".into()),
+        };
+        skills.absorb(HarnessReport {
+            harness: "claude-code".into(),
+            delivered: vec!["mcp/context7".into(), "mcp/b".into()],
+            failure: Some("mcp/c: also boom".into()),
+        });
+
+        assert_eq!(
+            skills.delivered,
+            vec!["mcp/b", "mcp/context7", "skill/z"],
+            "合并后必须重排：mcp/b 排在 mcp/context7 前面，两者都在 skill/z 前面"
+        );
+        assert_eq!(
+            skills.failure.as_deref(),
+            Some("skill/a: boom; mcp/c: also boom"),
+            "两半的失败都要留着，不能被后一半覆盖掉"
+        );
+        assert_eq!(skills.harness, "claude-code", "harness 名以收方那份为准");
+    }
+
+    /// 收方本来没有失败时，`absorb` 不该凭空造出 `Some("; ...")` 这种带分隔符的形状。
+    #[test]
+    fn absorb_takes_the_failure_when_there_was_none() {
+        let mut skills = HarnessReport {
+            harness: "codex".into(),
+            delivered: Vec::new(),
+            failure: None,
+        };
+        skills.absorb(HarnessReport {
+            harness: "codex".into(),
+            delivered: vec!["mcp/context7".into()],
+            failure: Some("mcp/context7: nope".into()),
+        });
+        assert_eq!(skills.failure.as_deref(), Some("mcp/context7: nope"));
+        assert_eq!(skills.delivered, vec!["mcp/context7"]);
     }
 
     #[test]
@@ -553,10 +625,10 @@ mod tests {
         // 没装的那家不跑：它的 skills 目录不存在，跑它等于无端建目录
         // ——那不是「让目标变成清单的样子」，是凭空造出一家的配置树。
         let t = TempHome::new();
-        let (mut plan, content) = end_to_end(&t);
+        let (mut plan, desired, content) = end_to_end(&t);
         plan.harnesses[0].detected = false;
         let mut ledger = Ledger::default();
-        let report = execute(&plan, &content, &mut ledger, &t.home).unwrap();
+        let report = execute(&plan, &desired, &content, &mut ledger, &t.home).unwrap();
         assert_eq!(report.harnesses.len(), 1);
         assert!(!t.path(".claude/skills/foo").exists());
         assert!(t.path(".codex/skills/foo").exists(), "另一家照常交付");

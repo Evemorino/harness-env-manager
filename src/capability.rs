@@ -190,7 +190,14 @@ pub fn normalize_locator(value: Option<&str>) -> Option<String> {
 /// MCP 的人类可读摘要。**只渲染键名，绝不渲染 env 值**——desired 侧的值永远是 `${VAR}`
 /// 引用，但 actual 侧是 adapter 从 `~/.claude.json` 这类活配置读出来的，可能就是明文真密钥。
 /// spec §3 决策 3：密钥永不进任何产物。
-fn mcp_summary(command: &str, args: &[String], env: &BTreeMap<String, String>) -> String {
+///
+/// 可见性提成 `pub(crate)` 是因为 `diff` 要拿它渲染 `update` 的 from/to——
+/// 再写一个同样的渲染函数就等于有了两份「什么算同一个 MCP」的定义。
+pub(crate) fn mcp_summary(
+    command: &str,
+    args: &[String],
+    env: &BTreeMap<String, String>,
+) -> String {
     let mut s = String::from(command);
     if !args.is_empty() {
         s.push(' ');

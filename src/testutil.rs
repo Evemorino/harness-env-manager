@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 use crate::adapters::HarnessAdapter;
+use crate::apply::mcp::McpTarget;
 use crate::capability::{CapId, Capability, Kind, Origin, Spec, Support, Targets};
 use crate::home::Home;
 use std::collections::BTreeMap;
@@ -13,6 +14,14 @@ pub struct TempHome {
     _dir: TempDir,
     pub home: Home,
     root: PathBuf,
+}
+
+// clippy 的 `new_without_default` 要求它（B3a 之前就在，Task 10 跑 `--all-targets`
+// 时才暴露：`testutil` 是非默认 feature，只有自指 dev-dependency 会打开它）。
+impl Default for TempHome {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl TempHome {
@@ -75,7 +84,12 @@ pub struct GitFixture {
 impl GitFixture {
     fn git(&self, args: &[&str]) -> String {
         let out = std::process::Command::new("git")
-            .args(["-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main"])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "init.defaultBranch=main",
+            ])
             .args(args)
             .current_dir(&self.dir)
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -153,6 +167,8 @@ pub struct FakeAdapter {
     pub unsupported: BTreeMap<Kind, String>,
     /// `None` = 这家没有用户级 skills 目录（kimi 的真实形态）。
     pub skills_dir: Option<PathBuf>,
+    /// `None` = 这家没有用户级 MCP 配置。
+    pub mcp_target: Option<McpTarget>,
 }
 
 impl FakeAdapter {
@@ -163,11 +179,17 @@ impl FakeAdapter {
             caps: Vec::new(),
             unsupported: BTreeMap::new(),
             skills_dir: None,
+            mcp_target: None,
         }
     }
 
     pub fn with_skills_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.skills_dir = Some(dir.into());
+        self
+    }
+
+    pub fn with_mcp_target(mut self, mcp: McpTarget) -> Self {
+        self.mcp_target = Some(mcp);
         self
     }
 
@@ -268,6 +290,9 @@ impl HarnessAdapter for FakeAdapter {
     fn skills_target_dir(&self) -> Option<PathBuf> {
         self.skills_dir.clone()
     }
+    fn mcp_target(&self) -> Option<McpTarget> {
+        self.mcp_target.clone()
+    }
 }
 
 /// `Confirm` 的测试替身：恒同意 / 恒拒绝。
@@ -286,9 +311,90 @@ impl crate::Confirm for RefuseAll {
     }
 }
 
+/// 一条记录 argv 的假 CLI（B3a 的 claude shell out 用）。
+///
+/// 它证明的是「我们发出的 argv 长什么样」——真 CLI 接不接受、写进哪里，
+/// 由 `#[ignore]` 的那条冒烟测试证。两者缺一不可：假 shim 证不了真 CLI 的契约，
+/// 真 CLI 证不了我们每一次调用都发了什么（它只说话，不留证据）。
+///
+/// **HOME 由调用方钉死**：`FakeCli` 只是可执行文件，不设置环境。测试若用它
+/// 跑真 CLI 的 wrapper，wrapper 自己 export HOME。
+pub struct FakeCli {
+    path: PathBuf,
+    log: PathBuf,
+}
+
+impl FakeCli {
+    /// 造一条 shim：记录每次调用的 argv（一次调用一行 `---` 分隔），退出 0。
+    pub fn new(t: &TempHome, rel: &str) -> Self {
+        Self::with_exit(t, rel, 0, "")
+    }
+
+    /// 造一条会失败的 shim，用于证明失败被报出来。
+    pub fn failing(t: &TempHome, rel: &str, code: i32, stderr: &str) -> Self {
+        Self::with_exit(t, rel, code, stderr)
+    }
+
+    fn with_exit(t: &TempHome, rel: &str, code: i32, stderr: &str) -> Self {
+        let path = t.path(rel);
+        let log = t.path(&format!("{rel}.log"));
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("mkdir shim parent");
+        }
+        // stderr 先落成文件、再由 shim `cat` 出来，**不把它插进脚本**：
+        // 未加引号的 `printf '%s\n' {stderr}` 会按参数逐个换行——
+        // "MCP server n already exists" 于是变成五行，错误消息里再也找不到
+        // 连续的 `already exists`（实测：这曾让 Task 8 的一条测试红）。
+        // 走文件则任何内容都原样吐出，不必跟 shell 引号规则较劲。
+        let err_file = t.path(&format!("{rel}.stderr"));
+        if !stderr.is_empty() {
+            std::fs::write(&err_file, format!("{stderr}\n")).expect("write shim stderr");
+        }
+        // 逐参数写一行：`"$*"` 会把参数用空格拼起来，丢了边界，
+        // 于是「JSON 里带空格」这种真实输入会被验成「参数对不上」。
+        let script = format!(
+            "#!/bin/sh\nprintf -- '---\\n' >> {log}\nfor a in \"$@\"; do printf '%s\\n' \"$a\" >> {log}; done\n\
+             {}\nexit {code}\n",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!("cat {} >&2\n", err_file.display())
+            },
+            log = log.display()
+        );
+        std::fs::write(&path, script).expect("write shim");
+        let mut perms = std::fs::metadata(&path).expect("stat").permissions();
+        std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+        Self { path, log }
+    }
+
+    pub fn path(&self) -> PathBuf {
+        self.path.clone()
+    }
+
+    /// 每次调用的 argv，按调用顺序。`Vec<Vec<String>>` 里每一项是一次调用。
+    pub fn invocations(&self) -> Vec<Vec<String>> {
+        let text = match std::fs::read_to_string(&self.log) {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
+        };
+        let mut out: Vec<Vec<String>> = Vec::new();
+        for line in text.lines() {
+            if line == "---" {
+                out.push(Vec::new());
+            } else if let Some(last) = out.last_mut() {
+                last.push(line.to_string());
+            }
+        }
+        out
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::apply::mcp::McpMechanism;
 
     #[test]
     fn the_git_fixture_creates_a_hermetic_local_repo() {
@@ -303,7 +409,11 @@ mod tests {
         let second = repo.commit("v2");
         assert_ne!(first, second);
         repo.tag("v1");
-        assert!(repo.url.starts_with("file://"), "必须是本地 URL：{}", repo.url);
+        assert!(
+            repo.url.starts_with("file://"),
+            "必须是本地 URL：{}",
+            repo.url
+        );
 
         repo.branch("develop");
         assert_eq!(
@@ -363,6 +473,26 @@ mod tests {
         assert!(
             !FakeAdapter::native("codex").with_detected(false).detect(),
             "with_detected(false) 必须盖过 native() 的 true"
+        );
+        // MCP 写目标：默认没有，`with_mcp_target` 之后原样返回（Task 9 的
+        // `deliver_mcps` 靠这个字段驱动，一个「设了但答 None」的替身会让
+        // 那条路径的所有断言都变成空转）。
+        assert_eq!(
+            FakeAdapter::native("codex").mcp_target(),
+            None,
+            "默认没有写目标"
+        );
+        let t = TempHome::new();
+        assert_eq!(
+            FakeAdapter::native("codex")
+                .with_mcp_target(McpTarget {
+                    path: t.path(".codex/config.toml"),
+                    mechanism: McpMechanism::CodexToml,
+                })
+                .mcp_target()
+                .unwrap()
+                .path,
+            t.path(".codex/config.toml")
         );
     }
 
@@ -424,5 +554,48 @@ mod tests {
             },
             "version/sha 必须原样落到各自字段，串了位就等于给 diff 喂假 locator"
         );
+    }
+
+    /// fixture 自己的契约测试：`FakeCli` 记错 argv 边界或调用边界，
+    /// Task 8 的每一条 argv 断言都会跟着错，而它们看起来照样「全绿」。
+    #[test]
+    fn the_fake_cli_records_argv_split_by_invocation() {
+        let t = TempHome::new();
+        let cli = FakeCli::new(&t, "bin/claude");
+        assert!(cli.path().is_file());
+
+        // 直接起它：这是 fixture 自己的契约测试，不用生产代码
+        std::process::Command::new(cli.path())
+            .args(["mcp", "add-json", "-s", "user", "n", "{\"a\": \"b c\"}"])
+            .status()
+            .unwrap();
+        std::process::Command::new(cli.path())
+            .args(["mcp", "remove", "-s", "user", "n"])
+            .status()
+            .unwrap();
+
+        assert_eq!(
+            cli.invocations(),
+            vec![
+                vec!["mcp", "add-json", "-s", "user", "n", "{\"a\": \"b c\"}"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>(),
+                vec!["mcp", "remove", "-s", "user", "n"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect::<Vec<_>>(),
+            ],
+            "参数边界与调用边界都要留住"
+        );
+    }
+
+    #[test]
+    fn a_failing_fake_cli_reports_its_code() {
+        let t = TempHome::new();
+        let cli = FakeCli::failing(&t, "bin/claude", 1, "boom");
+        let out = std::process::Command::new(cli.path()).output().unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        assert_eq!(String::from_utf8_lossy(&out.stderr).trim(), "boom");
     }
 }

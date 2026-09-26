@@ -1,4 +1,5 @@
 use crate::adapters::{CLAUDE_CODE, HarnessAdapter};
+use crate::apply::mcp::{McpMechanism, McpTarget};
 use crate::capability::{
     CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets, normalize_locator,
 };
@@ -188,6 +189,17 @@ impl HarnessAdapter for ClaudeCode {
 
     fn skills_target_dir(&self) -> Option<PathBuf> {
         Some(self.home.claude_skills())
+    }
+
+    fn mcp_target(&self) -> Option<McpTarget> {
+        Some(McpTarget {
+            path: self.home.claude_json(),
+            // `-s user` 不可省：默认 scope 是 `local`，那会写进
+            // `projects.<cwd>.mcpServers`——一个读路径故意不看的位置（§9.6）。
+            mechanism: McpMechanism::ClaudeCli {
+                binary: PathBuf::from("claude"),
+            },
+        })
     }
 
     fn supports(&self, _cap: &Capability) -> Support {
