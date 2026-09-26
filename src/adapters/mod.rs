@@ -4,8 +4,13 @@ pub mod claude_code;
 pub mod codex;
 pub mod kimi_code;
 
+use crate::apply::HarnessReport;
 use crate::capability::{Capability, Support};
+use crate::diff::HarnessPlan;
 use crate::home::Home;
+use crate::store::provenance::Ledger;
+use crate::store::skills::ContentIndex;
+use std::path::PathBuf;
 
 /// 本计划**只**承认这三家 harness（spec §1）。这三串同时是：`manifest` 里 `targets:`
 /// 允许出现的名字、`registry` 的返回顺序（Task 14 golden 逐行锁定）、报告里的行标签。
@@ -53,12 +58,48 @@ pub trait HarnessAdapter {
     ///   那条契约要消灭的假阴性。
     /// - 从活配置里读出的每一个 version / sha / ref 串，装进 `Spec` 之前先过
     ///   [`crate::capability::normalize_locator`]：本机在 `gitCommitSha` 这类字段上
-    ///   记的是字面量 `unknown`，不归一化的话两条 `Some("unknown")` 会命中
-    ///   「两边都有 SHA」分支判成 `Same`，两个真不同的构建被报成同步。
+    ///   记的是字面量 `unknown`，不归一化的话两条 `Some("unknown")` 会被当成真 SHA
+    ///   参与比较，两个真不同的构建被误判。
     fn read_state(&self) -> anyhow::Result<Vec<Capability>>;
 
     /// 这家能否接纳该能力——「拆解降级」的判定点（Task 12 细化）。
     fn supports(&self, cap: &Capability) -> Support;
+
+    /// 本家交付 skill 的目标目录。`None` = 这家**没有**用户级 skills 目录
+    /// （kimi-code，spec §9.1：它的散装 skill 只能随 plugin bundle 分发）。
+    ///
+    /// 返回 `None` 不是错误，是这家的事实；「拒绝」的判定在 `supports` 里做，
+    /// 这个方法只回答「往哪写」。
+    ///
+    /// **没有默认实现**：新加一家 harness 时必须显式回答这个问题，
+    /// 否则一个默认的 `None` 会让它的 skill 交付静默变成空操作。
+    fn skills_target_dir(&self) -> Option<PathBuf>;
+
+    /// 执行层的第 2 步（spec §9.2）：把**已经解析好的**内容交付到本家。
+    /// 不碰网络、不解析来源——那些在 `store` 的前置步骤里已经做完了。
+    ///
+    /// 默认实现覆盖三家在当前范围内的全部差异：它们交付 skill 的方式一模一样
+    /// （拷进各自的 skills 目录），差异只体现在 [`skills_target_dir`] 上。
+    /// B3 的 MCP 写入会给 claude 覆盖这个方法（它走 shell out `claude mcp add-json`）。
+    ///
+    /// 这**不是** Plan A 里那种「放个桩只能靠期望 panic 来测」的方法：三条真实路径
+    /// （claude/codex 各交付一次、kimi 交付零次）都有测试钉着。
+    ///
+    /// [`skills_target_dir`]: HarnessAdapter::skills_target_dir
+    fn apply(
+        &self,
+        slice: &HarnessPlan,
+        content: &ContentIndex,
+        ledger: &mut Ledger,
+    ) -> anyhow::Result<HarnessReport> {
+        crate::apply::deliver_skills(
+            self.name(),
+            self.skills_target_dir().as_deref(),
+            slice,
+            content,
+            ledger,
+        )
+    }
 }
 
 /// 全部已知 harness，**固定顺序** claude-code → codex → kimi-code。
@@ -98,6 +139,7 @@ pub fn lookup<'a>(
 mod tests {
     use super::*;
     use crate::capability::{Kind, SkillSource, Spec};
+    use crate::diff::{Action, PlanEntry};
     use crate::manifest::KNOWN_HARNESSES;
     use crate::testutil::{FakeAdapter, TempHome};
     use std::path::PathBuf;
@@ -291,5 +333,100 @@ mod tests {
             !lookup(&reg, CLAUDE_CODE).unwrap().detect(),
             "detect 必须要求目录；换成 exists() 时普通文件也会被认成已安装"
         );
+    }
+
+    /// 三家各自的目标目录（§9.1：kimi 没有用户级 skills 目录）。
+    /// 这条把「谁有目录」钉死，否则一个把 kimi 也填上的实现会让 kimi 的散装 skill
+    /// 静默走进交付路径，而它本该被 `supports` 判成 Unsupported。
+    #[test]
+    fn exactly_claude_and_codex_have_a_skills_target_dir() {
+        let t = TempHome::new();
+        let reg = registry(&t.home);
+        let got: Vec<(&str, bool)> = reg
+            .iter()
+            .map(|a| (a.name(), a.skills_target_dir().is_some()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(CLAUDE_CODE, true), (CODEX, true), (KIMI_CODE, false)]
+        );
+    }
+
+    #[test]
+    fn skills_target_dirs_point_at_each_harnesss_own_directory() {
+        let t = TempHome::new();
+        let reg = registry(&t.home);
+        assert_eq!(
+            lookup(&reg, CLAUDE_CODE)
+                .unwrap()
+                .skills_target_dir()
+                .unwrap(),
+            t.home.claude_skills()
+        );
+        assert_eq!(
+            lookup(&reg, CODEX).unwrap().skills_target_dir().unwrap(),
+            t.home.codex_skills()
+        );
+        // 必须是**各家自己的**目录：两处都返回 agents_skills() 这种错法会让
+        // 「交付到 claude」把文件放进共享目录，codex 那边看着像已交付。
+        assert_ne!(
+            lookup(&reg, CLAUDE_CODE).unwrap().skills_target_dir(),
+            Some(t.home.agents_skills())
+        );
+    }
+
+    /// 默认的 `apply` 必须把活交给 `apply::deliver_skills`——包括 kimi 那次
+    /// 「什么都不做但不是错误」的调用。这条用 FakeAdapter 驱动，不碰真实配置树。
+    #[test]
+    fn the_default_apply_delivers_through_the_shared_helper() {
+        let t = TempHome::new();
+        t.write("src/foo/SKILL.md", "# foo");
+        let cap = FakeAdapter::cap(
+            crate::capability::Kind::Skill,
+            "foo",
+            crate::capability::Spec::Skill {
+                source: crate::capability::SkillSource::AgentsDir,
+                path: None,
+            },
+        );
+        let mut content = crate::store::skills::ContentIndex::default();
+        content.sources.insert(
+            cap.id.clone(),
+            crate::store::skills::ResolvedContent {
+                path: t.path("src/foo"),
+                hash: "h".into(),
+                source_id: "agents-dir".into(),
+            },
+        );
+        content
+            .targets
+            .entry("claude-code".into())
+            .or_default()
+            .insert("foo".into(), crate::store::skills::TargetContent::NoContent);
+
+        let slice = HarnessPlan {
+            harness: "claude-code".into(),
+            detected: true,
+            entries: vec![PlanEntry::new(cap.id.clone(), Action::Install)],
+            actual_by_kind: Default::default(),
+        };
+        let mut ledger = crate::store::provenance::Ledger::default();
+        let fake = FakeAdapter::native("claude-code").with_skills_dir(t.path(".claude/skills"));
+        let report = fake
+            .apply(&slice, &content, &mut ledger)
+            .expect("default apply must work");
+        assert_eq!(report.delivered, vec!["skill/foo".to_string()]);
+        assert!(t.path(".claude/skills/foo/SKILL.md").exists());
+        assert_eq!(ledger.find("claude-code", "foo").unwrap().name, "foo");
+
+        // 没有目标目录的那家：不交付、不报错、不写账本。
+        let kimi = FakeAdapter::native("kimi-code");
+        let mut ledger2 = crate::store::provenance::Ledger::default();
+        let report = kimi
+            .apply(&slice, &content, &mut ledger2)
+            .expect("kimi 不报错");
+        assert!(report.delivered.is_empty());
+        assert!(report.failure.is_none());
+        assert!(ledger2.entries.is_empty());
     }
 }

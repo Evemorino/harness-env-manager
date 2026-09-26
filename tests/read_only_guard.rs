@@ -1,9 +1,14 @@
-//! Plan A 只读守卫：`src/` 里除 `testutil.rs` 及 `#[cfg(test)]` 测试模块外，不得出现任何文件写 API。
+//! 写路径守卫：`src/` 下只有白名单目录（`src/apply/`、`src/store/`）允许出现文件写 API。
 //!
-//! 写路径（`.bak` + temp + rename、`claude mcp add-json` shell out）属 Plan B。
-//! 在 Plan B 落地前，这个测试是「henv diff 绝不改我的配置」这句承诺的唯一证据。
+//! Plan A 的形态是「哪里都不许写」；Plan B 落地后收窄成白名单（spec §9.9）。
+//! 收窄的方式是**加一层允许**，不是从 `FORBIDDEN` 里删模式——`Command::new(` 尤其
+//! 必须留着（B2 的 git 与 B3 的 `claude mcp add-json` 都要 shell out，那是这个项目
+//! 第一次真的调用外部程序），谁把某条模式从列表里删掉，`FORBIDDEN` 就少一道闸。
 
 use std::path::{Path, PathBuf};
+
+/// 唯一允许落盘的目录前缀（相对仓库根，带尾斜杠）。spec §9.9。
+const WRITE_WHITELIST: &[&str] = &["src/apply/", "src/store/"];
 
 /// 带 `(` 的模式避免误伤 `fs::symlink_metadata` 这类只读 API。
 ///
@@ -38,6 +43,20 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
         }
     }
     out.sort();
+}
+
+/// 相对仓库根的路径，一律用 `/` 分隔——白名单按这个形态匹配。
+fn rel_path(path: &Path) -> String {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('\\', "/")
+}
+
+fn is_whitelisted(path: &Path) -> bool {
+    let rel = rel_path(path);
+    WRITE_WHITELIST.iter().any(|w| rel.starts_with(w))
 }
 
 fn offenders(path: &Path) -> Vec<String> {
@@ -88,22 +107,6 @@ fn src_files() -> Vec<PathBuf> {
     let mut v = Vec::new();
     walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut v);
     v
-}
-
-#[test]
-fn plan_a_source_has_no_write_api_outside_testutil() {
-    let mut all = Vec::new();
-    for f in src_files() {
-        if f.file_name().and_then(|n| n.to_str()) == Some("testutil.rs") {
-            continue;
-        }
-        all.extend(offenders(&f));
-    }
-    assert!(
-        all.is_empty(),
-        "Plan A 必须只读，发现写 API：\n{}\n（若确需写入，说明你在做 Plan B 的活）",
-        all.join("\n")
-    );
 }
 
 /// D4 的机械闸门：生产路径一律走 `try_read_skill_entries`；便利包装是 lossy 的，
@@ -162,5 +165,64 @@ fn scanner_is_not_vacuous() {
         files.len() >= 10,
         "只扫到 {} 个文件，walk 可能坏了",
         files.len()
+    );
+}
+
+/// §9.9：Plan A 的「哪里都不许写」收窄成「只许在这两个目录写」。
+/// 这条测试钉的是**机制**本身——它今天就是绿的（那两个目录还不存在，扫不到东西），
+/// 意义在于：Task 6/7 往里放写 API 时放错目录会被它抓住，而放对目录不会被它拦。
+#[test]
+fn write_api_is_allowed_only_inside_the_whitelist() {
+    let mut all = Vec::new();
+    for f in src_files() {
+        if is_whitelisted(&f) {
+            continue;
+        }
+        if f.file_name().and_then(|n| n.to_str()) == Some("testutil.rs") {
+            continue;
+        }
+        all.extend(offenders(&f));
+    }
+    assert!(
+        all.is_empty(),
+        "白名单外的生产代码出现写 API：\n{}\n（写路径只允许出现在 {} 下）",
+        all.join("\n"),
+        WRITE_WHITELIST.join(" / ")
+    );
+}
+
+/// 白名单前缀必须**真能**匹配，且必须**不**误放行别的目录。
+/// 少了这条，把 `WRITE_WHITELIST` 写成 `&["src/"]` 也能让上一条全绿——
+/// 那等于把守卫整个删掉还留着一条「通过」的记录。
+#[test]
+fn whitelist_matches_by_directory_prefix() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    assert!(is_whitelisted(&root.join("src/store/provenance.rs")));
+    assert!(is_whitelisted(&root.join("src/apply/write.rs")));
+    assert!(
+        !is_whitelisted(&root.join("src/diff.rs")),
+        "diff 是纯函数，不许写盘"
+    );
+    assert!(
+        !is_whitelisted(&root.join("src/store.rs")),
+        "前缀必须带尾斜杠：`src/store` 不该放行一个叫 src/store.rs 的文件"
+    );
+    assert!(!is_whitelisted(&root.join("src/adapters/codex.rs")));
+}
+
+/// 白名单不能是摆设：它必须**真的**放行了一批写 API。少了这条，
+/// 把白名单指向一个空目录、或者哪天把写路径整体挪出白名单，守卫都会照常绿。
+#[test]
+fn the_whitelist_actually_covers_real_write_code() {
+    let mut hits = Vec::new();
+    for f in src_files() {
+        if is_whitelisted(&f) {
+            hits.extend(offenders(&f));
+        }
+    }
+    assert!(
+        hits.iter()
+            .any(|h| h.contains("fs::write(") || h.contains("fs::create_dir")),
+        "白名单目录里一个写 API 都没有，说明白名单已经和写路径脱节了：{hits:?}"
     );
 }

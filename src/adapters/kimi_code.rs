@@ -159,6 +159,10 @@ impl KimiCode {
             }
             let Some(root) = &p.root else { continue };
             for e in try_read_skill_entries(&root.join("skills"), &self.home)? {
+                // 比较一律用解析后的真实路径（Task 7 契约 D5）；断链没有内容但有路径，
+                // §9.3 的自愈要能看见它——两条都由 `SkillEntry::content_path` 兑现。
+                // 先取再搬 `e.name`，顺序反了就是对一个被部分移动的值借方法。
+                let path = e.content_path();
                 out.push(Capability {
                     id: CapId::new(Kind::Skill, e.name),
                     origin: Origin::Plugin { name: p.id.clone() },
@@ -166,8 +170,7 @@ impl KimiCode {
                         source: SkillSource::PluginBundle {
                             plugin: p.id.clone(),
                         },
-                        // 比较一律用 `resolved`（Task 7 契约 D5：`path` 保持扫描现场的形态）
-                        path: e.resolved,
+                        path,
                     },
                     targets: Targets::All,
                 });
@@ -223,6 +226,13 @@ impl HarnessAdapter for KimiCode {
         // dedup_by 只去重相邻项，所以必须先 sort
         caps.dedup_by(|a, b| a.id == b.id);
         Ok(caps)
+    }
+
+    /// kimi-code 没有用户级 skills 目录（§9.1）：它的散装 skill 只能随 plugin
+    /// bundle 落地。`supports` 已经对散装 `Kind::Skill` 返回 `Unsupported`，
+    /// 这里返回 `None` 是与之一致的事实陈述，不是第二处独立的拒绝判定。
+    fn skills_target_dir(&self) -> Option<PathBuf> {
+        None
     }
 
     fn supports(&self, cap: &Capability) -> Support {
@@ -871,7 +881,8 @@ mod tests {
         assert!(msg.starts_with("failed to read skills dir "), "{msg}");
     }
 
-    /// 断链是数据不是故障：条目照常出现，`path` 落 None，交给 doctor。
+    /// 断链是数据不是故障：条目照常出现，来源不可判定（交给 doctor），但 `path` 要给得出
+    /// 链接本身——三个 adapter 对同一个字段给同一种答案，`content_path` 的规则才有一处出处。
     #[test]
     fn a_broken_link_inside_a_bundle_still_surfaces() {
         let t = TempHome::new();
@@ -898,7 +909,7 @@ mod tests {
                 source: SkillSource::PluginBundle {
                     plugin: "superpowers".into()
                 },
-                path: None,
+                path: Some(root.join("skills/gone")),
             }
         );
     }

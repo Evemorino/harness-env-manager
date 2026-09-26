@@ -3,7 +3,10 @@ use std::path::PathBuf;
 
 /// 能力种类。`Plugin` 是一等公民——spec §2.1 第 2 条：三家 harness 都有 plugin 机制，
 /// v1 以 bundle manifest 对账为主，只在目标 harness 缺 manifest 时才降级拆解。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
 pub enum Kind {
     Skill,
     Mcp,
@@ -169,8 +172,8 @@ pub enum VersionMatch {
         from: String,
         to: String,
     },
-    /// 无法判定（一侧有 SHA 一侧只有 version、跨 kind、或信息不足）。
-    /// 只读工具不该误报，diff 把 Unknown 当 in-sync。
+    /// 无法判定：跨 kind、信息不足、或 version 不是「version 形」（sha 形目录名 / 分支名）。
+    /// diff 不再把 Unknown 折成 in-sync，而是报出可见的 `? unknown`（spec §2.1 第 3 条）。
     Unknown,
 }
 
@@ -201,41 +204,11 @@ fn mcp_summary(command: &str, args: &[String], env: &BTreeMap<String, String>) -
     s
 }
 
-/// SHA 优先、version 兜底（spec §2.1 第 3 条）。
+/// 判据（spec §2.1 第 3 条，2026-09-25 修订）：plugin 用 entry 名作身份、版本比较见
+/// [`compare_plugins`]；skill git 源比 `ref`；mcp 比 command/args/env；其余 Unknown。
 pub fn compare_versions(desired: &Spec, actual: &Spec) -> VersionMatch {
     match (desired, actual) {
-        (Spec::Plugin { sha: Some(d), .. }, Spec::Plugin { sha: Some(a), .. }) => {
-            if d == a {
-                VersionMatch::Same
-            } else {
-                VersionMatch::Different {
-                    from: a.clone(),
-                    to: d.clone(),
-                }
-            }
-        }
-        (
-            Spec::Plugin {
-                sha: None,
-                version: Some(d),
-                ..
-            },
-            Spec::Plugin {
-                sha: None,
-                version: Some(a),
-                ..
-            },
-        ) => {
-            if d == a {
-                VersionMatch::Same
-            } else {
-                VersionMatch::Different {
-                    from: a.clone(),
-                    to: d.clone(),
-                }
-            }
-        }
-        (Spec::Plugin { .. }, Spec::Plugin { .. }) => VersionMatch::Unknown,
+        (Spec::Plugin { .. }, Spec::Plugin { .. }) => compare_plugins(desired, actual),
         (
             Spec::Skill {
                 source: SkillSource::Git { git_ref: d, .. },
@@ -280,6 +253,71 @@ pub fn compare_versions(desired: &Spec, actual: &Spec) -> VersionMatch {
     }
 }
 
+/// plugin 的版本判据（spec §2.1 第 3 条，2026-09-25 修订）：
+/// 1. 两边 SHA 都有且**不相等** ⇒ Different（内容不同，最硬的一刀）；
+/// 2. 否则（都 None、或相等——相等不再直接判 Same，见 §2.2 第 7 条）比 version 形：
+///    两边都能归一化出「version 形」才可比，归一化后相等 ⇒ Same、不等 ⇒ Different
+///    （from = 现状原值、to = 期望原值）；
+/// 3. 其余 ⇒ Unknown。
+fn compare_plugins(desired: &Spec, actual: &Spec) -> VersionMatch {
+    let (
+        Spec::Plugin {
+            sha: d_sha,
+            version: d_ver,
+            ..
+        },
+        Spec::Plugin {
+            sha: a_sha,
+            version: a_ver,
+            ..
+        },
+    ) = (desired, actual)
+    else {
+        unreachable!("compare_plugins 只在两边都是 Plugin 时调用");
+    };
+
+    if let (Some(d), Some(a)) = (d_sha, a_sha) {
+        if d != a {
+            return VersionMatch::Different {
+                from: a.clone(),
+                to: d.clone(),
+            };
+        }
+    }
+
+    match (d_ver, a_ver) {
+        (Some(d), Some(a)) => match (normalize_version(d), normalize_version(a)) {
+            (Some(dn), Some(an)) => {
+                if dn == an {
+                    VersionMatch::Same
+                } else {
+                    VersionMatch::Different {
+                        from: a.clone(),
+                        to: d.clone(),
+                    }
+                }
+            }
+            _ => VersionMatch::Unknown,
+        },
+        _ => VersionMatch::Unknown,
+    }
+}
+
+/// 归一化 version 串：去前导 `v`/`V`；仅当结果含小数点（`6.3.0` 形）才返回 Some，
+/// sha 形目录名（`db467cc56673`）、分支名（`main`）等不含小数点 → None（不可比，落 Unknown）。
+fn normalize_version(value: &str) -> Option<String> {
+    let v = value.trim();
+    let v = v
+        .strip_prefix('v')
+        .or_else(|| v.strip_prefix('V'))
+        .unwrap_or(v);
+    if v.contains('.') {
+        Some(v.to_string())
+    } else {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -290,6 +328,20 @@ mod tests {
             assert_eq!(Kind::parse(k.as_str()), Some(k), "{k:?} roundtrip");
         }
         assert_eq!(Kind::parse("nope"), None);
+    }
+
+    /// 账本把 `Kind` 序列化成 `as_str()` 的那个串（§9.3）。serde 的 rename 与
+    /// `as_str()`/`parse()` 是**独立的第三处拼写**，必须钉成相等——否则账本里
+    /// 会出现一个 `parse()` 认不出、而 serde 认得出的 kind。
+    #[test]
+    fn kind_serde_uses_the_same_spelling_as_as_str() {
+        for k in Kind::all() {
+            let json = serde_json::to_string(&k).expect("serialize");
+            assert_eq!(json, format!("\"{}\"", k.as_str()), "{k:?}");
+            let back: Kind = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back, k);
+        }
+        assert!(serde_json::from_str::<Kind>("\"nonsense\"").is_err());
     }
 
     /// `Kind::all()` 的**顺序**是契约的一部分，不只是集合：Task 14 的
@@ -369,15 +421,19 @@ mod tests {
     }
 
     #[test]
-    fn same_sha_wins_over_differing_version_strings() {
-        // 本机实测场景：claude 6.4.1 vs kimi v6.3.0，SHA 相同
+    fn same_sha_across_differing_version_strings_is_different() {
+        // 修订核心：sha 相同不再判 Same（claude 的 gitCommitSha 陈旧，§2.2 第 7 条），
+        // version 6.4.1 vs v6.3.0 归一化后不同 → Different。
         let sha = "b36e0829c6d0140e93cfef2ca599b1b07d4a7797";
         assert_eq!(
             compare_versions(
                 &plugin(Some("6.4.1"), Some(sha)),
                 &plugin(Some("v6.3.0"), Some(sha))
             ),
-            VersionMatch::Same
+            VersionMatch::Different {
+                from: "v6.3.0".into(),
+                to: "6.4.1".into()
+            }
         );
     }
 
@@ -417,6 +473,43 @@ mod tests {
         );
         assert_eq!(
             compare_versions(&plugin(None, None), &plugin(None, None)),
+            VersionMatch::Unknown
+        );
+    }
+
+    #[test]
+    fn leading_v_is_normalized_away() {
+        // claude 写 `6.4.1`，kimi 写 `v6.4.1`，去前导 v 后应判 Same（spec §2.1 第 3 条规则 2）。
+        assert_eq!(
+            compare_versions(&plugin(Some("6.4.1"), None), &plugin(Some("v6.4.1"), None)),
+            VersionMatch::Same
+        );
+    }
+
+    #[test]
+    fn non_version_form_locators_are_unknown() {
+        // sha 形目录名（claude 8/19 实测）与分支名（`main`）不含小数点 → 不是 version 形，
+        // 判不了 → Unknown，绝不报假 drift（spec §2.1 第 3 条规则 3、§2.2 第 7 条覆盖面）。
+        assert_eq!(
+            compare_versions(
+                &plugin(Some("db467cc56673"), None),
+                &plugin(Some("v6.3.0"), None)
+            ),
+            VersionMatch::Unknown
+        );
+        assert_eq!(
+            compare_versions(&plugin(Some("main"), None), &plugin(Some("main"), None)),
+            VersionMatch::Unknown
+        );
+    }
+
+    #[test]
+    fn equal_sha_without_version_is_unknown_not_same() {
+        // 「sha 相等 ⇒ Same」的废除核心：sha 相同但两边都没 version，无法确认内容一致
+        // （gitCommitSha 可能陈旧，§2.2 第 7 条），只能 Unknown，不能撒谎 Same。
+        let sha = "b36e0829c6d0140e93cfef2ca599b1b07d4a7797";
+        assert_eq!(
+            compare_versions(&plugin(None, Some(sha)), &plugin(None, Some(sha))),
             VersionMatch::Unknown
         );
     }
@@ -591,28 +684,32 @@ mod tests {
         );
     }
 
-    /// 这条是本 Task 真正的护栏。version-fallback 分支上那两个 `sha: None` 守卫一旦被删，
-    /// 上面 `mixed_sha_and_version_only_is_unknown` 仍全绿——因为它两边各缺一个字段，
-    /// 无论有没有守卫都进不了第二分支。必须用「一边 sha+version 都有、另一边只有 version」
-    /// 这个形状才检得出来——而这恰好就是本机真实数据形状：claude 记 `6.4.1` + `gitCommitSha`，
-    /// codex/kimi 只记 version。少了守卫，第二分支会先撞上，把本该 Unknown（按 in-sync 处理）
-    /// 的一对报成 `Different { from: "6.3.0", to: "6.4.1" }`，于是每次 diff 都误报 drift。
+    /// 修订前这条是护栏：一边 sha+version 都有、另一边只有 version，旧实现判 Unknown。
+    /// 修订后 sha 只在「两边都有且不等」时定 Different，其余 fall through 到 version 比较，
+    /// 所以这一对（version 6.4.1 vs 6.3.0 归一化后不同）必须判 Different——sha 在一边缺失
+    /// 不再阻断 version 比较。
     #[test]
-    fn sha_plus_version_against_version_only_is_unknown() {
+    fn sha_on_one_side_does_not_block_version_comparison() {
         assert_eq!(
             compare_versions(
                 &plugin(Some("6.4.1"), Some("abc123")),
                 &plugin(Some("6.3.0"), None)
             ),
-            VersionMatch::Unknown
+            VersionMatch::Different {
+                from: "6.3.0".into(),
+                to: "6.4.1".into()
+            }
         );
-        // 反方向同理：谁的哪一边有 sha 都不该改变结论
+        // 反方向同理
         assert_eq!(
             compare_versions(
                 &plugin(Some("6.3.0"), None),
                 &plugin(Some("6.4.1"), Some("abc123"))
             ),
-            VersionMatch::Unknown
+            VersionMatch::Different {
+                from: "6.4.1".into(),
+                to: "6.3.0".into()
+            }
         );
     }
 

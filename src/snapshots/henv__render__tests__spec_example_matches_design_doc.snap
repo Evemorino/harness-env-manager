@@ -9,4 +9,4 @@ codex         + install  mcp/browser-use, mcp/context7
 kimi-code     + install  mcp/context7
               - drift    mcp/experimental-thing (未在清单中，--prune 可删)
 
-Plan: 3 install, 1 update, 0 remove, 1 undeliverable, 1 drift
+Plan: 0 conflict, 3 install, 1 update, 0 remove, 1 undeliverable, 1 drift, 0 unknown

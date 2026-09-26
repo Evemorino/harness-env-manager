@@ -47,6 +47,20 @@ impl SkillEntry {
     pub fn is_broken(&self) -> bool {
         self.link_target.is_some() && self.resolved.is_none()
     }
+
+    /// 交给内容层（§9.3）的路径：正常条目给解析后的真实路径；**断链给链接本身**——
+    /// 断链有的是路径，缺的只是内容，而 `hash_dir` 会把它读成 `NoContent`，`apply`
+    /// 于是能把它换成真拷贝。少了这一格，「断链自愈」在真实运行里就是死代码。
+    ///
+    /// 解不开却不只是断链的（权限、`read_link` 之外的失败）仍返回 `None`：那些是故障
+    /// 不是数据，交给 doctor 报告，不拿它们去猜一个可交付的内容位置。
+    pub fn content_path(&self) -> Option<PathBuf> {
+        match &self.resolved {
+            Some(r) => Some(r.clone()),
+            None if self.is_broken() => Some(self.path.clone()),
+            None => None,
+        }
+    }
 }
 
 /// 扫描一个 skills 目录（**不可失败**的便利版）。
@@ -722,6 +736,35 @@ mod tests {
             got[0].link_target,
             Some(PathBuf::from("../../.agents/skills/does-not-exist")),
             "断链必须原样报告它指向哪里"
+        );
+    }
+
+    #[test]
+    fn content_path_offers_a_broken_link_its_own_path() {
+        // §9.3 的断链自愈要能成立，内容层就必须看得见这个条目：`resolved` 为 None 不等于
+        // 「没有路径」——断链有的是路径，缺的只是内容。少了这一条，apply 端到端永远收不到
+        // `TargetContent::NoContent`，那句「断链会被换成真拷贝」在真实运行里就是死的。
+        let t = TempHome::new();
+        t.mkdir(".claude/skills")
+            .write(".claude/skills/real/SKILL.md", "# hi")
+            .symlink(".claude/skills/linked", "real")
+            .symlink(".claude/skills/gone", "../../.agents/skills/does-not-exist");
+        let got = read_skill_entries(&t.path(".claude/skills"), &t.home);
+
+        let broken = got.iter().find(|e| e.name == "gone").expect("断链条目");
+        assert_eq!(
+            broken.content_path(),
+            Some(t.path(".claude/skills/gone")),
+            "断链交给内容层的是链接本身"
+        );
+
+        // 解得开的软链才是能区分两种形态的样本：是普通目录时 `path` 与 `resolved` 恰好相同，
+        // 拿它做对比等于什么都没钉。
+        let linked = got.iter().find(|e| e.name == "linked").expect("可解软链");
+        assert_eq!(
+            linked.content_path(),
+            Some(t.path(".claude/skills/real")),
+            "正常条目照旧给解析后的真实路径"
         );
     }
 

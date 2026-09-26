@@ -69,6 +69,8 @@ pub struct FakeAdapter {
     pub caps: Vec<Capability>,
     /// kind -> 拒绝理由。未列出的 kind 判 Native。
     pub unsupported: BTreeMap<Kind, String>,
+    /// `None` = 这家没有用户级 skills 目录（kimi 的真实形态）。
+    pub skills_dir: Option<PathBuf>,
 }
 
 impl FakeAdapter {
@@ -78,7 +80,13 @@ impl FakeAdapter {
             detected: true,
             caps: Vec::new(),
             unsupported: BTreeMap::new(),
+            skills_dir: None,
         }
+    }
+
+    pub fn with_skills_dir(mut self, dir: impl Into<PathBuf>) -> Self {
+        self.skills_dir = Some(dir.into());
+        self
     }
 
     pub fn with_caps(mut self, caps: Vec<Capability>) -> Self {
@@ -174,6 +182,25 @@ impl HarnessAdapter for FakeAdapter {
             },
             None => Support::Native,
         }
+    }
+    fn skills_target_dir(&self) -> Option<PathBuf> {
+        self.skills_dir.clone()
+    }
+}
+
+/// `Confirm` 的测试替身：恒同意 / 恒拒绝。
+pub struct AssumeYes;
+pub struct RefuseAll;
+
+impl crate::Confirm for AssumeYes {
+    fn ask(&mut self, _prompt: &str) -> bool {
+        true
+    }
+}
+
+impl crate::Confirm for RefuseAll {
+    fn ask(&mut self, _prompt: &str) -> bool {
+        false
     }
 }
 

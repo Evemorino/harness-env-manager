@@ -45,15 +45,15 @@ impl ClaudeCode {
                 // 断链或指向库外：来源不可判定，交给 doctor 报告
                 SkillStore::Other => SkillSource::Unknown,
             };
+            // §9.3：断链没有内容但有路径，自愈要能看见它（见 `SkillEntry::content_path`）。
+            // 先取再搬 `e.name`——顺序反了就是对一个被部分移动的值借方法。
+            let path = e.content_path();
             out.push(Capability {
                 id: CapId::new(Kind::Skill, e.name),
                 origin: Origin::Adopted {
                     harness: CLAUDE_CODE.into(),
                 },
-                spec: Spec::Skill {
-                    source,
-                    path: e.resolved,
-                },
+                spec: Spec::Skill { source, path },
                 targets: Targets::All,
             });
         }
@@ -184,6 +184,10 @@ impl HarnessAdapter for ClaudeCode {
         // dedup_by 只去重相邻项，所以必须先 sort
         caps.dedup_by(|a, b| a.id == b.id);
         Ok(caps)
+    }
+
+    fn skills_target_dir(&self) -> Option<PathBuf> {
+        Some(self.home.claude_skills())
     }
 
     fn supports(&self, _cap: &Capability) -> Support {
@@ -588,11 +592,13 @@ mod tests {
             .symlink(".claude/skills/gone", "../../.agents/skills/nope");
         let caps = ClaudeCode::new(t.home.clone()).read_state().unwrap();
         let s = find(&caps, Kind::Skill, "gone").expect("broken link must be reported");
+        // 来源仍不可判定（doctor 的事），但 `path` 要给得出**链接本身**：§9.3 的断链自愈
+        // 靠内容层看得见这个条目才成立，`None` 会让那条承诺在真实运行里永远走不到。
         assert_eq!(
             s.spec,
             Spec::Skill {
                 source: SkillSource::Unknown,
-                path: None
+                path: Some(t.path(".claude/skills/gone"))
             }
         );
     }

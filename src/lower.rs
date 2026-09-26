@@ -115,7 +115,7 @@ pub fn lower(m: &Manifest) -> Vec<Capability> {
                 marketplace,
                 entry,
                 // 期望侧无 SHA：manifest 只有 ref（git 源）。ref 落在 version 位，
-                // compare_versions 走 version 兜底；实际侧有 SHA 时判 Unknown → in-sync。
+                // compare_versions 走 version 形比较（spec §2.1 第 3 条）；判不了则 Unknown。
                 // 哨兵（`unknown`/空白）在此归成 None → 落到 Unknown，而不是报假 drift。
                 version: normalize_locator(p.git_ref.as_deref()),
                 sha: None,

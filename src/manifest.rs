@@ -6,9 +6,11 @@
 use crate::capability::{Kind, Targets};
 use crate::secrets;
 use serde::Deserialize;
-use serde::de::{self, Deserializer, Unexpected};
+use serde::de::{self, Deserializer, MapAccess, Unexpected, Visitor};
 use serde_yaml_ng::Value;
 use std::collections::BTreeMap;
+use std::marker::PhantomData;
+use std::path::{Component, Path};
 
 /// 清单支持的 schema 版本。
 pub const SUPPORTED_VERSION: u32 = 1;
@@ -22,11 +24,11 @@ pub struct Manifest {
     pub version: u32,
     #[serde(default)]
     pub harnesses: BTreeMap<String, HarnessEntry>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_unique_map")]
     pub skills: BTreeMap<String, SkillEntry>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_unique_map")]
     pub mcps: BTreeMap<String, McpEntry>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_unique_map")]
     pub plugins: BTreeMap<String, PluginEntry>,
 }
 
@@ -266,6 +268,74 @@ const REDACTED_ACTUAL: &str = "a value (not shown)";
 const REDACTED_VARIANT: &str = "(value not shown)";
 const REDACTED_SHAPE: &str = "unrecognized parse problem (parser text not shown)";
 
+/// 反序列化一张**键必须唯一**的表。
+///
+/// `BTreeMap` 的 `Deserialize` 就是 `entry.insert(value)`：后一条**静默顶掉**前一条，而
+/// `MapAccess` 本身会把重复键老老实实都吐出来。所以能发现重复的地方只有这里——换成自己收，
+/// 撞键就报。
+///
+/// 措辞**故意**沿用 serde 自己的 `duplicate field`：它是 `KEY_ONLY_MARKERS` 里「只带键名」
+/// 的三种形状之一，会**原样**穿过 `redact_serde_message`。自创任何一种别的说法都会被那道
+/// 门禁换成静态理由，用户就拿不到出错的那个键名。
+///
+/// `visit_unit` 是必需的：`skills:`（空值）在 YAML 里解成 unit，而 `BTreeMap` 自己的实现
+/// 把它当空表——少了这一格，「写了 `skills:` 但没写内容」会从「空表」变成形状错误。
+fn deserialize_unique_map<'de, D, V>(d: D) -> Result<BTreeMap<String, V>, D::Error>
+where
+    D: Deserializer<'de>,
+    V: Deserialize<'de>,
+{
+    struct UniqueMap<V>(PhantomData<V>);
+
+    impl<'de, V: Deserialize<'de>> Visitor<'de> for UniqueMap<V> {
+        type Value = BTreeMap<String, V>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a mapping")
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(BTreeMap::new())
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut access: A) -> Result<Self::Value, A::Error> {
+            let mut out = BTreeMap::new();
+            while let Some((key, value)) = access.next_entry::<String, V>()? {
+                if out.contains_key(&key) {
+                    return Err(de::Error::custom(format!("duplicate field `{key}`")));
+                }
+                out.insert(key, value);
+            }
+            Ok(out)
+        }
+    }
+
+    d.deserialize_map(UniqueMap::<V>(PhantomData))
+}
+
+/// skill 名会直接参与路径拼接：`store::skills` 拿它找源（`agents_skills().join(name)`），
+/// `apply` 拿它定位目标（`target_dir.join(name)`）。`Path::join` 的语义让两类名字能逃出去：
+/// **绝对路径替换基路径**、`..` 逐级上溯——于是 henv 会去读/写 skills 目录**之外**，
+/// 静默覆盖用户没让它碰的东西，正是不变式二要消灭的形态。故名字必须是单一路径分量。
+///
+/// `\` 单列一条：它在 Unix 上是普通字符、在 Windows 上是分隔符，而清单是可移植的——
+/// 今天在 macOS 上它只是个怪名字，换台机器就是第二处逃逸。
+///
+/// **本函数只按 POSIX 语义判「是不是单一路径分量」，这不是疏忽而是有意的范围**：henv
+/// 目前只跑 macOS/Linux，且**编译期就锁死**了这一点——`src/apply/write.rs` 直接调
+/// `std::os::unix::fs::symlink`，`std::os::unix` 在 Windows 上不存在，所以本 crate 今天
+/// 根本构建不出 Windows 产物。因此 `:`（盘符/NTFS ADS）与尾部空格/点（Windows 会自行
+/// 归一化掉）在唯一支持的平台上都是**普通文件名字符**，逃不出基路径。
+/// 哪天要支持 Windows，这里**必须**一起补：拒 `:`、拒 `trim_end_matches([' ', '.'])`
+/// 之后为空的或落到 `.`/`..` 的名字——那两处归一化是 Windows 独有的逃逸面。
+fn name_is_a_single_component(name: &str) -> bool {
+    if name.contains('\\') {
+        return false;
+    }
+    let mut parts = Path::new(name).components();
+    matches!(parts.next(), Some(Component::Normal(_))) && parts.next().is_none()
+}
+
 /// 认得的 serde 标记里取**最靠前**的那个（值里可以自带标记词，实测
 /// `version: "invalid type: sk-live-…"`，从后往前找会把值的尾巴当成消息头留下）。
 fn value_marker(msg: &str) -> Option<(usize, &'static str)> {
@@ -423,6 +493,11 @@ impl Manifest {
 
         for (name, s) in &self.skills {
             let at = format!("skills.{name}");
+            if !name_is_a_single_component(name) {
+                e.push(format!(
+                    "{at}: name must be a single path component (no `/`, no `\\`, not `.`/`..`, not empty)"
+                ));
+            }
             reject_blank(&at, "repo", s.repo.as_deref(), &mut e);
             reject_blank(&at, "path", s.path.as_deref(), &mut e);
             match s.source {
@@ -1154,5 +1229,78 @@ plugins:
                 "raw = {raw:?} location = {location:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_skill_name_that_escapes_the_skills_dir_is_rejected() {
+        // 名字会直接参与路径拼接：`agents_skills().join(name)`（读源）与
+        // `target_dir.join(name)`（写目标）。`Path::join` 遇到绝对路径**替换**基路径、
+        // 遇到 `..` **逐级逃逸**——两种都能把 henv 带出 skills 目录，去静默覆盖用户
+        // 没让它碰的东西，正是不变式二要消灭的形态。故名字必须是单一路径分量。
+        for name in ["../../evil", "a/b", "/etc/foo", "..", ".", ""] {
+            let text = format!("version: 1\nskills:\n  \"{name}\":\n    source: agents-dir\n");
+            let err = Manifest::parse(&text)
+                .expect_err(&format!("name {name:?} 会被 Path::join 带出 skills 目录"))
+                .to_string();
+            assert!(err.contains("single path component"), "{name:?} → {err}");
+        }
+    }
+
+    #[test]
+    fn a_skill_name_with_a_backslash_is_rejected() {
+        // `\` 在 Unix 上是普通字符、在 Windows 上是分隔符。清单是可移植的：
+        // 今天在 macOS 上它只是个怪名字，换台机器就变成第二处逃逸。
+        let text = "version: 1\nskills:\n  'a\\\\b':\n    source: agents-dir\n";
+        let err = Manifest::parse(text).unwrap_err().to_string();
+        assert!(err.contains("single path component"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_keys_are_rejected_in_all_three_entry_maps() {
+        // 同一个 helper 挂在三张表上，所以三张都要有证据——只钉 skills 的话，
+        // 以后有人把 mcps/plugins 的 `deserialize_with` 删掉，测试照样全绿。
+        for text in [
+            "version: 1\nmcps:\n  a: { command: x }\n  a: { command: y }\n",
+            "version: 1\nplugins:\n  a: { source: github, repo: r }\n  a: { source: github, repo: s }\n",
+        ] {
+            let err = Manifest::parse(text)
+                .expect_err(&format!("重复键必须被拒：{text}"))
+                .to_string();
+            assert!(err.contains("duplicate field `a`"), "{err}");
+        }
+    }
+
+    #[test]
+    fn a_bare_section_key_is_still_an_empty_table() {
+        // `deserialize_unique_map` 的 `visit_unit` 那一格：YAML 里 `skills:` 是 unit，
+        // `BTreeMap` 自己的实现把它当空表。少了那一格，这样写会从「空表」变成形状错误
+        // ——而「写了段落名、还没写内容」正是手写清单时最常见的中间状态。
+        let m = Manifest::parse("version: 1\nskills:\nmcps:\nplugins:\n")
+            .expect("空段落应解成空表，不是形状错误");
+        assert!(m.skills.is_empty() && m.mcps.is_empty() && m.plugins.is_empty());
+    }
+
+    #[test]
+    fn ordinary_skill_names_still_pass() {
+        // 反面：这条守卫只该拒绝「不是单一路径分量」的名字。空格与非 ASCII 是合法目录名
+        // （Review Focus 3 要求交付后逐字节不变），带点的名字是既有惯用法（如 `kimi-cu`）。
+        for name in ["foo", "my skill", "技能", "kimi-cu", "a.b", "_x", "-y"] {
+            let text = format!("version: 1\nskills:\n  \"{name}\":\n    source: agents-dir\n");
+            let m = Manifest::parse(&text).unwrap_or_else(|e| panic!("{name:?} 应合法：{e}"));
+            assert!(m.skills.contains_key(name), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn a_duplicate_skill_name_is_rejected_not_silently_dropped() {
+        // Review Focus 4 的另一半：同一个名字写两次。json/yaml 的 map 反序列化默认是
+        // last-wins，也就是后一条**静默吞掉**前一条——用户以为配了两个源，实际只交付了一个。
+        // 使用者期望：要么清单层拒绝，要么报一个看得见的冲突；静默丢不是其中任何一种。
+        let text = "version: 1\nskills:\n  foo:\n    source: agents-dir\n  foo:\n    source: local\n    path: /tmp/x\n";
+        let err = Manifest::parse(text)
+            .expect_err("同名两次必须被拒绝，不能静默取后者")
+            .to_string();
+        assert!(err.contains("duplicate field"), "{err}");
+        assert!(err.contains("foo"), "消息要给出出错的键名：{err}");
     }
 }

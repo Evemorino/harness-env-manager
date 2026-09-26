@@ -122,6 +122,19 @@ impl Home {
     pub fn harness_dirs(&self) -> Vec<PathBuf> {
         vec![self.claude_dir(), self.codex_dir(), self.kimi_dir()]
     }
+
+    /// henv 自己的状态目录（spec §9.3）。刻意放在任何**内容目录之外**——
+    /// 账本要能活过它所记录的那些目录，放进 `.claude/` 就等于把自己的记忆
+    /// 交给被记录方保管。用 XDG 的 state 位置（相对 root，所以 $HENV_HOME 一路有效）。
+    pub fn henv_state_dir(&self) -> PathBuf {
+        self.root.join(".local").join("state").join("henv")
+    }
+
+    /// 交付账本。**不是** §1 非目标里那个 lockfile：它只记「henv 在这里放过什么」，
+    /// 不解版本、不做依赖求解、不参与任何求解过程。
+    pub fn henv_provenance(&self) -> PathBuf {
+        self.henv_state_dir().join("provenance.json")
+    }
 }
 
 #[cfg(test)]
@@ -249,5 +262,23 @@ mod tests {
             format!("{err:#}").contains("not-a-directory"),
             "错误信息里必须带上出问题的路径"
         );
+    }
+
+    #[test]
+    fn state_paths_live_outside_any_content_directory() {
+        let h = Home::new("/fake/root");
+        assert_eq!(
+            h.henv_state_dir(),
+            PathBuf::from("/fake/root/.local/state/henv")
+        );
+        assert_eq!(
+            h.henv_provenance(),
+            PathBuf::from("/fake/root/.local/state/henv/provenance.json")
+        );
+        // §9.3：账本刻意放在任何内容目录之外，这样它比被它记录的那些目录活得久。
+        for d in h.harness_dirs() {
+            assert!(!h.henv_state_dir().starts_with(&d), "{d:?}");
+        }
+        assert!(!h.henv_state_dir().starts_with(h.agents_skills()));
     }
 }

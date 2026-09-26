@@ -20,8 +20,8 @@ pub fn render(plan: &Plan) -> String {
     let c = plan.counts();
     let _ = writeln!(
         out,
-        "Plan: {} install, {} update, {} remove, {} undeliverable, {} drift",
-        c.install, c.update, c.remove, c.undeliverable, c.drift
+        "Plan: {} conflict, {} install, {} update, {} remove, {} undeliverable, {} drift, {} unknown",
+        c.conflict, c.install, c.update, c.remove, c.undeliverable, c.drift, c.unknown
     );
     out
 }
@@ -68,28 +68,44 @@ fn render_harness(h: &HarnessPlan, out: &mut String) {
                 );
             }
             Action::Update { from, to } => {
-                let _ = writeln!(
-                    out,
+                let line = format!(
                     "{lead}{}{} ({from} → {to})",
                     action_cell("~ update"),
                     e.id.label()
                 );
+                let _ = writeln!(out, "{}", with_note(line, e.note.as_ref()));
             }
             Action::Undeliverable { reason } => {
-                let _ = writeln!(
-                    out,
+                let line = format!(
                     "{lead}{}{} ({reason})",
                     action_cell("! undeliverable"),
                     e.id.label()
                 );
+                let _ = writeln!(out, "{}", with_note(line, e.note.as_ref()));
             }
             Action::Drift => {
-                let _ = writeln!(
-                    out,
+                let line = format!(
                     "{lead}{}{} (未在清单中，--prune 可删)",
                     action_cell("- drift"),
                     e.id.label()
                 );
+                let _ = writeln!(out, "{}", with_note(line, e.note.as_ref()));
+            }
+            Action::Unknown => {
+                let line = format!(
+                    "{lead}{}{} (版本无法判定)",
+                    action_cell("? unknown"),
+                    e.id.label()
+                );
+                let _ = writeln!(out, "{}", with_note(line, e.note.as_ref()));
+            }
+            Action::Conflict { reason } => {
+                let line = format!(
+                    "{lead}{}{} ({reason})",
+                    action_cell("! conflict"),
+                    e.id.label()
+                );
+                let _ = writeln!(out, "{}", with_note(line, e.note.as_ref()));
             }
             // pending 已过滤掉 InSync；match 需穷尽故留空臂，不 panic。
             Action::InSync => {}
@@ -99,6 +115,15 @@ fn render_harness(h: &HarnessPlan, out: &mut String) {
 
 fn indent() -> String {
     " ".repeat(NAME_WIDTH + 1)
+}
+
+/// 行尾注记（§9.3）。install 的合并行不用它——note 只可能出现在
+/// update/conflict 这类逐条渲染的行上。
+fn with_note(mut line: String, note: Option<&String>) -> String {
+    if let Some(n) = note {
+        let _ = write!(line, " [{n}]");
+    }
+    line
 }
 
 /// 前缀对齐到 `ACTION_WIDTH` 列；超长的 `! undeliverable`(15) 退化为两空格分隔。
@@ -149,10 +174,7 @@ mod tests {
     }
 
     fn pe(kind: Kind, name: &str, action: Action) -> PlanEntry {
-        PlanEntry {
-            id: CapId::new(kind, name),
-            action,
-        }
+        PlanEntry::new(CapId::new(kind, name), action)
     }
 
     /// spec §5 的示例场景：claude-code 全同步，codex 有 install/update/undeliverable，
@@ -387,7 +409,9 @@ mod tests {
     fn footer_counts_come_from_plan_not_from_lines() {
         let out = render(&spec_plan());
         assert!(
-            out.ends_with("\nPlan: 3 install, 1 update, 0 remove, 1 undeliverable, 1 drift\n"),
+            out.ends_with(
+                "\nPlan: 0 conflict, 3 install, 1 update, 0 remove, 1 undeliverable, 1 drift, 0 unknown\n"
+            ),
             "{out:?}"
         );
     }
@@ -397,7 +421,152 @@ mod tests {
         let out = render(&Plan::default());
         assert_eq!(
             out,
-            "Plan: 0 install, 0 update, 0 remove, 0 undeliverable, 0 drift\n"
+            "Plan: 0 conflict, 0 install, 0 update, 0 remove, 0 undeliverable, 0 drift, 0 unknown\n"
         );
+    }
+
+    #[test]
+    fn unknown_action_renders_a_line_with_question_mark() {
+        let plan = Plan {
+            harnesses: vec![hp(
+                "claude-code",
+                true,
+                vec![pe(Kind::Plugin, "superpowers", Action::Unknown)],
+                vec![(Kind::Plugin, 1)],
+            )],
+        };
+        let out = render(&plan);
+        assert!(
+            out.contains("claude-code   ? unknown  plugin/superpowers (版本无法判定)\n"),
+            "{out}"
+        );
+        assert!(
+            out.ends_with(
+                "Plan: 0 conflict, 0 install, 0 update, 0 remove, 0 undeliverable, 0 drift, 1 unknown\n"
+            ),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn footer_counts_come_from_plan_and_include_conflicts() {
+        let plan = Plan {
+            harnesses: vec![hp(
+                "claude-code",
+                true,
+                vec![
+                    pe(Kind::Skill, "a", Action::Install),
+                    pe(
+                        Kind::Skill,
+                        "b",
+                        Action::Conflict {
+                            reason: "目标已存在同名条目且不是 henv 交付的".into(),
+                        },
+                    ),
+                ],
+                vec![(Kind::Skill, 2)],
+            )],
+        };
+        let out = render(&plan);
+        assert!(
+            out.ends_with(
+                "Plan: 1 conflict, 1 install, 0 update, 0 remove, 0 undeliverable, 0 drift, 0 unknown\n"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("! conflict skill/b (目标已存在同名条目且不是 henv 交付的)\n"),
+            "{out}"
+        );
+    }
+
+    /// 冲突行前缀必须与别的动作一样对齐到 11 列，否则报告会错位。
+    #[test]
+    fn conflict_prefix_is_padded_like_every_other_action() {
+        assert_eq!(action_cell("! conflict"), "! conflict ");
+        assert_eq!(action_cell("! conflict").chars().count(), ACTION_WIDTH);
+    }
+
+    /// 内容层给的注记渲染成行尾的 ` [note]`（§9.3「副本被手改过」）。
+    #[test]
+    fn an_update_note_is_rendered_at_the_end_of_the_line() {
+        let plan = Plan {
+            harnesses: vec![hp(
+                "claude-code",
+                true,
+                vec![
+                    PlanEntry::new(
+                        CapId::new(Kind::Skill, "a"),
+                        Action::Update {
+                            from: "aaaa".into(),
+                            to: "bbbb".into(),
+                        },
+                    )
+                    .with_note(Some("副本被手改过".into())),
+                ],
+                vec![(Kind::Skill, 1)],
+            )],
+        };
+        let out = render(&plan);
+        assert!(
+            out.contains("~ update   skill/a (aaaa → bbbb) [副本被手改过]\n"),
+            "{out}"
+        );
+    }
+
+    /// 带注记的 update 与 install 相邻时，install 的合并逻辑不能被打乱。
+    ///
+    /// 条目顺序按 `Action::rank()`：install(1) 在 update(2) 之前，且合并只并
+    /// **连续**的 install——这正是 `compute` 排完序后的形态（两处 install 中间
+    /// 夹一条 update 是它产不出来的）。
+    #[test]
+    fn a_note_does_not_break_install_coalescing() {
+        let plan = Plan {
+            harnesses: vec![hp(
+                "claude-code",
+                true,
+                vec![
+                    pe(Kind::Skill, "a", Action::Install),
+                    pe(Kind::Skill, "c", Action::Install),
+                    PlanEntry::new(
+                        CapId::new(Kind::Skill, "b"),
+                        Action::Update {
+                            from: "1".into(),
+                            to: "2".into(),
+                        },
+                    )
+                    .with_note(Some("副本被手改过".into())),
+                ],
+                vec![(Kind::Skill, 3)],
+            )],
+        };
+        let out = render(&plan);
+        assert!(out.contains("+ install  skill/a, skill/c\n"), "{out}");
+        assert!(out.contains(" [副本被手改过]\n"), "{out}");
+    }
+
+    /// 冲突是阻断性的，必须在最前——一行 `+ install` 出现在冲突之前会让人
+    /// 以为改动已经可以做了。
+    #[test]
+    fn conflicts_render_before_installs() {
+        let plan = Plan {
+            harnesses: vec![hp(
+                "claude-code",
+                true,
+                vec![
+                    pe(
+                        Kind::Skill,
+                        "z-last-name",
+                        Action::Conflict { reason: "r".into() },
+                    ),
+                    pe(Kind::Skill, "a-first-name", Action::Install),
+                ],
+                vec![(Kind::Skill, 2)],
+            )],
+        };
+        let out = render(&plan);
+        let conflict_at = out.find("! conflict").expect("conflict line");
+        let install_at = out.find("+ install").expect("install line");
+        assert!(conflict_at < install_at, "{out}");
     }
 }

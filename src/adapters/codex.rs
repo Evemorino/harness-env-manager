@@ -5,7 +5,7 @@ use crate::home::Home;
 use crate::skills_dir::{SkillStore, plugin_from_path, try_read_skill_entries};
 use anyhow::anyhow;
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use toml::Table as TomlTable;
 use toml::Value as TomlValue;
 
@@ -113,7 +113,7 @@ impl Codex {
     ///
     /// **已知局限**（Plan C 的 doctor 要报出来）：codex 的 `config.toml` 不记录 plugin 的
     /// 版本或 SHA（缓存目录名可能是 semver、git sha 或字面量 `unknown`），所以 `version`
-    /// 与 `sha` 恒为 `None` → `compare_versions` 判 `Unknown` → diff 按 in-sync 处理，
+    /// 与 `sha` 恒为 `None` → `compare_versions` 判 `Unknown` → diff 报可见的 `? unknown`，
     /// 不误报 update。这也是本文件不 import `normalize_locator` 的原因：codex 一个 locator
     /// 字段都不读，没有需要归一化的东西。
     fn read_plugins(&self, root: &TomlTable, file: &Path) -> anyhow::Result<Vec<Capability>> {
@@ -184,15 +184,15 @@ impl Codex {
                 // 断链或指向库外：来源不可判定，交给 doctor 报告
                 SkillStore::Other => SkillSource::Unknown,
             };
+            // §9.3：断链没有内容但有路径，自愈要能看见它（见 `SkillEntry::content_path`）。
+            // 先取再搬 `e.name`——顺序反了就是对一个被部分移动的值借方法。
+            let path = e.content_path();
             out.push(Capability {
                 id: CapId::new(Kind::Skill, e.name),
                 origin: Origin::Adopted {
                     harness: CODEX.into(),
                 },
-                spec: Spec::Skill {
-                    source,
-                    path: e.resolved,
-                },
+                spec: Spec::Skill { source, path },
                 targets: Targets::All,
             });
         }
@@ -220,6 +220,10 @@ impl HarnessAdapter for Codex {
         // dedup_by 只去重相邻项，所以必须先 sort
         caps.dedup_by(|a, b| a.id == b.id);
         Ok(caps)
+    }
+
+    fn skills_target_dir(&self) -> Option<PathBuf> {
+        Some(self.home.codex_skills())
     }
 
     fn supports(&self, _cap: &Capability) -> Support {
@@ -448,11 +452,13 @@ mod tests {
             .symlink(".codex/skills/gone", "../../.agents/skills/nope");
         let caps = Codex::new(t.home.clone()).read_state().unwrap();
         let s = find(&caps, Kind::Skill, "gone").expect("broken link must be reported");
+        // 来源仍不可判定（doctor 的事），但 `path` 要给得出**链接本身**：§9.3 的断链自愈
+        // 靠内容层看得见这个条目才成立，`None` 会让那条承诺在真实运行里永远走不到。
         assert_eq!(
             s.spec,
             Spec::Skill {
                 source: SkillSource::Unknown,
-                path: None
+                path: Some(t.path(".codex/skills/gone"))
             }
         );
     }
