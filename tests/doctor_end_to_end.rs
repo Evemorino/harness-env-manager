@@ -34,6 +34,9 @@ fn doctor(home: &TempHome, manifest: &str) -> (i32, String, String) {
 #[test]
 fn a_clean_environment_exits_zero() {
     let home = TempHome::new();
+    // 装了的家：`detect()` 就是「目录在不在」。没有它，这条测试保不住
+    // 「干净 = 0 问题 0 警告」——报告会多出一条「启用了但没装」的警告。
+    home.mkdir(".claude");
     let (code, out, err) = doctor(&home, &format!("version: 1\n{ONLY_CLAUDE}"));
     assert_eq!(code, 0, "stdout={out} stderr={err}");
     assert!(out.ends_with("Doctor: 0 problems, 0 warnings\n"), "{out}");
@@ -84,4 +87,32 @@ fn a_broken_link_is_reported_as_a_warning_and_does_not_fail() {
     assert!(out.contains("- link"), "{out}");
     assert!(out.contains("skill/foo@claude-code"), "{out}");
     assert!(out.contains("1 warnings"), "{out}");
+}
+
+/// 清单里启用了、本机却没装的家：只警告（**先写清单后装 harness 是正常流程**），
+/// exit 仍是 0，harness 行上写明状态。
+#[test]
+fn an_enabled_but_absent_harness_only_warns() {
+    let home = TempHome::new();
+    let manifest = "version: 1\nharnesses:\n  claude-code: { enabled: false }\n  codex: { enabled: false }\n  kimi-code: { enabled: true }\n";
+    let (code, out, err) = doctor(&home, manifest);
+    assert_eq!(code, 0, "stdout={out} stderr={err}");
+    assert!(out.contains("kimi-code"), "{out}");
+    assert!(out.contains("not installed"), "{out}");
+    assert!(out.contains("Doctor: 0 problems, 1 warnings"), "{out}");
+}
+
+/// 配置读不出来 = 这一家的判定不可信 → **问题**（exit 1），而且要说清是哪一家、
+/// 以及「计划那一段这轮没跑」——不然「没有 conflict」会被误读成「没有冲突」。
+#[test]
+fn an_unreadable_harness_config_exits_one() {
+    let home = TempHome::new();
+    home.mkdir(".codex");
+    home.write(".codex/config.toml", "= = =\n");
+    let (code, out, err) = doctor(&home, "version: 1\n");
+    assert_eq!(code, 1, "stdout={out} stderr={err}");
+    assert!(out.contains("! config unreadable"), "{out}");
+    assert!(out.contains("! harness"), "{out}");
+    assert!(out.contains("codex"), "{out}");
+    assert!(out.contains("diff 段"), "{out}");
 }

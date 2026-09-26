@@ -1,0 +1,10 @@
+---
+source: src/doctor.rs
+expression: render_doctor(&report)
+---
+claude-code   ✓ ok
+codex         ! config unreadable
+kimi-code     ⚠ not installed
+(warn)        - harness  kimi-code (清单里启用了，但本机没装（这一家的能力不会被体检）)
+
+Doctor: 0 problems, 1 warnings

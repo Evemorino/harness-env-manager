@@ -12,8 +12,10 @@
 //! - **判据与 `diff` 同源**：冲突与交付不了直接取同一次规划里的 `Action`，
 //!   不另写一套判据、也不在健康路径上再读一遍盘。
 
+use crate::adapters;
 use crate::diff::{Action, Plan};
 use crate::home::Home;
+use crate::manifest::{KNOWN_HARNESSES, Manifest};
 use crate::render::{NAME_WIDTH, action_cell};
 use crate::store::skills::SourceMode;
 use std::fmt::Write as _;
@@ -39,8 +41,20 @@ pub struct Check {
     pub text: String,
 }
 
+/// 一家 harness 的体检结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HarnessCheck {
+    pub name: String,
+    /// `detect()`：这一家的目录在不在。
+    pub installed: bool,
+    /// 装了、但配置读不出来：`Some(理由)`。`None` = 读得出来（或压根没装、没读）。
+    pub parse_error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DoctorReport {
+    /// 报告的第一段：逐家一行（装没装、配置读不读得出来）。
+    pub harnesses: Vec<HarnessCheck>,
     pub checks: Vec<Check>,
 }
 
@@ -158,10 +172,45 @@ fn detail_line(prefix: &str, subject: &str, detail: &str) -> String {
     format!("{}{subject} ({detail})", action_cell(prefix))
 }
 
+/// 清单里启用了、本机却没装的家 → 一条警告（**不是**问题：先写清单后装 harness
+/// 是正常流程）。行上的状态由 harness 表那一段负责，这里给的是「这意味着什么」。
+fn absent_harness_warnings(harnesses: &[HarnessCheck]) -> Vec<Check> {
+    harnesses
+        .iter()
+        .filter(|h| !h.installed)
+        .map(|h| Check {
+            kind: CheckKind::Warning,
+            text: detail_line(
+                "- harness",
+                &h.name,
+                "清单里启用了，但本机没装（这一家的能力不会被体检）",
+            ),
+        })
+        .collect()
+}
+
+/// harness 表：报告的第一段，逐家一行。
+fn render_harnesses(harnesses: &[HarnessCheck], out: &mut String) {
+    for h in harnesses {
+        let head = format!("{:<NAME_WIDTH$} ", h.name);
+        // 「配置读不出来」的原因在 `(plan)` 段的那条问题里（那里有整句），
+        // 这里只说状态——表要一眼能扫。
+        let state = if h.parse_error.is_some() {
+            "! config unreadable"
+        } else if h.installed {
+            "✓ ok"
+        } else {
+            "⚠ not installed"
+        };
+        let _ = writeln!(out, "{head}{state}");
+    }
+}
+
 /// 段落顺序：问题在前（先 `(env)` 后 `(plan)`——环境不可信时计划判定也没意义），
-/// 警告在后；没有内容的段一个字符都不输出，页脚永远是最后一行。
+/// 警告在后；harness 表在最前。没有内容的段一个字符都不输出，页脚永远是最后一行。
 pub fn render_doctor(report: &DoctorReport) -> String {
     let mut out = String::new();
+    render_harnesses(&report.harnesses, &mut out);
     for (kind, head) in [
         (CheckKind::Env, "(env)"),
         (CheckKind::Plan, "(plan)"),
@@ -181,7 +230,7 @@ pub fn render_doctor(report: &DoctorReport) -> String {
             let _ = writeln!(out, "{lead}{}", c.text);
         }
     }
-    if !report.checks.is_empty() {
+    if !report.harnesses.is_empty() || !report.checks.is_empty() {
         out.push('\n');
     }
     let _ = writeln!(
@@ -193,15 +242,118 @@ pub fn render_doctor(report: &DoctorReport) -> String {
     out
 }
 
+/// `plan_for` 失败时归因：**只探 `plan_for` 会去读的家**——清单里启用的，加上被
+/// `source_harness:` 点名的（源扫描不看 `enabled`）。一个被 `harnesses:` 关掉、又没人
+/// 当源的家，`plan_for` 根本不会碰它，把它的坏配置算成本次失败的原因就是假阳性。
+///
+/// 返回 `None` = 归不了因（清单自己读不了/解不开、git 跑不起来……），调用方把原错误
+/// 上抛：那是「工具没跑成」，不是「体检查出问题」。
+fn attribute_failure(manifest_path: &Path, home: &Home) -> Option<(Vec<HarnessCheck>, Vec<Check>)> {
+    let text = std::fs::read_to_string(manifest_path).ok()?;
+    let manifest = Manifest::parse(&text).ok()?;
+
+    let mut wanted: Vec<&str> = KNOWN_HARNESSES
+        .iter()
+        .copied()
+        .filter(|name| crate::is_enabled(&manifest, name))
+        .collect();
+    for p in manifest.plugins.values() {
+        if let Some(source) = p.source_harness.as_deref() {
+            wanted.push(source);
+        }
+    }
+    wanted.sort_unstable();
+    wanted.dedup();
+
+    let registry = adapters::registry(home);
+    let mut harnesses = Vec::new();
+    for name in wanted {
+        let Some(a) = adapters::lookup(&registry, name) else {
+            continue;
+        };
+        if !a.detect() {
+            harnesses.push(HarnessCheck {
+                name: name.to_string(),
+                installed: false,
+                parse_error: None,
+            });
+            continue;
+        }
+        let parse_error = a.read_state().err().map(|e| format!("{e:#}"));
+        harnesses.push(HarnessCheck {
+            name: name.to_string(),
+            installed: true,
+            parse_error,
+        });
+    }
+
+    let broken: Vec<&HarnessCheck> = harnesses
+        .iter()
+        .filter(|h| h.parse_error.is_some())
+        .collect();
+    if broken.is_empty() {
+        return None;
+    }
+
+    let mut checks: Vec<Check> = broken
+        .iter()
+        .map(|h| Check {
+            kind: CheckKind::Plan,
+            text: detail_line(
+                "! harness",
+                &h.name,
+                &format!(
+                    "配置读不出来：{}",
+                    h.parse_error.as_deref().unwrap_or_default()
+                ),
+            ),
+        })
+        .collect();
+    // 说清后果：计划那一段这轮没跑，所以「没有 conflict / undeliverable」不代表没有。
+    checks.push(Check {
+        kind: CheckKind::Plan,
+        text: detail_line(
+            "! plan",
+            "diff 段",
+            &format!("这轮没跑：有 {} 家配置读不出来", broken.len()),
+        ),
+    });
+    Some((harnesses, checks))
+}
+
 /// 体检一次。I/O 只在这个函数里发生：规划一次（与 `diff` 同一份），分类与渲染都是纯的。
 pub fn run_doctor(
     manifest_path: &Path,
     home: &Home,
     out: &mut dyn Write,
 ) -> anyhow::Result<DoctorReport> {
-    let planned = crate::plan_for(manifest_path, home, SourceMode::Cached, None)?;
-    let report = DoctorReport {
-        checks: plan_checks(&planned.plan),
+    let report = match crate::plan_for(manifest_path, home, SourceMode::Cached, None) {
+        Ok(planned) => {
+            // 健康路径只观察了一次盘：装没装直接取 `plan_for` 已经读到的 `detected`，
+            // 不再 `read_state()`（§9.5 那条「不许有第二条读路径」）。
+            let harnesses: Vec<HarnessCheck> = planned
+                .plan
+                .harnesses
+                .iter()
+                .map(|h| HarnessCheck {
+                    name: h.harness.clone(),
+                    installed: h.detected,
+                    parse_error: None,
+                })
+                .collect();
+            let mut checks = absent_harness_warnings(&harnesses);
+            checks.extend(plan_checks(&planned.plan));
+            DoctorReport { harnesses, checks }
+        }
+        // 规划跑不动：先归因。读不出来的是某一家配置 → 那是体检**查出来的问题**
+        // （报告 + 退出码 1）；归不了因才是「工具没跑成」（原错误上抛 → 退出码 2）。
+        Err(err) => match attribute_failure(manifest_path, home) {
+            Some((harnesses, mut checks)) => {
+                checks.splice(0..0, absent_harness_warnings(&harnesses));
+                DoctorReport { harnesses, checks }
+            }
+            None => return Err(err),
+        },
     };
     write!(out, "{}", render_doctor(&report))?;
     Ok(report)
@@ -219,6 +371,7 @@ mod tests {
     #[test]
     fn a_problem_report_renders_every_section() {
         let report = DoctorReport {
+            harnesses: Vec::new(),
             checks: vec![
                 Check {
                     kind: CheckKind::Env,
@@ -283,6 +436,64 @@ mod tests {
             ],
         };
         insta::assert_snapshot!(render_doctor(&report));
+    }
+
+    /// harness 表是报告的第一段，三种状态各一行：读得出来、装不上、装得上但配置坏。
+    #[test]
+    fn the_harness_table_renders_three_states() {
+        let report = DoctorReport {
+            harnesses: vec![
+                HarnessCheck {
+                    name: "claude-code".into(),
+                    installed: true,
+                    parse_error: None,
+                },
+                HarnessCheck {
+                    name: "codex".into(),
+                    installed: true,
+                    parse_error: Some("cannot parse ~/.codex/config.toml".into()),
+                },
+                HarnessCheck {
+                    name: "kimi-code".into(),
+                    installed: false,
+                    parse_error: None,
+                },
+            ],
+            checks: absent_harness_warnings(&[HarnessCheck {
+                name: "kimi-code".into(),
+                installed: false,
+                parse_error: None,
+            }]),
+        };
+        insta::assert_snapshot!(render_doctor(&report));
+    }
+
+    /// 没装的家只警告；装了且读得出来的家什么都不报（否则每台机器都会恒红）。
+    #[test]
+    fn only_absent_harnesses_warn() {
+        let checks = absent_harness_warnings(&[
+            HarnessCheck {
+                name: "claude-code".into(),
+                installed: true,
+                parse_error: None,
+            },
+            HarnessCheck {
+                name: "kimi-code".into(),
+                installed: false,
+                parse_error: None,
+            },
+        ]);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].kind, CheckKind::Warning);
+        assert!(checks[0].text.contains("kimi-code"), "{}", checks[0].text);
+        assert_eq!(
+            DoctorReport {
+                harnesses: Vec::new(),
+                checks
+            }
+            .warnings(),
+            1
+        );
     }
 
     /// 空报告是**空操作**：没有段、没有空行，只有页脚。
