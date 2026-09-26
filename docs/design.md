@@ -951,3 +951,52 @@ harness 配置）。
 （`! env mcp \`context7\` (${CONTEXT7_API_KEY} 在当前环境里没有值)`），**绝不回显值**——日志与终端
 回滚缓冲是威胁模型（§3 决策 3）。清单只读一次：`plan_for` 已经把 `Manifest` 解析过了，doctor 直接取
 那一份（`Planned.manifest`）。
+
+### 10.2 scan（收养）
+
+`henv scan [-m env.yaml] [--dry-run]`。**它是 `apply` 的反向管道**（§3 决策 2、§5）：读一遍本机
+现状，把「清单还描述不了、但本机确实装着」的能力变成 `env.yaml` 条目**追加**进去。方向反了，
+判据不反——现状与清单的比对仍是同一套 `Capability`，只是把「actual 有、desired 无」的那一侧翻译
+成清单文本。现状走的是与 `diff`/`apply`/`doctor` **共用的那一次** `read_harness_states`
+（§9.5「不许有第二条读路径」），不新开一条读盘路径。
+
+| 现状 | 收养成 | 备注 |
+|---|---|---|
+| `skill`，源在 `~/.agents/skills` 共享库 | `skills: {source: agents-dir}` | §2.1 第 4 条的既有事实标准 |
+| `skill`，harness 自己目录里的真目录 | `skills: {source: local, path: <解析后的真实路径>}` | 内容就在那儿，如实记 |
+| `skill`，随 plugin 分发（`PluginBundle` / `Origin::Plugin`） | **不收养** | 写进清单 = 把原生安装降级成散装 skill（§2.1 第 2 条） |
+| `skill`，来源不可判定（断链 / 指向库外） | **不收养** | 没有可记的源 |
+| `skill`，来源是 git | **不收养** | 现状侧读不到 `repo`/`ref`，写了也是空壳 |
+| `mcp` | `mcps: {command, args, env}` | `env` 值原样保留 `${VAR}` 引用，**不展开**（§3 决策 3） |
+| `plugin` | **不收养** | 见下 |
+| `command` / `agent` / `hook` | **不收养** | §4 的清单只有三段，表达不了 |
+
+**plugin 不收养**：清单里的 plugin 条目含义是**交付请求**（§9.5：`source_harness:` 请求拆解、
+`targets` 决定送到哪几家），不是「本机装着它」的快照。收养只可能记「它装在这一家」，于是两种
+写法都错——`targets` 只有源家 ⇒ 交付目标 = `targets` − 源家 = 空 ⇒ 恒 `undeliverable`（实测
+`plugin/chrome-devtools-mcp` 在真机上就是这一行）；`targets: all` ⇒ 把这家 bundle 的内容拆到另外
+两家 ⇒ 静默扩范围。要记「装过什么版本」，清单得先长出「只记录、不交付」的 source 形态——**本轮
+不做**（§9.1 的「不做」里就有 plugin 原生安装）。所以 `scan` 只把它连同理由报出来。
+
+**收养不扩范围。** 条目 `targets:` 记**发现它的那几家**（按 `KNOWN_HARNESSES` 顺序去重），不写
+`all`：收养的语义是「把现状记下来」，不是「顺手让它铺到另外两家」。真想让某个 skill 也去
+codex，那是用户改 `targets` 的决定，不是 `scan` 的。
+
+**只追加，绝不修改已有条目。** 清单里已有同名同 kind 的条目 → **静默跳过**（不是 finding：内容
+是否一致是 `diff` 的 `drift`/`update` 领域，`scan` 一个字节都不碰）。报出来只会在每台机器上刷满
+屏——与 `doctor` 把 `install`/`in-sync` 当安静行是同一条理由。`(skip)` 段只留「用户可能以为能
+收养、但收不了」的那几类。
+
+**写回是文本级插入，不是 YAML 序列化。** 清单是用户手写的：注释、空行、键序、缩进都保留
+（§9.1「`scan` 的产物是清单条目，不是形态改写」）。定位只认列 0 的顶层键行；新条目接在该段最后
+一个非空行之后（注释也算段内容，不许被顶开），段不存在就在文件末尾新建。段缩进跟着**该段第一行
+内容**的缩进走，新条目的字段永远比条目头深一级。段头带了内联值（`mcps: {}`）→ **拒绝**并让用户
+自己改一行（展开 flow 形态必然要重写别的字节）。落盘顺序：拼接 → **`Manifest::parse` 解一遍**
+（解不开就拒绝写，一个字节不落）→ `apply::write::write_config`（temp → fsync → rename，rename
+前落 `.henv.bak`）。所以 `scan` 不需要新的写路径目录，`tests/read_only_guard.rs` 的白名单不用动。
+
+**退出码只有 `0` 与 `2`。** 它不是门禁（对比 §10.1）：`0` = 跑成了（有没有新增都是 0）、
+`2` = 工具没跑成（清单读不了/解不开、某家状态读不了、插入结果自己解不开）。没有 `1`——「本机有
+drift」不是错误，那是 `diff`/`doctor` 的事。`--dry-run` 只打印：不写清单、不落 `.henv.bak`。
+不提问确认：这个动作只追加、有 `.bak`、且是用户显式敲的命令（对比 `apply` 会覆盖既有内容，
+所以它要一次 y/N）。

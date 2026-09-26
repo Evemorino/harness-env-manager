@@ -4,6 +4,6 @@ expression: render_scan(&report, true)
 ---
 (adopt)              skill/trim            → skills: source=local path=/home/u/.claude/skills/trim targets=[claude-code]
                      mcp/kimi-cu           → mcps: command=uvx targets=[kimi-code]
-                     skill/ext@kimi-code   plugin `kimi-cu` 的分发产物，收养会把它降级成散装 skill
+                     skill/ext@kimi-code   随 plugin `kimi-cu` 分发（收养会降级成散装 skill）
 
 Scan: 2 to adopt, 1 skipped (dry run)

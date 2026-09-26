@@ -16,9 +16,13 @@
 
 use crate::capability::{Capability, Kind, Origin, SkillSource, Spec};
 use crate::diff::HarnessState;
+use crate::home::Home;
 use crate::manifest::Manifest;
+use anyhow::Context as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
+use std::io::Write;
+use std::path::Path;
 
 /// 清单的三个可收养段。段的顺序就是渲染顺序，也是 `section.as_str()` 的拼写。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -55,8 +59,9 @@ pub struct Adoption {
     pub name: String,
     /// `kind/name`——与 `Skip.label` 同一套拼写，报告里两段的行首才读得一致。
     pub label: String,
-    /// 条目**字段行**的 YAML 文本：每行 4 空格缩进（条目头下的一级）、以 `\n` 结尾，
-    /// **不含** `name:` 那一行。插入是纯拼接，不需要再懂 YAML。
+    /// 条目**字段行**的 YAML 文本：每行 2 空格缩进（相对条目头，往下一级）、以 `\n`
+    /// 结尾，**不含** `name:` 那一行。缩进是**相对**的：清单里已有的段用几个空格缩进，
+    /// 插入时就补几个（`insert_entries` 负责），这样 `scan` 不会把用户的排版改掉。
     pub body: String,
     /// 报告里的一行人话（不含 `targets`，那是渲染器统一补的）。
     pub summary: String,
@@ -97,7 +102,7 @@ pub fn adoptions(manifest: &Manifest, states: &[HarnessState]) -> AdoptionReport
             // 随 plugin 装进来的内容不是散装条目（kimi 的 bundle skill 走这一支）：
             // 把它写成清单条目，等于把原生安装降级成散装 skill（§2.1 第 2 条）。
             if let Origin::Plugin { name } = &cap.origin {
-                let reason = format!("随 plugin `{name}` 装进来的，不是散装条目");
+                let reason = format!("随 plugin `{name}` 装进来（不是散装条目）");
                 record_skip(&mut skips, cap, state, reason);
                 continue;
             }
@@ -143,35 +148,23 @@ fn adoptable(cap: &Capability) -> Result<(), String> {
             // plugin 缓存里的真目录：收养它就把「随 plugin 分发」写成了「散装 skill」，
             // 下次 apply 会往 harness 自己的目录里拷一份，plugin 升级后两边分叉。
             SkillSource::PluginBundle { plugin } => Err(format!(
-                "plugin `{plugin}` 的分发产物，收养会把它降级成散装 skill"
+                "随 plugin `{plugin}` 分发（收养会降级成散装 skill）"
             )),
             // 断链与指向库外的链接在这层分不开（`Spec::Skill` 只留 `content_path()`），
             // 所以理由写成一句覆盖两种情形的话——不为了好看的措辞去猜。
-            SkillSource::Unknown => Err("来源不可判定（断链或指向共享库外），没有可记的源".into()),
+            SkillSource::Unknown => Err("来源不可判定（断链或指向共享库外）".into()),
             // 现状侧没有仓库与 ref 的信息（adapter 只读 harness 目录），记不出
             // `repo:`/`ref:` 两格——写一条空壳 `source: git` 比不写更坏。
-            SkillSource::Git { .. } => {
-                Err("来源是 git，但现状里读不到仓库与 ref，记不出 `repo:`/`ref:`".into())
-            }
+            SkillSource::Git { .. } => Err("来源是 git，但读不到 repo/ref，记不出这两格".into()),
         },
         Spec::Mcp { .. } => Ok(()),
-        Spec::Plugin {
-            marketplace,
-            enabled,
-            ..
-        } => {
-            if !*enabled {
-                return Err(
-                    "已安装但被禁用（enabled = false），清单不该记一个用户关掉的东西".into(),
-                );
-            }
-            if marketplace.is_none() {
-                return Err(
-                    "没有 marketplace，记不出 `source:`（§4 的 plugins 段只有三种 source）".into(),
-                );
-            }
-            Ok(())
-        }
+        // plugin **不收养**。清单里的 plugin 条目含义是**交付请求**（§9.5：`source_harness:`
+        // 请求拆解、`targets` 决定送到哪几家），不是「本机装着它」的快照。收养只可能记
+        // 「它装在这一家」，于是两种写法都错：
+        // `targets` 只有源家 → 交付目标 = targets − 源家 = 空 → 恒 `undeliverable`（实测）；
+        // `targets: all` → 把这家 bundle 的内容拆到另外两家 → 静默扩范围。
+        // 要记「装过什么版本」，清单得先长出「只记录、不交付」的 source 形态（本轮不做）。
+        Spec::Plugin { .. } => Err("清单里的 plugin 条目是交付请求、不是快照（§9.5）".into()),
         // §4 的清单只有 skills / mcps / plugins 三段，这三种 kind 表达不了。
         Spec::Command { .. } | Spec::Agent { .. } | Spec::Hook { .. } => Err(format!(
             "清单 schema 表达不了 `{}` 这个 kind",
@@ -218,17 +211,17 @@ fn shape(cap: &Capability, harnesses: &BTreeSet<String>) -> Adoption {
         .filter(|h| harnesses.contains(**h))
         .map(|h| (*h).to_string())
         .collect();
-    let targets_line = format!("    targets: [{}]", targets.join(", "));
+    let targets_line = format!("  targets: [{}]", targets.join(", "));
     let (mut body, summary) = match &cap.spec {
         Spec::Skill { source, .. } => match source {
             SkillSource::AgentsDir => (
-                String::from("    source: agents-dir\n"),
+                String::from("  source: agents-dir\n"),
                 String::from("source=agents-dir"),
             ),
             SkillSource::Local { path: local } => {
                 let p = local.display().to_string();
                 (
-                    format!("    source: local\n    path: {}\n", scalar(&p)),
+                    format!("  source: local\n  path: {}\n", scalar(&p)),
                     format!("source=local path={p}"),
                 )
             }
@@ -241,16 +234,16 @@ fn shape(cap: &Capability, harnesses: &BTreeSet<String>) -> Adoption {
         },
         Spec::Mcp { command, args, env } => {
             let mut out = String::new();
-            let _ = writeln!(out, "    command: {}", scalar(command));
+            let _ = writeln!(out, "  command: {}", scalar(command));
             if !args.is_empty() {
                 let items: Vec<String> = args.iter().map(|a| scalar(a)).collect();
-                let _ = writeln!(out, "    args: [{}]", items.join(", "));
+                let _ = writeln!(out, "  args: [{}]", items.join(", "));
             }
             if !env.is_empty() {
-                out.push_str("    env:\n");
+                out.push_str("  env:\n");
                 for (k, v) in env {
                     // 值永远是 `${VAR}` 引用，原样写回——**不展开**（§3 决策 3）。
-                    let _ = writeln!(out, "      {}: {}", scalar(k), scalar(v));
+                    let _ = writeln!(out, "    {}: {}", scalar(k), scalar(v));
                 }
             }
             let summary = if args.is_empty() {
@@ -260,27 +253,9 @@ fn shape(cap: &Capability, harnesses: &BTreeSet<String>) -> Adoption {
             };
             (out, summary)
         }
-        Spec::Plugin {
-            marketplace,
-            entry,
-            version,
-            ..
-        } => {
-            let marketplace = marketplace.clone().unwrap_or_default();
-            let mut out = String::new();
-            out.push_str("    source: claude-marketplace\n");
-            let _ = writeln!(out, "    marketplace: {}", scalar(&marketplace));
-            let _ = writeln!(out, "    entry: {}", scalar(entry));
-            let mut summary =
-                format!("source=claude-marketplace marketplace={marketplace} entry={entry}");
-            // `ref:` 是这次收养的快照，不是判决。只有「version 形」才记（§2.1 第 3 条：
-            // sha 形目录名与 `unknown` 与版本不可比，记进去就是把不可比当成了可比）。
-            if let Some(v) = version.as_deref().and_then(version_shaped) {
-                let _ = writeln!(out, "    ref: {}", scalar(&v));
-                summary.push_str(&format!(" ref={v}"));
-            }
-            (out, summary)
-        }
+        // `adoptable` 一律拒绝 plugin（理由见那里）。这里留一个说得出原因的兜底而不是空实现：
+        // 真有人放开那条判据时，会立刻炸在他眼前。
+        Spec::Plugin { .. } => unreachable!("plugin adoption is refused by `adoptable`"),
         Spec::Command { .. } | Spec::Agent { .. } | Spec::Hook { .. } => {
             unreachable!("not adoptable: {:?}", cap.id.kind)
         }
@@ -295,12 +270,6 @@ fn shape(cap: &Capability, harnesses: &BTreeSet<String>) -> Adoption {
         summary,
         targets,
     }
-}
-
-/// 「version 形」的判据只有一处定义（`capability::normalize_version`）：去前导 `v`/`V`
-/// 后含小数点才算版本。sha 形目录名、分支名、`unknown` 都过不了。
-fn version_shaped(value: &str) -> Option<String> {
-    crate::capability::normalize_version(value)
 }
 
 /// YAML 标量渲染。安全就裸写，否则双引号包住并转义——**规则宁严勿宽**：多引一对引号
@@ -335,6 +304,198 @@ fn scalar(s: &str) -> String {
         }
     }
     out.push('"');
+    out
+}
+
+/// 收养一次。I/O 只在两处：读现状（走与 `diff`/`apply`/`doctor` 共用的那一个
+/// `read_harness_states`）与写回（复用 `apply::write::write_config` 的
+/// temp → fsync → rename + `.henv.bak`）。
+///
+/// `dry_run` 时**只读**：不落 `.henv.bak`、不碰清单。
+pub fn run_scan(
+    manifest_path: &Path,
+    home: &Home,
+    dry_run: bool,
+    out: &mut dyn Write,
+) -> anyhow::Result<AdoptionReport> {
+    let text = std::fs::read_to_string(manifest_path)
+        .with_context(|| format!("cannot read manifest: {}", manifest_path.display()))?;
+    let manifest = Manifest::parse(&text)
+        .with_context(|| format!("invalid manifest: {}", manifest_path.display()))?;
+
+    let registry = crate::adapters::registry(home);
+    let states = crate::read_harness_states(&registry, &manifest, None)?;
+    let report = adoptions(&manifest, &states);
+
+    // **先落盘、后打印报告**：报告末行会说「已追加到 env.yaml」，那句话不能先于事实出现
+    // （写失败时用户只看得到 `Error:`，看不到一句已经说出口的谎）。
+    if !dry_run {
+        if let Some(new_text) = insert_entries(&text, &report.adoptions)? {
+            // 落盘前先自己解一遍：写出一份自己都读不回的清单，比不写坏得多。
+            Manifest::parse(&new_text)
+                .context("refusing to write a manifest that does not parse back")?;
+            crate::apply::write::write_config(manifest_path, new_text.as_bytes())?;
+        }
+    }
+    write!(out, "{}", render_scan(&report, dry_run))?;
+    Ok(report)
+}
+
+/// 把条目插进清单文本的对应段，**已有字节一个不动**（只做拼接，从不重写既有的行）。
+/// 返回 `None` = 没有条目可插（空报告是空操作）。
+///
+/// 段定位：只认**列 0** 的顶层键行（`^[A-Za-z0-9_-]+:`，`#` 注释与空行不算）。段的范围
+/// 到下一个顶层键行为止；新条目接在该段的**最后一个非空非注释行之后**。段不存在就在文件
+/// 末尾新建。段头带了内联值（`mcps: {}` / `mcps: [a]`）时**拒绝**——把一个 flow 形态展开成
+/// block 而不动用户的其他字节做不到，宁可让他自己改一行。
+///
+/// 缩进跟着**已有段的第一行内容**走：用户的清单用 4 空格缩进条目，新条目也是 4 空格。
+/// 我们不替用户决定排版，也不要因为排版不同就把他的清单解不开。
+pub fn insert_entries(text: &str, adoptions: &[Adoption]) -> anyhow::Result<Option<String>> {
+    if adoptions.is_empty() {
+        return Ok(None);
+    }
+    let mut by_section: BTreeMap<Section, Vec<&Adoption>> = BTreeMap::new();
+    for a in adoptions {
+        by_section.entry(a.section).or_default().push(a);
+    }
+    let mut out = text.to_string();
+    // 逐段处理，每次都基于「当前文本」重新定位：前一次插入挪动了偏移，重扫一遍最省心
+    // （清单是几百行的量级，不值得为它上一套偏移账本）。
+    for (section, entries) in by_section {
+        out = insert_section(&out, section, &entries)?;
+    }
+    Ok(Some(out))
+}
+
+/// 一行的范围（`start` 到 `end`，`end` 不含换行符）。
+fn line_ranges(text: &str) -> Vec<(usize, usize)> {
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    for line in text.split_inclusive('\n') {
+        let body = line.strip_suffix('\n').unwrap_or(line);
+        out.push((at, at + body.len()));
+        at += line.len();
+    }
+    out
+}
+
+/// 列 0 的顶层键行 → 键名。缩进行、注释行、空行、以及不是 `key:` 形状的行都不是。
+fn top_level_key(line: &str) -> Option<&str> {
+    if line.is_empty() || line.starts_with([' ', '\t', '#']) {
+        return None;
+    }
+    let (key, _) = line.split_once(':')?;
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    Some(key)
+}
+
+/// 段内容里「非空」的行。**注释也算**：它属于这一段，新条目该排在它下面。
+fn is_nonblank(line: &str) -> bool {
+    !line.trim().is_empty()
+}
+
+/// 段缩进只看**非空非注释**的行：注释的缩进是排版的自由，不能拿来当基准。
+fn is_indented_content(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty() && !t.starts_with('#')
+}
+
+fn insert_section(text: &str, section: Section, entries: &[&Adoption]) -> anyhow::Result<String> {
+    let name = section.as_str();
+    let lines = line_ranges(text);
+    let at = |i: usize| -> &str { &text[lines[i].0..lines[i].1] };
+
+    let mut header: Option<usize> = None;
+    let mut block_end = lines.len();
+    for i in 0..lines.len() {
+        let line = at(i);
+        let Some(key) = top_level_key(line) else {
+            continue;
+        };
+        match header {
+            None => {
+                if key == name {
+                    if line.trim_end() != format!("{name}:") {
+                        anyhow::bail!(
+                            "`{name}:` 带了内联值（`{}`）；scan 不会改写用户的排版，\
+                             请把它改成 block 形态（单独一行 `{name}:`）再跑",
+                            line.trim()
+                        );
+                    }
+                    header = Some(i);
+                }
+            }
+            Some(_) => {
+                if key != name {
+                    block_end = i;
+                    break;
+                }
+            }
+        }
+    }
+
+    // 缩进与插入点：段内第一个有意义的行的缩进，以及最后一个有意义行之后。
+    let Some(header) = header else {
+        return Ok(append_section(text, name, &render_entries(entries, 2)));
+    };
+    let nonblank: Vec<usize> = (header + 1..block_end)
+        .filter(|i| is_nonblank(at(*i)))
+        .collect();
+    let indent = nonblank
+        .iter()
+        .find(|i| is_indented_content(at(**i)))
+        .map(|i| at(*i).len() - at(*i).trim_start().len())
+        .unwrap_or(2);
+    let after = nonblank.last().map(|i| i + 1).unwrap_or(header + 1);
+    let insert_at = lines.get(after).map(|(s, _)| *s).unwrap_or(text.len());
+
+    let mut out = String::with_capacity(text.len() + 128);
+    out.push_str(&text[..insert_at]);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str(&render_entries(entries, indent));
+    out.push_str(&text[insert_at..]);
+    Ok(out)
+}
+
+/// 条目文本：`<indent><name>:` + body。body 的 2 空格是**相对**缩进，这里补上段缩进——
+/// 所以新条目的字段永远比条目头深一级（2 空格），无论用户的旧条目用的是 2 还是 4 空格
+/// 一级：YAML 只要求子节点比父节点深，不要求兄弟节点的子节点对齐。
+fn render_entries(entries: &[&Adoption], indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    let mut out = String::new();
+    for a in entries {
+        let _ = writeln!(out, "{pad}{}:", scalar(&a.name));
+        for line in a.body.lines() {
+            let _ = writeln!(out, "{pad}{line}");
+        }
+    }
+    out
+}
+
+/// 段不存在 → 在文件末尾新建，与已有内容之间隔一个空行（好读，也不影响解析）。
+fn append_section(text: &str, name: &str, rendered: &str) -> String {
+    let mut out = String::with_capacity(text.len() + rendered.len() + 24);
+    out.push_str(text);
+    if !out.is_empty() {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        if !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+    }
+    out.push_str(name);
+    out.push_str(":\n");
+    out.push_str(rendered);
     out
 }
 
@@ -447,8 +608,10 @@ mod tests {
     /// 把一条生成的条目插进一份最小清单并解出来——**生成的文本必须自己解得出**，
     /// 这是「渲染器写错了」唯一有效的证据（比逐字符断言 body 强得多）。
     fn parse_with(section: Section, name: &str, body: &str) -> Manifest {
+        // body 是**相对**缩进（2 空格 = 条目头下一级），拼进一份 2 空格缩进的清单。
+        let indented: String = body.lines().map(|l| format!("  {l}\n")).collect();
         let text = format!(
-            "version: 1\n{}:\n  {}:\n{body}",
+            "version: 1\n{}:\n  {}:\n{indented}",
             section.as_str(),
             scalar(name)
         );
@@ -643,88 +806,55 @@ mod tests {
         assert_eq!(entry.targets, Targets::Only(vec!["codex".into()]));
     }
 
-    /// plugin：`ref:` 只在 version 形时记（sha 形与 `unknown` 与版本不可比）；
-    /// 没有 marketplace 与「装了但禁用」都不收养。
+    /// plugin **一律不收养**：清单里的 plugin 条目是交付请求（§9.5），收养它要么恒
+    /// `undeliverable`（`targets` 只有源家 → 差集为空），要么把 bundle 拆到别的家。
+    /// 这条钉住「每一支 plugin 都走 skip」，并钉住理由里说清了为什么。
     #[test]
-    fn a_plugin_records_a_ref_only_when_the_version_is_comparable() {
+    fn marketplace_plugins_are_skipped_because_the_manifest_cannot_snapshot_them() {
         let manifest = Manifest::parse("version: 1\n").unwrap();
-        let plugin =
-            |entry: &str, marketplace: Option<&str>, version: Option<&str>, enabled| Spec::Plugin {
-                marketplace: marketplace.map(str::to_string),
-                entry: entry.into(),
-                version: version.map(str::to_string),
-                sha: None,
-                install_path: None,
-                enabled,
-            };
+        let plugin = |entry: &str, marketplace: Option<&str>, enabled| Spec::Plugin {
+            marketplace: marketplace.map(str::to_string),
+            entry: entry.into(),
+            version: Some("v6.3.0".into()),
+            sha: None,
+            install_path: None,
+            enabled,
+        };
         let states = vec![state(
             "claude-code",
             vec![
                 cap(
                     "superpowers",
                     "claude-code",
-                    plugin("superpowers", Some("official"), Some("v6.3.0"), true),
-                ),
-                cap(
-                    "sha-only",
-                    "claude-code",
-                    plugin("sha-only", Some("official"), Some("b36e0829c6d0"), true),
+                    plugin("superpowers", Some("official"), true),
                 ),
                 cap(
                     "no-marketplace",
                     "claude-code",
-                    plugin("no-marketplace", None, None, true),
+                    plugin("no-marketplace", None, true),
                 ),
                 cap(
                     "disabled",
                     "claude-code",
-                    plugin("disabled", Some("official"), None, false),
+                    plugin("disabled", Some("official"), false),
                 ),
             ],
         )];
 
         let report = adoptions(&manifest, &states);
-        assert_eq!(report.adoptions.len(), 2, "{:?}", report.adoptions);
-        // 按名字取，不按位置——BTreeMap 的顺序是名字升序（sha-only < superpowers）。
-        let by_name = |name: &str| {
-            report
-                .adoptions
-                .iter()
-                .find(|a| a.name == name)
-                .unwrap_or_else(|| panic!("no adoption named {name}"))
-        };
-        let superpowers = by_name("superpowers");
-        // `scalar` 对数字开头的串一律引起来（YAML 会把 `6.3.0` 这类读成非字符串的
-        // 隐式类型，多一对引号只是不好看）。往返断言在下面，那是真正的判据。
         assert!(
-            superpowers.body.contains("ref: \"6.3.0\""),
-            "{}",
-            superpowers.body
+            report.adoptions.is_empty(),
+            "plugin 一条都不许收养：{:?}",
+            report.adoptions
         );
-        let parsed = parse_with(superpowers.section, &superpowers.name, &superpowers.body);
-        assert_eq!(
-            parsed.plugins["superpowers"].git_ref.as_deref(),
-            Some("6.3.0")
-        );
-        assert_eq!(
-            parsed.plugins["superpowers"].marketplace.as_deref(),
-            Some("official")
-        );
-        let sha_only = by_name("sha-only");
-        assert!(
-            !sha_only.body.contains("ref:"),
-            "sha 形不可比，不该记 ref：{}",
-            sha_only.body
-        );
-
-        assert_eq!(report.skips.len(), 2);
-        assert!(
-            report
-                .skips
-                .iter()
-                .any(|s| s.reason.contains("marketplace"))
-        );
-        assert!(report.skips.iter().any(|s| s.reason.contains("禁用")));
+        assert_eq!(report.skips.len(), 3);
+        for skip in &report.skips {
+            assert!(
+                skip.reason.contains("交付请求"),
+                "理由要说清「清单里的 plugin 条目是交付请求」：{}",
+                skip.reason
+            );
+        }
     }
 
     /// 名字里的 `:`、`#`、空格、前导数字都会让裸标量解成别的东西（或解不开）。
@@ -754,6 +884,170 @@ mod tests {
                 parsed.skills.keys().collect::<Vec<_>>()
             );
         }
+    }
+
+    /// 原串是新串的**子序列**：只做拼接的插入器，这条是「一个已有字节都没动」的判据
+    /// （比逐行比对更强——它连行内字符的顺序漂移都能抓到）。
+    fn is_subsequence(needle: &str, haystack: &str) -> bool {
+        let mut it = haystack.chars();
+        needle.chars().all(|c| it.any(|h| h == c))
+    }
+
+    fn skill_adoption(name: &str) -> Adoption {
+        let manifest = Manifest::parse("version: 1\n").unwrap();
+        let states = vec![state("codex", vec![cap(name, "codex", agents_dir())])];
+        adoptions(&manifest, &states).adoptions.remove(0)
+    }
+
+    /// 追加进已存在的段：新条目落在那一段的末尾（下一个顶层键之前），原有字节一个不动。
+    #[test]
+    fn appending_into_an_existing_section_keeps_every_original_byte() {
+        let text = "# 我的清单\nversion: 1\n\nskills:\n  foo:\n    source: agents-dir\n    targets: [claude-code]\n\nmcps:\n  m:\n    command: npx\n";
+        let out = insert_entries(text, &[skill_adoption("bar")])
+            .unwrap()
+            .unwrap();
+
+        assert!(is_subsequence(text, &out), "原有字节被动过了：\n{out}");
+        let bar = out.find("  bar:").expect("新条目应在");
+        assert!(
+            out[..bar].ends_with("    targets: [claude-code]\n"),
+            "新条目该接在 skills 段最后一个条目之后：\n{out}"
+        );
+        assert!(bar < out.find("mcps:").unwrap(), "不该插进别的段：\n{out}");
+        // 解得出，且两边条目都在。
+        let parsed = Manifest::parse(&out).unwrap();
+        assert!(parsed.skills.contains_key("foo") && parsed.skills.contains_key("bar"));
+        assert!(parsed.mcps.contains_key("m"), "后面那段不许被吃掉：\n{out}");
+    }
+
+    /// 段不存在 → 在文件末尾新建；与前文之间恰一个空行。
+    #[test]
+    fn a_missing_section_is_created_at_the_end() {
+        let manifest =
+            Manifest::parse("version: 1\nskills:\n  foo:\n    source: agents-dir\n").unwrap();
+        let states = vec![state(
+            "codex",
+            vec![cap(
+                "m",
+                "codex",
+                Spec::Mcp {
+                    command: "npx".into(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                },
+            )],
+        )];
+        let report = adoptions(&manifest, &states);
+        let text = "version: 1\nskills:\n  foo:\n    source: agents-dir\n";
+        let out = insert_entries(text, &report.adoptions).unwrap().unwrap();
+
+        assert!(is_subsequence(text, &out), "原有字节被动过了：\n{out}");
+        assert!(
+            out.ends_with(
+                "    source: agents-dir\n\nmcps:\n  m:\n    command: npx\n    targets: [codex]\n"
+            ),
+            "尾行长这样：\n{out:?}"
+        );
+        let parsed = Manifest::parse(&out).unwrap();
+        assert!(parsed.skills.contains_key("foo") && parsed.mcps.contains_key("m"));
+    }
+
+    /// 不同段各自就位：skills 插段内、plugins 新建在末尾，一次调用同时发生。
+    #[test]
+    fn entries_land_in_their_own_sections() {
+        let manifest =
+            Manifest::parse("version: 1\nskills:\n  foo:\n    source: agents-dir\n").unwrap();
+        let states = vec![state(
+            "claude-code",
+            vec![
+                cap("bar", "claude-code", agents_dir()),
+                cap(
+                    "m",
+                    "claude-code",
+                    Spec::Mcp {
+                        command: "npx".into(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                    },
+                ),
+            ],
+        )];
+        let report = adoptions(&manifest, &states);
+        let out = insert_entries(
+            "version: 1\nskills:\n  foo:\n    source: agents-dir\n",
+            &report.adoptions,
+        )
+        .unwrap()
+        .unwrap();
+
+        let parsed = Manifest::parse(&out).unwrap();
+        assert!(parsed.skills.contains_key("foo") && parsed.skills.contains_key("bar"));
+        assert!(parsed.mcps.contains_key("m"), "新段该建在文件末尾：\n{out}");
+        assert!(is_subsequence(
+            "version: 1\nskills:\n  foo:\n    source: agents-dir\n",
+            &out
+        ));
+    }
+
+    /// 段头带内联值时**拒绝**，不试着去展开它——展开就要重写用户的排版。
+    #[test]
+    fn an_inline_section_header_is_refused_instead_of_corrupted() {
+        for text in [
+            "version: 1\nskills: {}\n",
+            "version: 1\nskills: [a]\n",
+            "version: 1\nskills: all\n",
+        ] {
+            let err = insert_entries(text, &[skill_adoption("bar")]).unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("内联值"), "{text:?} → {msg}");
+            assert!(msg.contains("skills"), "{text:?} → {msg}");
+        }
+    }
+
+    /// 用户的段用 4 空格缩进条目 → 新条目也 4 空格，且整份清单仍解得出
+    /// （YAML 的块缩进在同一层必须一致，插错缩进会让整份文件解不开）。
+    #[test]
+    fn entries_follow_the_existing_block_indentation() {
+        let text = "version: 1\nskills:\n    foo:\n        source: agents-dir\n";
+        let out = insert_entries(text, &[skill_adoption("bar")])
+            .unwrap()
+            .unwrap();
+        // 条目头跟着旧条目的 4 空格；字段比它深一级（6 空格）——YAML 只要求更深。
+        assert!(
+            out.contains("\n    bar:\n      source: agents-dir\n"),
+            "{out:?}"
+        );
+        let parsed = Manifest::parse(&out).unwrap();
+        assert!(parsed.skills.contains_key("foo") && parsed.skills.contains_key("bar"));
+    }
+
+    /// 段里只有注释时，插在注释之后、段头之下（注释是用户的，不许被顶开或压住）。
+    #[test]
+    fn an_empty_but_commented_section_takes_entries_below_its_comment() {
+        let text = "version: 1\nskills:\n  # 下面都是 skill\nmcps:\n  m:\n    command: npx\n";
+        let out = insert_entries(text, &[skill_adoption("bar")])
+            .unwrap()
+            .unwrap();
+        let bar = out.find("  bar:").unwrap();
+        assert!(bar > out.find("# 下面都是 skill").unwrap(), "{out}");
+        assert!(bar < out.find("mcps:").unwrap(), "{out}");
+        assert!(Manifest::parse(&out).unwrap().skills.contains_key("bar"));
+    }
+
+    /// 文件末尾没有换行也要能追加（不然会与最后一行粘在一起）。
+    #[test]
+    fn a_file_without_a_trailing_newline_still_gets_a_clean_append() {
+        let out = insert_entries("version: 1", &[skill_adoption("bar")])
+            .unwrap()
+            .unwrap();
+        assert!(out.contains("version: 1\n\nskills:\n  bar:\n"), "{out:?}");
+        assert!(Manifest::parse(&out).unwrap().skills.contains_key("bar"));
+    }
+
+    /// 空报告 = 一个字节都不写（返回 `None`，调用方因此不会碰盘）。
+    #[test]
+    fn an_empty_adoption_list_writes_nothing() {
+        assert_eq!(insert_entries("version: 1\n", &[]).unwrap(), None);
     }
 
     /// 一个 `scalar` 的字面契约（往返之外的第二条证据：什么时候它才裸写）。

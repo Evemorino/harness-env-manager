@@ -403,12 +403,28 @@ git commit -m "test(scan): pin idempotence, target scope and the read-only guard
 6. `read_harness_states` 收 `registry` 参数而不是自己 `adapters::registry(home)` 再建一份
    ——它是有序表，重建一份就有了两个「顺序」的来源。
 
+7. **plugin 一律不收养**（推翻 Task 1 Step 5 表里的 plugin 行，以及 Review Focus 6 的
+   「`ref:` 记快照」规则）。实测：把收养来的 `plugin/chrome-devtools-mcp` 写成
+   `targets: [claude-code]` + `source_harness: claude-code` 后跑真机 `diff`，得到的是
+   `! undeliverable … 差集为空（目标只有源 harness 自己）`——即 `scan` 会**给环境造问题**；
+   而 `targets: all` 会把这家 bundle 的内容拆到另外两家，是静默扩范围。清单里的 plugin 条目
+   是**交付请求**不是快照，要记版本得先给清单加「只记录、不交付」的 source 形态（本轮不做）。
+   真机 `scan --dry-run` 因此是 `18 to adopt, 75 skipped`，其中 30 条是该理由的 plugin。
+8. **`insert_entries(text, adoptions)` 只收两个参数**（计划里的 `sections` 是多余的：段在
+   `Adoption` 上）；`Adoption.body` 改成**相对缩进**（每级 2 空格），绝对缩进由插入器按**该段
+   已有内容**的缩进补上——用户用 4 空格缩进条目，新条目也是 4 空格。段里的**注释**算段内容，
+   新条目排在它下面；段头带内联值 → 报错拒绝写。
+9. **备份名是 `.henv.bak`**（`write_config` 既有约定，不是计划里写的 `.bak`）；写回顺序是
+   **先落盘后打印报告**——报告末行会说「已追加到 env.yaml」，那句话不能先于事实出现。
+10. **不提问确认**：只追加 + 有 `.bak` + 用户显式敲的命令（对比 `apply` 会覆盖既有内容）。
+
 ## 验收（C2 完成时）
 
 - `henv scan --dry-run` 在真机上打出可收养条目与不可收养的理由，**清单与 `.bak` 都不出现**。
 - `henv scan` 把新条目**追加**进清单：原有字节保持（`insert_entries` 的子序列断言 + 端到端逐字节断言），`.bak` 是原文。
 - **连跑两次，第二次 `0 to adopt`，清单逐字节不变**——幂等。
 - 收养来的条目 `targets` 只含发现它的家；下一次 `diff` 不冒出「另外两家要装它」。
-- 清单 schema 表达不了的 kind（command/agent/hook）、plugin cache 里的 skill、断链、无 marketplace 的 plugin：报告里逐条有理由，清单里零痕迹。
+- 清单 schema 表达不了的 kind（command/agent/hook）、随 plugin 分发的内容、断链、**以及全部 plugin**：
+  报告里逐条有理由，清单里零痕迹。
 - `tests/read_only_guard.rs` 两张表一个字符未改，8 条守卫全绿；`render()` 的 golden 一个字节未动；`diff`/`apply`/`doctor` 既有测试条数与断言不变。
 - 真机冒烟（`#[ignore]`）仍通过：`cargo test --test smoke_real_home -- --ignored --nocapture`。

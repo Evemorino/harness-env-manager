@@ -1,4 +1,4 @@
-//! henv CLI。`diff` 只读、`apply` 落盘、`doctor` 只读且带门禁语义；`scan` 由 Plan C2 加。
+//! henv CLI。`diff`/`doctor` 只读（`doctor` 还带门禁语义）、`apply` 与 `scan` 落盘。
 
 use clap::{Parser, Subcommand};
 use henv::{AssumeYes, Confirm, StdinConfirm};
@@ -23,7 +23,10 @@ use std::path::PathBuf;
 `apply --harness <name>` 把一次运行限定在一家（值域：claude-code / codex / kimi-code）。\n\
 `skills list` 同样只读：它只把仓库取到 henv 自己的缓存目录下看完即删。\n\
 `doctor` 同样只读：它把「必须处理」的问题（同名冲突、交付不了、配置读不出来、${VAR} 缺值）报出来，\n\
-并按门禁语义退出——0 = 没有问题、1 = 有问题、2 = henv 自己没跑成（清单读不了/解不开）。\n\n\
+并按门禁语义退出——0 = 没有问题、1 = 有问题、2 = henv 自己没跑成（清单读不了/解不开）。\n\
+`scan` 会写，但是只追加：它把本机已有、清单还没描述的能力接在对应段（skills/mcps/plugins）的末尾，\n\
+已有字节一个不动；落盘前先自己解一遍（解不开就拒绝写），并落一份 `env.yaml.henv.bak`。\n\
+`scan --dry-run` 只打印。它不做门禁——退出码只有 0（跑成了）与 2（工具没跑成）。\n\n\
 degrade: 政策决定「目标 harness 吃不下、但内容已经拆出来了」的能力是进报告还是静默丢弃（§9.5）。"
 )]
 struct Cli {
@@ -65,6 +68,15 @@ enum Command {
         /// 清单路径
         #[arg(short, long, default_value = "env.yaml")]
         manifest: PathBuf,
+    },
+    /// 收养：把本机已有、清单还没描述的能力追加进清单（会写 env.yaml）
+    Scan {
+        /// 清单路径
+        #[arg(short, long, default_value = "env.yaml")]
+        manifest: PathBuf,
+        /// 只打印将要追加的条目，不写清单
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -169,6 +181,16 @@ fn main() -> anyhow::Result<()> {
             drop(lock);
             if !report.healthy() {
                 std::process::exit(1);
+            }
+        }
+        Command::Scan { manifest, dry_run } => {
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            // `scan` 不是门禁，没有 `1`：只有「跑成了」（0）与「工具没跑成」（2）。
+            if let Err(err) = henv::scan::run_scan(&manifest, &home, dry_run, &mut lock) {
+                drop(lock);
+                eprintln!("Error: {err:?}");
+                std::process::exit(2);
             }
         }
     }
