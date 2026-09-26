@@ -21,6 +21,8 @@ fn doctor(home: &TempHome, manifest: &str) -> (i32, String, String) {
         .arg(home.path("env.yaml"))
         .env("HENV_HOME", home.home.root())
         .env("HOME", home.home.root())
+        // `${VAR}` 检查的夹具变量：显式清掉，结果不受跑测试的这台机器影响。
+        .env_remove("HENV_TEST_MISSING_VAR_9F3A")
         .output()
         .expect("run henv doctor");
     (
@@ -58,6 +60,28 @@ fn a_name_conflict_exits_one() {
     assert!(out.contains("(plan)"), "{out}");
     assert!(out.contains("conflict"), "{out}");
     assert!(out.contains("1 problems"), "{out}");
+}
+
+/// 清单引用了当前环境里没有的 `${VAR}` → 问题（exit 1）：`apply` 会把未展开的引用
+/// 原样写进 harness 配置，所以这不能只是警告。报告只出现变量名，**绝不回显值**。
+#[test]
+fn a_missing_env_reference_exits_one() {
+    let home = TempHome::new();
+    let manifest = "version: 1\nmcps:\n  context7:\n    command: npx\n    env:\n      K: ${HENV_TEST_MISSING_VAR_9F3A}\n";
+    let (code, out, err) = doctor(&home, manifest);
+    assert_eq!(code, 1, "stdout={out} stderr={err}");
+    assert!(out.contains("(env)"), "{out}");
+    assert!(out.contains("mcp `context7`"), "{out}");
+    assert!(out.contains("HENV_TEST_MISSING_VAR_9F3A"), "{out}");
+    assert!(
+        !out.contains("HENV_TEST_MISSING_VAR_9F3A="),
+        "只出现名字，不出现「名字=值」：{out}"
+    );
+    // `(env)` 段在 `(plan)` 段之前：环境不可信时，计划判定也没意义。
+    let env_at = out.find("(env)").expect("(env) section");
+    if let Some(plan_at) = out.find("(plan)") {
+        assert!(env_at < plan_at, "{out}");
+    }
 }
 
 /// 清单解不开 = henv 没跑成 → 2（**不是** 1：脚本要能把「环境有问题」与

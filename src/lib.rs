@@ -80,6 +80,9 @@ pub(crate) struct Planned {
     /// 清单 lower 后的能力表。MCP 的交付要拿它的三段载荷——`plan` 里只有 id 与动作。
     /// `diff` 不看它（它只读），但两个入口共用 `plan_for`，所以它跟着一起返回。
     desired: Vec<capability::Capability>,
+    /// 解析后的清单本体。`doctor` 要在规划之外看一眼 `${VAR}` 引用（§10.1 的 `(env)` 段），
+    /// 但**不许**再读一次盘：这一份就是本次规划用的那一份，两次读之间清单可能被改。
+    pub manifest: Manifest,
     content: store::skills::ContentIndex,
     ledger: store::provenance::Ledger,
 }
@@ -203,6 +206,7 @@ pub(crate) fn plan_for(
     Ok(Planned {
         plan,
         desired,
+        manifest,
         content,
         ledger,
     })

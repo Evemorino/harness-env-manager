@@ -17,6 +17,7 @@ use crate::diff::{Action, Plan};
 use crate::home::Home;
 use crate::manifest::{KNOWN_HARNESSES, Manifest};
 use crate::render::{NAME_WIDTH, action_cell};
+use crate::secrets;
 use crate::store::skills::SourceMode;
 use std::fmt::Write as _;
 use std::io::Write;
@@ -170,6 +171,36 @@ fn plan_checks(plan: &Plan) -> Vec<Check> {
 /// （计划类的行带 `@harness`，环境类的行写 `mcp \`x\``）。
 fn detail_line(prefix: &str, subject: &str, detail: &str) -> String {
     format!("{}{subject} ({detail})", action_cell(prefix))
+}
+
+/// 清单里的 `${VAR}` 引用在当前环境里有没有值 → 问题（§10.1 的 `(env)` 段）。
+///
+/// **只出现变量名与引用它的 key，绝不回显值**：判据用 `secrets::missing`（空串也算
+/// 没有），消息里拼的只有名字。`apply` 会把未展开的引用原样写进 harness 配置，
+/// 所以缺值是「现在就挡路」而不是警告。
+///
+/// `lookup` 由调用方注入（生产传 `std::env::var_os`，测试传假表）——这样这条判据
+/// 的可测性不依赖进程环境，测试也不必去改真实环境变量。
+pub fn env_checks(manifest: &Manifest, lookup: &dyn Fn(&str) -> Option<String>) -> Vec<Check> {
+    let mut checks = Vec::new();
+    for (key, mcp) in &manifest.mcps {
+        for var in mcp.env.values().filter_map(|v| secrets::parse_ref(v)) {
+            // `missing` 是「有没有值」这条判据的唯一定义，这里只借用它，不另写一份；
+            // 单元素入参让「这条引用归哪个 key」不会错位。
+            if secrets::missing(&[var.to_string()], lookup).is_empty() {
+                continue;
+            }
+            checks.push(Check {
+                kind: CheckKind::Env,
+                text: detail_line(
+                    "! env",
+                    &format!("mcp `{key}`"),
+                    &format!("${{{var}}} 在当前环境里没有值"),
+                ),
+            });
+        }
+    }
+    checks
 }
 
 /// 清单里启用了、本机却没装的家 → 一条警告（**不是**问题：先写清单后装 harness
@@ -342,6 +373,10 @@ pub fn run_doctor(
                 })
                 .collect();
             let mut checks = absent_harness_warnings(&harnesses);
+            // 环境段的判据是清单 + 进程环境，与规划无关；但清单只读这一次。
+            checks.extend(env_checks(&planned.manifest, &|v| {
+                std::env::var_os(v).map(|s| s.to_string_lossy().into_owned())
+            }));
             checks.extend(plan_checks(&planned.plan));
             DoctorReport { harnesses, checks }
         }
@@ -494,6 +529,39 @@ mod tests {
             .warnings(),
             1
         );
+    }
+
+    /// 引用了当前环境里没有的变量 → 问题，且消息里只有变量名与 key 名（绝不回显值）。
+    #[test]
+    fn a_missing_reference_is_a_problem_and_never_echoes_a_value() {
+        let m = Manifest::parse(
+            "version: 1\nmcps:\n  context7:\n    command: npx\n    env:\n      CONTEXT7_API_KEY: ${CONTEXT7_API_KEY}\n",
+        )
+        .unwrap();
+
+        let checks = env_checks(&m, &|_| None);
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].kind, CheckKind::Env);
+        assert!(
+            checks[0].text.contains("CONTEXT7_API_KEY"),
+            "{}",
+            checks[0].text
+        );
+        assert!(checks[0].text.contains("context7"), "{}", checks[0].text);
+        assert_eq!(
+            DoctorReport {
+                harnesses: Vec::new(),
+                checks
+            }
+            .problems(),
+            1
+        );
+
+        // 有值（非空）就什么都不报：`missing` 把空串也算没有。
+        let ok = env_checks(&m, &|k| (k == "CONTEXT7_API_KEY").then(|| "x".into()));
+        assert!(ok.is_empty());
+        let empty = env_checks(&m, &|_| Some(String::new()));
+        assert_eq!(empty.len(), 1);
     }
 
     /// 空报告是**空操作**：没有段、没有空行，只有页脚。
