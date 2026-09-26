@@ -297,6 +297,11 @@ plugins:
     degrade:
       hooks: report             # 拆出后装不下的能力：report（进报告）| skip（静默丢弃）
       commands: report
+
+  chrome-devtools-mcp:          # 记录型（§10.3）：只记「本机装着它」，**不请求交付**
+    source: snapshot
+    versions:                   # 逐家版本——§2.2 第 6 条：同一个 plugin 可以一家一个版本
+      claude-code: 0.1.2
 ```
 
 Schema 决策：
@@ -310,6 +315,10 @@ Schema 决策：
    `#[serde(default)]` 的，代码区分不出「没写」与「写了空的」，而 `source_harness` 是
    `Option`，它的 `Some`/`None` 天然就是二分。语义唯一之后反过来也成立——**没写
    `source_harness:` 的 plugin 条目一律不拆解**（§9.5），它只做版本对账，且不再假装能装。
+6. **`source: snapshot` 不是第四种来源，是另一种条目语义**（§10.3）：这条条目说的是
+   「本机装着它」，不是「请把它交付到哪几家」。它 `targets` 记**哪几家有这个记录**、
+   `versions` 记逐家版本（键必须 ⊆ `targets`）；`marketplace`/`repo`/`ref`/`source_harness`
+   一律不许写——那四格都在描述「从哪儿拿内容」，而记录型条目从不拿内容。
 
 ## 5. 数据流与错误处理
 
@@ -332,9 +341,11 @@ apply = diff → 确认 → 执行
   每家先拷贝 skill 内容进自己的 skills 目录，最后写自己的 MCP/plugin 配置（§9.2）
 
 scan（收养，反向管道）
-  各 adapter.read_state() → 归一化 → 与 env.yaml 比对
-  新发现的能力 → 生成条目追加进 env.yaml（Origin::Adopted）
-  只追加不修改已有条目；--dry-run 只打印
+  各 adapter.read_state() → 归一化 → 与 env.yaml 比对（同一个 read_harness_states）
+  「本机有、清单没有」的能力 → 生成条目**追加**进 env.yaml；status 侧来源是 Origin::Adopted
+  条目 targets 只记发现它的那几家；plugin 收养成 source: snapshot 的记录型条目（§10.3）
+  只追加、绝不修改已有条目（已在清单 = 静默跳过）；写回是文本级插入，注释与键序原样保留
+  退出码只有 0/2（不是门禁，没有 1）；--dry-run 只打印
 
 doctor（体检）
   diff 的 undeliverable + 环境校验：
@@ -631,7 +642,9 @@ manifest 对账为主，**仅当目标 harness 缺对应 manifest 时才降级�
   里可见；丢了它，`diff` 会报 `0 undeliverable`，用户以为一切正常。
 - **没写 `source_harness:` 的条目**走今天的对账路，但**不再假装能装**：`install` / `update`
   改判 `undeliverable`（理由写明原生 plugin 安装不在本轮范围，§9.1，并指路「写 `source_harness:`
-  可拆解交付其 skills」），`in-sync` / `unknown` 保留——它们不承诺写盘。修的是「diff 说 install、
+  可拆解交付其 skills」），`in-sync` / `unknown` 保留——它们不承诺写盘。
+  > **`source: snapshot` 的记录型条目不走这一支**（§10.3）：它在更早的地方就被分流成
+  > 「只对账、不交付」，连 `undeliverable` 都不产——那两难是**交付请求**才有的。修的是「diff 说 install、
   `apply` 一个字节没写、两边都不报错」这个假成功——交付层对「没有内容的非 Skill 条目」是安静
   跳过的，而没有内容正是 plugin 条目今天的常态。
 
@@ -925,7 +938,8 @@ harness 配置）。
 
 **警告（不 fail）**：`drift`（盘上有、清单没有）、`unknown`（版本判不了）、`stale`（**已经交付过**
 的副本与源不同）、行上的注记（源未被上游确认 / 副本被手改过）、断链（§2.1 的 `NoContent`）、
-清单里启用了但本机没装的家。
+清单里启用了但本机没装的家、**记录型 plugin 的版本与记录不符或本机没装**（§10.3：记录是提醒，
+不是承诺——本机没装一个记过的 plugin 可以是正常状态，把它算问题会让 doctor 在新机器上恒红）。
 
 **doctor 不回答「同步了没有」。** `install` 行（清单里有、本机还没装）**不是** finding——那是 apply
 的活；把它当问题会让 doctor 在每台新机器上恒红。这是两个命令的分工：`diff` 是普查，`doctor` 是门禁。
@@ -968,15 +982,16 @@ harness 配置）。
 | `skill`，来源不可判定（断链 / 指向库外） | **不收养** | 没有可记的源 |
 | `skill`，来源是 git | **不收养** | 现状侧读不到 `repo`/`ref`，写了也是空壳 |
 | `mcp` | `mcps: {command, args, env}` | `env` 值原样保留 `${VAR}` 引用，**不展开**（§3 决策 3） |
-| `plugin` | **不收养** | 见下 |
+| `plugin` | `plugins: {source: snapshot, versions: {...}}` | 记录型条目，只记不交付（§10.3） |
 | `command` / `agent` / `hook` | **不收养** | §4 的清单只有三段，表达不了 |
 
-**plugin 不收养**：清单里的 plugin 条目含义是**交付请求**（§9.5：`source_harness:` 请求拆解、
-`targets` 决定送到哪几家），不是「本机装着它」的快照。收养只可能记「它装在这一家」，于是两种
-写法都错——`targets` 只有源家 ⇒ 交付目标 = `targets` − 源家 = 空 ⇒ 恒 `undeliverable`（实测
-`plugin/chrome-devtools-mcp` 在真机上就是这一行）；`targets: all` ⇒ 把这家 bundle 的内容拆到另外
-两家 ⇒ 静默扩范围。要记「装过什么版本」，清单得先长出「只记录、不交付」的 source 形态——**本轮
-不做**（§9.1 的「不做」里就有 plugin 原生安装）。所以 `scan` 只把它连同理由报出来。
+**plugin 收养成记录型条目**（§10.3）。C2 落地时这里写的是「**不收养**」，理由是当时清单里
+只有一种 plugin 条目语义：**交付请求**（§9.5：`source_harness:` 请求拆解、`targets` 决定送到
+哪几家）。收养只可能记「它装在这一家」，于是两种写法都错——`targets` 只有源家 ⇒ 交付目标 =
+`targets` − 源家 = 空 ⇒ 恒 `undeliverable`（实测 `plugin/chrome-devtools-mcp` 在真机上就是这一行）；
+`targets: all` ⇒ 把这家 bundle 的内容拆到另外两家 ⇒ 静默扩范围。**Plan D 补上了那条缺的形态**：
+`source: snapshot` 只记录、不交付，于是这两难整类消失——收养来的条目既不会要求交付，也不写
+`targets: all`。
 
 **收养不扩范围。** 条目 `targets:` 记**发现它的那几家**（按 `KNOWN_HARNESSES` 顺序去重），不写
 `all`：收养的语义是「把现状记下来」，不是「顺手让它铺到另外两家」。真想让某个 skill 也去
@@ -1000,3 +1015,61 @@ codex，那是用户改 `targets` 的决定，不是 `scan` 的。
 drift」不是错误，那是 `diff`/`doctor` 的事。`--dry-run` 只打印：不写清单、不落 `.henv.bak`。
 不提问确认：这个动作只追加、有 `.bak`、且是用户显式敲的命令（对比 `apply` 会覆盖既有内容，
 所以它要一次 y/N）。
+
+### 10.3 记录型 plugin（`source: snapshot`）
+
+清单里的 plugin 条目有两种语义，**由 `source:` 二分**：
+
+| 条目 | 说的是 | `diff` 对它的行为 |
+|---|---|---|
+| `source: claude-marketplace` / `github` / `zip-url` | 「请把它交到 `targets` 那几家」（写了 `source_harness:` 就是拆解请求，§9.5） | 交付/拆解；交付不了就是 `undeliverable`（问题） |
+| `source: snapshot` | 「**本机装着它**，版本记在这里」 | 只对账：永不产 `install`/`update`，不符或没装产一条 `~ snapshot`（**警告**） |
+
+```yaml
+plugins:
+  superpowers:                  # 身份 = key（或显式 `entry:`）
+    source: snapshot
+    targets: [claude-code, kimi-code]   # 记录覆盖哪几家（缺省 = all）
+    versions:                            # 逐家版本；没写 = 只记身份、不对账版本
+      claude-code: 6.4.1
+      kimi-code: v6.3.0
+```
+
+**为什么版本是逐家的。** §2.2 第 6 条实测：`superpowers` 在 claude 是 6.4.1、在 kimi 是 6.3.0，
+同一个上游、两个钉死的版本。一个单值 `version:` 必然有一家永远对不上，而且用户**改不掉**——
+只能二选一。`versions:` 是映射，一家一格。
+
+**对账判据。** 复用 `normalize_version`（§2.1 第 3 条：只有两边都是「version 形」才可比）：
+
+| 清单记的 | 本机 | 结果 |
+|---|---|---|
+| version 形，与本机归一化后相等 | 装着 | 安静（这是绝大多数时候） |
+| version 形，不等 | 装着 | `~ snapshot`（清单记 A，本机 B） |
+| version 形 | 没装 | `~ snapshot`（清单记 A，本机没装） |
+| version 形 | 装着，但版本读不出（codex 恒如此） | 安静 |
+| 不是 version 形（sha 形目录名、分支名、`unknown`） | 任意 | 安静 |
+
+后两行是**故意安静**的：报出去就是一条**永远修不掉**的 warning，而「判不了不报假 drift」是
+§2.1 第 3 条的原话。`targets` 不含的家照旧报 `drift`——「清单说只记在 claude」而 kimi 也装着一份，
+那是「它铺到别的家去了」，是该看见的事，不是记录型条目要吞掉的噪音。
+
+**载荷走旁路表（`SnapshotTable`），`Spec::Plugin` 一个字段都不加。** 与 `DegradeTable` /
+`SourceHarnessTable` 同一个先例：`Spec` 回答「装的是什么」，「这条只记录」是**条目语义**。
+表里**有这个名字** = 这条条目是记录型（哪怕 `versions` 是空的）——空表与不在表里是两件事：
+前者「记了身份、没记版本」，后者「不是记录型」。
+
+**它不是可执行动作。** `Action::Snapshot` 不是待办：`apply` 的 filter 只认
+`install`/`update`/`remove`，这个变体天然在它外面，一个字节都不写；`is_clean()` 也不数它。
+`doctor` 把它算**警告**（§10.1 同款理由：本机没装一个记过的 plugin 可以是正常状态）。
+`diff` 的汇总行只在非零时才追加 `, N snapshot`——零是绝大多数清单的样子，而那一行是既有
+golden 的一部分。
+
+**`scan` 收养时的规则。** 身份用 `plugin_identity`（`entry` 缺省 = key，`declared_ids` 也按它判，
+否则 `{key: alias, entry: superpowers}` 会与扫到的 `superpowers` 重复收养）；`targets` 只记
+**发现它的那几家**；`versions` **只记 version 形的观测值**——sha 形的目录名（`db467cc56673`）
+记进去就是一条 diff 说「不可比」的死值，比不记更坏，所以那一家只进 `targets`，报告行里说明
+「未记」。
+
+**已知边界（接受了的取舍）**：`enabled: false` 的 plugin 照样被收养、也照样按版本对账——
+记录的是「盘上有什么」，不记「开着还是关着」；而交付型条目对禁用是报 `undeliverable` 的。
+两条路故意不同：禁用让一条**交付请求**无法满足，却不让一条**记录**失真。
