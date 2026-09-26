@@ -680,6 +680,14 @@ manifest 对账为主，**仅当目标 harness 缺对应 manifest 时才降级�
   MCP）**只探存在性、不解析内容**，按该 plugin 条目的 `degrade.<kind>` 逐 kind 决定 `report`
   （进报告）还是 `skip`（静默丢弃）。**不为它们新建能力身份**——它们进的是该条目的报告说明，
   不是 diff 行。
+  > **报告落点是 `(notes)` 段（2026-09-26 收尾轮）**：说明是**每条 plugin 一句**，而拆出来的
+  > skill 行是**每个 skill 一行**（真机上 14 条）。挂在行尾就是同一句话印 14 遍；挂在其中
+  > 一行上，则那一行不在时（未安装的家整节被跳过、`--harness` 视图滤掉、这条本来就没有行）
+  > 说明静默消失——而「报告里说一句」正是 `report` 与 `skip` 唯一的区别。因此 `Plan` 多一张
+  > `notes` 表（plugin 身份 → 一句人话），`render` 在 `(global)` 段之后、`Plan:` 汇总行之前
+  > 渲染成 `(notes)` 段，每条 plugin 一行（行内带条目名，段里没有「这是哪一行」的上下文）。
+  > 注记**不是能力、不是动作**：不进 `counts()`、不影响 `is_clean()`、`apply` 不为它写字节；
+  > 表为空时输出逐字节不变。
 - **拆解目标是 kimi 时**：skill 仍 undeliverable（§9.1）——kimi 没有用户级 skills 目录。
   注意这与「来源是 kimi」是两件事：`source_harness: kimi-code` 而目标是 claude 是
   **本设计最想要的用法**（把 kimi 独有的 plugin 携带的 skill 给 claude 用）。

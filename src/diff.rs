@@ -117,6 +117,18 @@ pub struct Plan {
     /// 静默丢掉（`diff` 报 `0 undeliverable`，用户以为一切正常，而清单里明明有一条
     /// 根本无法满足的要求）。全局段把它接住，`render` 渲染成一个 `(global)` 段。
     pub unattached: Vec<PlanEntry>,
+    /// §9.5「装不下的部分」的报告说明：plugin 身份 → 一句人话。
+    ///
+    /// **不是能力、不是动作**：不进 `counts()`、不影响 `is_clean()`，`apply` 不为它写
+    /// 任何字节。`render` 把它渲染成报告末尾的 `(notes)` 段（排在所有 harness 节与
+    /// `(global)` 段之后、`Plan:` 汇总行之前），每条 plugin **一行**。
+    ///
+    /// 为什么要有这一层，而不是像过去那样挂在拆出来的 skill 行尾：这句话是**每条
+    /// plugin 一句**，而 skill 行是**每个 skill 一行**（真机上 14 条），挂行尾就是
+    /// 同一句说 14 遍；挂在其中一行上，则那一行一旦不在（未安装的家整节跳过、
+    /// `--harness` 视图、这条本来就没有行）说明就静默消失——而「报告里说一句」正是
+    /// `degrade.<kind> = report` 与 `skip` 唯一的区别。
+    pub notes: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -385,19 +397,18 @@ fn detached_plugin_rows(
                 "plugin `{}`：交付目标 = targets − `{source}`，差集为空（目标只有源 harness 自己）（§9.5）",
                 cap.id.name
             ),
-            // 拆不出 skill 就没有 skill 行能承载「还有 hook 未拆解」那句
-            // `degrade.<kind> = report` 注记，只能挂在这条 undeliverable 上——
-            // 否则 `report` 事实上退化成 `skip`（§9.5）。
-            None if decomposed_skill_count(desired, &cap.id.name) == 0 => {
-                let base = format!(
-                    "plugin `{}`：bundle `{source}` 里拆不出任何 skill（§9.5）",
-                    cap.id.name
-                );
-                match content.notes.get(&cap.id.name) {
-                    Some(note) => format!("{base}；{note}"),
-                    None => base,
-                }
-            }
+            // 拆不出 skill → 这条 plugin 拿不到任何 skill 行，但那句
+            // `degrade.<kind> = report` 的说明**不在这里印**：它统一进 `Plan.notes`
+            // （`(notes)` 段），与拆得出 skill 的情形同一个落点。这一行只回答
+            // 「它为什么交付不了」，不再兼任注记的载体。
+            //
+            // 注记本身不会因此丢掉：`content.notes` 整张表都进 `Plan.notes`，
+            // 与这里的分支无关（终审 Minor#2 那条「`report` 不许退化成 `skip`」的
+            // 性质由 `(notes)` 段守，比挂在某一行上更强）。
+            None if decomposed_skill_count(desired, &cap.id.name) == 0 => format!(
+                "plugin `{}`：bundle `{source}` 里拆不出任何 skill（§9.5）",
+                cap.id.name
+            ),
             None => continue,
         };
         let slot = inputs
@@ -643,19 +654,10 @@ pub fn compute(
                         }
                         _ => verdict_note,
                     };
-                    // §9.5：bundle 里装不下的部分（hooks/commands/…）进的是
-                    // **这条目的报告说明**，不是 diff 行。拆解出的 skill 正是这条目的产物，
-                    // 所以注记跟着它们走；两份注记同时在时都要留着（源过期 / 还有没拆的东西
-                    // 是两件事）。
-                    let note = match &cap.origin {
-                        Origin::Plugin { name } => match (note, content.notes.get(name)) {
-                            (Some(a), Some(b)) => Some(format!("{b}；{a}")),
-                            (Some(a), None) => Some(a),
-                            (None, Some(b)) => Some(b.clone()),
-                            (None, None) => None,
-                        },
-                        _ => note,
-                    };
+                    // §9.5：bundle 里装不下的部分（hooks/commands/…）那句说明**不挂在
+                    // 行尾**——它进 `Plan.notes`，由 `(notes)` 段每条 plugin 印一次
+                    // （行尾版本会随拆出来的 skill 数重复；两种说明同时在时也各归各位：
+                    // 「源过期 / 副本被手改」是这一行的判定说明，留在行尾）。
                     entries.push(PlanEntry::new(cap.id.clone(), action).with_note(note));
                 }
             }
@@ -724,6 +726,9 @@ pub fn compute(
     Plan {
         harnesses,
         unattached,
+        // §9.5：整张注记表原样进报告，与上面任何一条判定无关——它的落点是
+        // `(notes)` 段，不是某一行。
+        notes: content.notes.clone(),
     }
 }
 
@@ -1101,8 +1106,12 @@ mod tests {
     /// §9.5：一个只有 `hooks/`、拆不出任何 skill 的 bundle，`degrade.<kind> = report`
     /// 的那句「还有 hook 未拆解」不能因为没有 skill 行就丢掉——
     /// 丢了的话 `report` 事实上退化成 `skip`（终审 Minor#2）。
+    ///
+    /// 它现在落在 `(notes)` 段，而**不是**那条 `undeliverable` 的 reason 里：
+    /// 那一行回答「为什么这条交付不了」，注记回答「还有什么没拆」。两件事各说各的，
+    /// 合在一句里读起来像是同一句说了两遍，也让注记的去向跟着行的去留起落。
     #[test]
-    fn a_bundle_with_no_skills_still_carries_the_leftover_note() {
+    fn a_bundle_with_no_skills_still_reports_the_leftover_note() {
         let (plugin, sources) = plugin_with_source("p");
         let (states, adapters) = harness_states(vec![fake("claude-code"), fake("codex")]);
         let inputs = harness_inputs(&states, &adapters);
@@ -1121,6 +1130,9 @@ mod tests {
             &Ledger::default(),
             &sources,
         );
+        let note = plan.notes.get("p").expect("拆不出 skill 也得留话");
+        assert!(note.contains("hook"), "{note}");
+
         let row = plan
             .harnesses
             .iter()
@@ -1130,7 +1142,11 @@ mod tests {
         let Action::Undeliverable { reason } = &row.action else {
             unreachable!()
         };
-        assert!(reason.contains("hook"), "注记要跟着走：{reason}");
+        assert!(reason.contains("拆不出任何 skill"), "{reason}");
+        assert!(
+            !reason.contains("hook"),
+            "注记不该在 reason 里再说一遍：{reason}"
+        );
     }
 
     /// §9.5「开关与目标」后半：**没写** `source_harness:` 的条目，
@@ -1238,10 +1254,14 @@ mod tests {
     }
 
     /// §9.5「交付什么」：bundle 里装不下的部分（hooks/commands/...）进的是
-    /// **该条目的报告说明**，跟着拆解出的 skill 行走，不是 diff 行、
+    /// **该条目的报告说明**（`Plan.notes` / `(notes)` 段），不是 diff 行、
     /// 也不为它们新建能力身份。
+    ///
+    /// 而且**只落一次**：它是「每条 plugin 一句」，不是「每个 skill 一句」。
+    /// 挂在拆出来的 skill 行尾会让同一句话随 skill 数量重复（真机上 14 条），
+    /// 那正是这层载体存在要消灭的东西。
     #[test]
-    fn the_leftover_note_rides_every_decomposed_skill_row() {
+    fn the_leftover_note_lands_in_the_plan_notes_once() {
         let (plugin, sources) = plugin_with_source("p");
         let (states, adapters) = harness_states(vec![fake("claude-code"), fake("codex")]);
         let inputs = harness_inputs(&states, &adapters);
@@ -1268,14 +1288,12 @@ mod tests {
             &Ledger::default(),
             &sources,
         );
-        let row = plan
-            .harnesses
-            .iter()
-            .flat_map(|h| &h.entries)
-            .find(|e| e.id.kind == Kind::Skill)
-            .expect("拆出来的 skill 有一行");
-        let note = row.note.as_deref().expect("注记要跟着走");
+        let note = plan.notes.get("p").expect("装不下的部分要留话");
         assert!(note.contains("hook"), "{note}");
+        // 关键回归：这一行不许再挂一遍——不然 14 条 skill 就是同一句话印 14 遍。
+        for row in plan.harnesses.iter().flat_map(|h| &h.entries) {
+            assert_eq!(row.note, None, "{} 不该带注记", row.id.label());
+        }
     }
 
     /// 既有测试的默认入参：内容层缺席 = Plan A 行为。
@@ -2459,6 +2477,7 @@ mod tests {
                 actual_by_kind: BTreeMap::new(),
             }],
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
         };
         assert_eq!(plan.counts().remove, 1);
         assert!(!plan.is_clean());
@@ -2496,6 +2515,7 @@ mod tests {
                 actual_by_kind: BTreeMap::new(),
             }],
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
         };
         let mut ledger = Ledger::default();
         ledger.record(ledger_entry("claude-code", Kind::Skill, "owned"));
@@ -2538,6 +2558,7 @@ mod tests {
                 actual_by_kind: BTreeMap::new(),
             }],
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
         };
         let mut ledger = Ledger::default();
         ledger.record(ledger_entry("claude-code", Kind::Skill, "owned"));
@@ -2562,6 +2583,7 @@ mod tests {
                 actual_by_kind: BTreeMap::new(),
             }],
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
         };
         let mut ledger = Ledger::default();
         ledger.record(ledger_entry("codex", Kind::Skill, "foo"));
@@ -2584,6 +2606,7 @@ mod tests {
                 actual_by_kind: BTreeMap::new(),
             }],
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
         };
         assert_eq!(
             prune_plan(&plan, &Ledger::default()).harnesses[0].entries[0].action,
@@ -2606,6 +2629,7 @@ mod tests {
                 actual_by_kind: BTreeMap::new(),
             }],
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
         };
         let mut ledger = Ledger::default();
         ledger.record(ledger_entry("claude-code", Kind::Skill, "a"));

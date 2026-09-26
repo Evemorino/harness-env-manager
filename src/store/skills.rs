@@ -83,9 +83,11 @@ pub struct ContentIndex {
     /// plugin 身份 → 报告注记（§9.5「装不下的部分」：bundle 里的 hooks/commands/
     /// agents/MCP 只探了存在性，没拆）。
     ///
-    /// 它**不参与任何判决**，只跟着那条目拆出来的 skill 行出现在报告里——
-    /// 「它们进的是该条目的报告说明，不是 diff 行」。与 `sources`/`unresolved`/
-    /// `targets` 一样，空表时行为与 Plan A 逐字节相同。
+    /// 它**不参与任何判决**：整张表原样进 [`crate::diff::Plan::notes`]，由 `render`
+    /// 渲染成报告末尾的 `(notes)` 段，每条 plugin 一行。「它们进的是该条目的报告
+    /// 说明，不是 diff 行」；而说明是**每条 plugin 一句**，所以也不挂在拆出来的
+    /// 每个 skill 行尾（那是同一句话说 N 遍，且那一行不在时说明就没了）。
+    /// 与 `sources`/`unresolved`/`targets` 一样，空表时行为与 Plan A 逐字节相同。
     pub notes: BTreeMap<String, String>,
 }
 

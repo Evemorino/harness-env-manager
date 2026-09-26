@@ -2,6 +2,7 @@
 
 use crate::capability::Kind;
 use crate::diff::{Action, HarnessPlan, Plan, PlanEntry};
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 /// harness 名列宽。spec §5 示例里内容一律从第 15 列起 → `{:<13}` 再补一个空格。
@@ -10,6 +11,9 @@ const NAME_WIDTH: usize = 13;
 const ACTION_WIDTH: usize = 11;
 /// §9.5 全局段的段名。宽度与 harness 名一致，好让动作列对齐。
 const GLOBAL_SECTION: &str = "(global)";
+/// §9.5「装不下的部分」的段名。与 `(global)` 同理：它不是 harness，
+/// 是报告末尾的一段说明，宽度对齐好让正文列齐平。
+const NOTES_SECTION: &str = "(notes)";
 
 pub fn render(plan: &Plan) -> String {
     let mut out = String::new();
@@ -21,7 +25,11 @@ pub fn render(plan: &Plan) -> String {
     if !plan.unattached.is_empty() {
         render_unattached(&plan.unattached, &mut out);
     }
-    if !plan.harnesses.is_empty() || !plan.unattached.is_empty() {
+    // §9.5 的 `(notes)` 段：bundle 里装不下的部分，每条 plugin 印一次。
+    if !plan.notes.is_empty() {
+        render_notes(&plan.notes, &mut out);
+    }
+    if !plan.harnesses.is_empty() || !plan.unattached.is_empty() || !plan.notes.is_empty() {
         out.push('\n');
     }
     let c = plan.counts();
@@ -64,6 +72,20 @@ fn render_unattached(entries: &[PlanEntry], out: &mut String) {
     let head = format!("{:<NAME_WIDTH$} ", GLOBAL_SECTION);
     let pending: Vec<&PlanEntry> = entries.iter().collect();
     render_entries(&pending, &head, out);
+}
+
+/// §9.5 的 `(notes)` 段：`bundle` 里装了、但没拆也没交付的部分
+/// （hooks / commands / agents / MCP —— 按该条 plugin 的 `degrade.<kind>` 决定
+/// 说不说）。**不是 diff 行**：它不参与任何判定，`Plan` 的计数也不数它。
+///
+/// 一条 plugin 一行：句子的主语是 plugin 条目（内容来自定位到的 bundle），
+/// 所以段里带上条目名——挂在 skill 行尾时这个上下文由行本身提供，独立成段就
+/// 必须写出来，否则「哪一条 plugin 还有东西没拆」就无从回答。
+fn render_notes(notes: &BTreeMap<String, String>, out: &mut String) {
+    let head = format!("{:<NAME_WIDTH$} ", NOTES_SECTION);
+    for (plugin, note) in notes {
+        let _ = writeln!(out, "{head}plugin `{plugin}`：{note}");
+    }
 }
 
 /// 逐条渲染一个节的待办行。`head` 是该节首行的名字列（含对齐），后续行用等宽缩进。
@@ -230,6 +252,7 @@ mod tests {
     fn spec_plan() -> Plan {
         Plan {
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
             harnesses: vec![
                 hp(
                     "claude-code",
@@ -329,6 +352,7 @@ mod tests {
         // 这条是 `Kind::all()` 顺序在 Task 2 之外的第二道闸，两道都要在。
         let plan = Plan {
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
             harnesses: vec![hp(
                 "codex",
                 true,
@@ -360,6 +384,7 @@ mod tests {
     fn in_sync_entries_render_only_the_summary_line() {
         let plan = Plan {
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
             harnesses: vec![hp(
                 "claude-code",
                 true,
@@ -389,6 +414,7 @@ mod tests {
     fn empty_harness_says_nothing_installed() {
         let plan = Plan {
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
             harnesses: vec![hp("codex", true, vec![], vec![])],
         };
         assert!(render(&plan).contains("codex         ✓ in-sync  (nothing installed)\n"));
@@ -398,6 +424,7 @@ mod tests {
     fn undetected_harness_is_reported_not_listed_as_install() {
         let plan = Plan {
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
             harnesses: vec![hp(
                 "codex",
                 false,
@@ -424,6 +451,7 @@ mod tests {
         // `! undeliverable` 是 15 字符，超过 11 列宽 → 退化为两空格分隔（spec 示例形态）。
         let plan = Plan {
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
             harnesses: vec![hp(
                 "kimi-code",
                 true,
@@ -464,6 +492,7 @@ mod tests {
                 actual_by_kind: BTreeMap::new(),
             }],
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
         };
         assert!(
             render(&bare).contains("- drift    mcp/experimental-thing (未在清单中)\n"),
@@ -504,6 +533,7 @@ mod tests {
     fn unknown_action_renders_a_line_with_question_mark() {
         let plan = Plan {
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
             harnesses: vec![hp(
                 "claude-code",
                 true,
@@ -528,6 +558,7 @@ mod tests {
     fn footer_counts_come_from_plan_and_include_conflicts() {
         let plan = Plan {
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
             harnesses: vec![hp(
                 "claude-code",
                 true,
@@ -569,6 +600,7 @@ mod tests {
     fn an_update_note_is_rendered_at_the_end_of_the_line() {
         let plan = Plan {
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
             harnesses: vec![hp(
                 "claude-code",
                 true,
@@ -601,6 +633,7 @@ mod tests {
     fn a_noted_install_is_not_merged_into_the_coalesced_line() {
         let plan = Plan {
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
             harnesses: vec![hp(
                 "claude-code",
                 true,
@@ -630,6 +663,7 @@ mod tests {
     fn a_noted_in_sync_is_not_folded_into_the_summary() {
         let plan = Plan {
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
             harnesses: vec![hp(
                 "claude-code",
                 true,
@@ -654,6 +688,7 @@ mod tests {
     fn a_note_does_not_break_install_coalescing() {
         let plan = Plan {
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
             harnesses: vec![hp(
                 "claude-code",
                 true,
@@ -683,6 +718,7 @@ mod tests {
     fn conflicts_render_before_installs() {
         let plan = Plan {
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
             harnesses: vec![hp(
                 "claude-code",
                 true,
@@ -718,6 +754,7 @@ mod tests {
                     reason: "源家没装".into(),
                 },
             )],
+            notes: BTreeMap::new(),
         };
         let out = render(&plan);
         assert!(out.contains("(global)"), "{out}");
@@ -726,6 +763,59 @@ mod tests {
         assert!(
             out.contains("1 undeliverable"),
             "汇总要把全局段数进去：{out}"
+        );
+    }
+
+    /// §9.5 `(notes)` 段：bundle 里装不下的部分（hooks/commands/…），
+    /// **每条 plugin 一行、只印一次**。
+    ///
+    /// 过去它挂在拆出来的每个 skill 行尾——真机上 14 条 skill 就是同一句话印 14 遍。
+    /// 独立成段之后主语必须写出来（`plugin \`x\`：`）：挂在行尾时「这是哪一条 plugin
+    /// 的事」由那一行提供上下文，段里没有这个上下文。
+    #[test]
+    fn leftover_notes_render_once_under_the_notes_section() {
+        let plan = Plan {
+            harnesses: vec![hp(
+                "codex",
+                true,
+                vec![pe(Kind::Skill, "alpha", Action::Install)],
+                Vec::new(),
+            )],
+            unattached: Vec::new(),
+            notes: BTreeMap::from([(
+                "superpowers".to_string(),
+                "bundle `claude-code` 里还有 hook，未拆解（degrade.<kind> = report）".to_string(),
+            )]),
+        };
+        let out = render(&plan);
+        assert!(out.contains("(notes)"), "{out}");
+        assert!(out.contains("plugin `superpowers`："), "{out}");
+        assert_eq!(out.matches("未拆解").count(), 1, "只印一次：{out}");
+        let notes_at = out.find("(notes)").expect("有 notes 段");
+        let plan_at = out.find("Plan: ").expect("有汇总行");
+        assert!(
+            notes_at > out.find("+ install").expect("有 install 行"),
+            "{out}"
+        );
+        assert!(notes_at < plan_at, "notes 段排在汇总行之前：{out}");
+        assert_eq!(
+            out.lines().last().map(|l| l.starts_with("Plan: ")),
+            Some(true),
+            "汇总行仍是最后一行：{out}"
+        );
+    }
+
+    /// 空 `notes` 是**空操作**：既有输出逐字节不变（golden 与 `spec_plan` 都靠这条）。
+    #[test]
+    fn an_empty_notes_table_changes_nothing() {
+        let mut plan = spec_plan();
+        plan.notes = BTreeMap::new();
+        let out = render(&plan);
+        assert!(!out.contains("(notes)"), "{out}");
+        assert_eq!(
+            out.lines().last().map(|l| l.starts_with("Plan: ")),
+            Some(true),
+            "{out}"
         );
     }
 
@@ -741,6 +831,7 @@ mod tests {
                 Vec::new(),
             )],
             unattached: Vec::new(),
+            notes: BTreeMap::new(),
         };
         let out = render(&plan);
         assert!(out.contains("- remove   skill/gone"), "{out}");
