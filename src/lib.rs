@@ -23,6 +23,7 @@ pub mod apply;
 pub mod capability;
 pub mod decompose;
 pub mod diff;
+pub mod doctor;
 pub mod home;
 pub mod lower;
 pub mod manifest;
@@ -74,8 +75,8 @@ impl Confirm for StdinConfirm {
 
 /// 一次规划的全部产物。`diff` 与 `apply` 共用**同一个**规划函数——
 /// 两个规划器能互相不一致，正是这个项目存在要消灭的「假同步」。
-struct Planned {
-    plan: diff::Plan,
+pub(crate) struct Planned {
+    pub plan: diff::Plan,
     /// 清单 lower 后的能力表。MCP 的交付要拿它的三段载荷——`plan` 里只有 id 与动作。
     /// `diff` 不看它（它只读），但两个入口共用 `plan_for`，所以它跟着一起返回。
     desired: Vec<capability::Capability>,
@@ -83,7 +84,7 @@ struct Planned {
     ledger: store::provenance::Ledger,
 }
 
-fn plan_for(
+pub(crate) fn plan_for(
     manifest_path: &Path,
     home: &Home,
     mode: store::skills::SourceMode,

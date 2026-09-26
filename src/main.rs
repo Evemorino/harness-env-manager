@@ -1,4 +1,4 @@
-//! henv CLI。`diff` 只读、`apply` 落盘；`scan`/`doctor` 由 Plan C 各自加一个变体。
+//! henv CLI。`diff` 只读、`apply` 落盘、`doctor` 只读且带门禁语义；`scan` 由 Plan C2 加。
 
 use clap::{Parser, Subcommand};
 use henv::{AssumeYes, Confirm, StdinConfirm};
@@ -21,7 +21,9 @@ use std::path::PathBuf;
 `apply` 落盘前会先渲染计划并要一次 y/N 确认（`--yes` 跳过，供脚本与 CI 用）；\n\
 `apply --prune` 只撤销账本里记着的条目（henv 自己交付过的 skill 拷贝与 MCP 键），用户手放的 drift 一律只报不删；\n\
 `apply --harness <name>` 把一次运行限定在一家（值域：claude-code / codex / kimi-code）。\n\
-`skills list` 同样只读：它只把仓库取到 henv 自己的缓存目录下看完即删。\n\n\
+`skills list` 同样只读：它只把仓库取到 henv 自己的缓存目录下看完即删。\n\
+`doctor` 同样只读：它把「必须处理」的问题（同名冲突、交付不了、配置读不出来、${VAR} 缺值）报出来，\n\
+并按门禁语义退出——0 = 没有问题、1 = 有问题、2 = henv 自己没跑成（清单读不了/解不开）。\n\n\
 degrade: 政策决定「目标 harness 吃不下、但内容已经拆出来了」的能力是进报告还是静默丢弃（§9.5）。"
 )]
 struct Cli {
@@ -57,6 +59,12 @@ enum Command {
         /// 只对这一家生效（claude-code / codex / kimi-code）
         #[arg(long, value_name = "NAME", value_parser = parse_harness)]
         harness: Option<String>,
+    },
+    /// 只读体检：报出「必须处理」的问题，并按门禁语义退出（0/1/2）
+    Doctor {
+        /// 清单路径
+        #[arg(short, long, default_value = "env.yaml")]
+        manifest: PathBuf,
     },
 }
 
@@ -144,6 +152,25 @@ fn main() -> anyhow::Result<()> {
                 print!("{out}");
             }
         },
+        Command::Doctor { manifest } => {
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            let report = match henv::doctor::run_doctor(&manifest, &home, &mut lock) {
+                Ok(report) => report,
+                // `2` = henv 没跑成（清单读不了/解不开、归不了因的失败）。与 `1`
+                // （体检发现问题）分开，脚本才能区分「环境有问题」与「工具坏了」。
+                // 错误形状照抄 anyhow 自己的 `Termination`（`Error: {err:?}`），
+                // 免得两个出口打印两种风格。
+                Err(err) => {
+                    eprintln!("Error: {err:?}");
+                    std::process::exit(2);
+                }
+            };
+            drop(lock);
+            if !report.healthy() {
+                std::process::exit(1);
+            }
+        }
     }
     Ok(())
 }

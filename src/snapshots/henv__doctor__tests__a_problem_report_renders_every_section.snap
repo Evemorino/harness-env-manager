@@ -1,0 +1,14 @@
+---
+source: src/doctor.rs
+expression: render_doctor(&report)
+---
+(env)         ! env      mcp `context7` (${CONTEXT7_API_KEY} 在当前环境里没有值)
+(plan)        ! conflict skill/foo@claude-code (目标已存在同名条目且不是 henv 交付的（a1b2c3d），apply 不会覆盖)
+              ! undeliverable  hook/superpowers:pre-commit@codex (no hook support)
+(warn)        - drift    mcp/experimental-thing@codex (未在清单中，只报不删)
+              - unknown  skill/legacy@kimi-code (版本无法判定)
+              - stale    skill/alpha@claude-code (副本与源不同（v2.1 → v2.2）)
+              - link     skill/beta@claude-code (盘上是断链，apply 会换成真拷贝（→ 9f8e7d6c）)
+              - note     skill/gamma@codex (源这次沿用缓存，未经上游确认（§9.4）)
+
+Doctor: 3 problems, 5 warnings

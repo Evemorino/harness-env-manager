@@ -902,3 +902,39 @@ Plan A 已把 `"Command::new("` 埋进 `FORBIDDEN` 当绊线，**Plan B 的第�
 - **`toml_edit` 解禁**（§8 注 2），只用于 §9.6 的子树级 merge。
 - **git 的 monorepo 子目录抽取**（`repo` + `path` + `ref`）由 henv 自己做，落在
   `store/skills.rs`；缓存放 `~/.cache/henv/git/<repo-hash>/`，避免每次 apply 重新下载。
+
+## 10. Plan C：体检与收养
+
+### 10.1 doctor（门禁与退出码）
+
+`henv doctor [-m env.yaml]`。**只读**：与 `diff` 同一份规划（`SourceMode::Cached`）、同一条读盘路径，
+不写任何文件、不碰账本。它是 `diff` 从不承担的那半句承诺——「门禁语义留给 Plan C 的 doctor」
+（§9.8、`run_diff` 的 rustdoc）。
+
+**退出码**。doctor 是唯一一个退出码承载语义的子命令，因此它必须把「发现问题」与「跑不动」分开：
+
+| 码 | 含义 |
+|---|---|
+| `0` | 体检完成，没有必须处理的问题（可以有警告） |
+| `1` | 体检完成，**有必须处理的问题**（下表左列） |
+| `2` | henv 压根没跑成：清单读不了/解不开，或一个归不了因的失败 |
+
+**问题（fail）**：`conflict`（同名冲突，apply 见到就停）、`undeliverable`（清单要求了却交付不了）、
+某家配置读不出来（这一家的判定不可信）、`${VAR}` 引用的变量当前不存在（apply 会把未展开的引用写进
+harness 配置）。
+
+**警告（不 fail）**：`drift`（盘上有、清单没有）、`unknown`（版本判不了）、`stale`（**已经交付过**
+的副本与源不同）、行上的注记（源未被上游确认 / 副本被手改过）、断链（§2.1 的 `NoContent`）、
+清单里启用了但本机没装的家。
+
+**doctor 不回答「同步了没有」。** `install` 行（清单里有、本机还没装）**不是** finding——那是 apply
+的活；把它当问题会让 doctor 在每台新机器上恒红。这是两个命令的分工：`diff` 是普查，`doctor` 是门禁。
+
+**判据与 `diff` 同源。** 计划类的检查直接取 `plan_for` 产出的 `Action`，不另写一套判据、也不在
+健康路径上再读一遍盘：某家装没装取 `Plan.harnesses[].detected`；`read_state()` 只在**失败归因**时
+才再发生一次（§9.5 那条「不许有第二条读路径」的同一理由）。
+
+**行的主语带 `@harness`**（`skill/my-draft@claude-code`）：doctor 的报告是扁平的，没有 `diff` 那种
+按家分节的上下文；不带这一截，同一条能力在两家的两行会长得一模一样。挂不进任何一家的条目写
+`@(global)`（沿用 §9.5 全局段的段名）。**断链与过期分开写**：两者都长成 `Update`，但断链是 §9.3 的
+自愈判定，前缀写 `- link`，过期写 `- stale`——§2.1 说的「doctor 断链报告」就是这一行。

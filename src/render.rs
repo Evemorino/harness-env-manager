@@ -6,7 +6,10 @@ use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
 /// harness 名列宽。spec §5 示例里内容一律从第 15 列起 → `{:<13}` 再补一个空格。
-const NAME_WIDTH: usize = 13;
+///
+/// `pub(crate)`：doctor 的报告复用同一列宽（`src/doctor.rs`）——两份报告摆在一起
+/// 看时才像同一个工具输出的。
+pub(crate) const NAME_WIDTH: usize = 13;
 /// 动作前缀列宽。`+ install`/`~ update`/`- drift`/`✓ in-sync` 都对齐到 11 列。
 const ACTION_WIDTH: usize = 11;
 /// §9.5 全局段的段名。宽度与 harness 名一致，好让动作列对齐。
@@ -197,7 +200,9 @@ fn with_note(mut line: String, note: Option<&String>) -> String {
 }
 
 /// 前缀对齐到 `ACTION_WIDTH` 列；超长的 `! undeliverable`(15) 退化为两空格分隔。
-fn action_cell(prefix: &str) -> String {
+///
+/// `pub(crate)`：doctor 复用同一套前缀对齐（`src/doctor.rs`）。
+pub(crate) fn action_cell(prefix: &str) -> String {
     let n = prefix.chars().count();
     if n >= ACTION_WIDTH {
         format!("{prefix}  ")
