@@ -5,6 +5,13 @@ edition = "2024"
 rust-version = "1.85"
 description = "跨 harness 能力环境管理器"
 
+[features]
+# 把测试夹具（假 HOME、本地 git 仓库）暴露给 `tests/` 下的集成测试。
+# 不在默认里：它是测试脚手架，不是给用户的 API。
+# `tempfile` 随之转为可选依赖——夹具要它，而集成测试那一侧的 lib 不链接
+# dev-dependencies，所以不能只把 tempfile 留在 dev-dependencies 里。
+testutil = ["dep:tempfile"]
+
 [dependencies]
 anyhow = "1"
 clap = { version = "4.6", features = ["derive"] }
@@ -12,8 +19,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml_ng = "0.10"
 sha2 = "0.10"
+tempfile = { version = "3", optional = true }
 toml = "1.1"
 
 [dev-dependencies]
 insta = "1.48"
 tempfile = "3"
+# 自己依赖自己，只为让集成测试拿到 `testutil` feature（Cargo 的常规做法）。
+# 集成测试是独立 crate，看不到 lib 的 `#[cfg(test)]` 模块。
+henv = { path = ".", features = ["testutil"] }

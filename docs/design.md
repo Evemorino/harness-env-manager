@@ -418,14 +418,28 @@ Plan A 范围内的，不是永久封禁**；Plan B 按上表解禁，用于 §9
 **日期：2026-09-25。状态：已与用户逐节确认。** 本节兑现 §3 里
 `store/skills.rs`、`store/plugins.rs` 与 `HarnessAdapter::apply` 三个已占位未实现的东西。
 
-**落地进度（2026-09-25）：本节分 B1/B2/B3 三块做，B1 已完成。** B1 落的是**骨架与 skills
+**落地进度（2026-09-26）：本节分 B1/B2/B3 三块做，B1 与 B2 已完成。** B1 落的是**骨架与 skills
 交付**：`henv apply` 子命令（渲染计划 → 冲突则中止 → 一次 y/N 确认，`--yes` 跳过）、规划与
 执行分离（`plan_for` + `apply::execute`）、`agents-dir` 与 `local` 两种 skill 源的**逐 harness
 真拷贝交付**、`~/.local/state/henv/provenance.json` 账本（记「往哪家放了什么、内容哈希是多少」）、
 只读守卫改成 `src/apply/` + `src/store/` 写入白名单，以及 §9.3 的断链自愈（`SkillEntry::content_path`）。
-**B1 未做的**：**B2** 的 `git` 源与 `henv skills list`；**B3** 的 MCP 三家写入、plugin bundle 拆解、
-`degrade:` 真正生效（§9.1 的声明性占位，至今仍不改变报告）、`--prune`。因此本节的 `.bak`、
-失败隔离与事务性（§9.7）目前只有 skills 交付那一条路径实装，配置文件的写路径尚未涉及。
+
+**B2 落的是 git 源与 `henv skills list`**（2026-09-26）：`source: git` 的解析（`store::git::resolve`，
+shell out 系统 git、不引 `git2`，缓存 `~/.cache/henv/git/<repo-hash>/`，`owner/repo` 简写展开到
+`https://github.com/<owner>/<repo>.git`）、判定模式穿线（**`diff` 只读缓存不联网 / `apply` fetch**）、
+来源标识 `repo@ref@sha`、§9.4 的 `stale`（上游刷不动就沿用缓存，标出来而不是报失败）、
+`henv skills list`（§9.8），以及一条 B1 遗留缺陷的收口：**没解析出来的源不再被静默跳过**
+（skill 的 install 报成可见的 `undeliverable`，apply 侧也报失败）。只读守卫因此**收窄而非删除**：
+`Command::new(` 在 `src/store/git.rs` 与 `src/testutil.rs` 之外仍然禁止（§9.9）。
+
+**2026-09-26 终审后的两处修正**（都是接口层的事实错误，不是设计变更）：§9.4 的解析配方原本
+写的是裸 `rev-parse <ref>`，而 `fetch` 不移动本地分支——照那个配方实现会让**默认分支静默停在
+旧提交上并报「新鲜」**、非默认分支则永远解不出来；现已改为按 `origin/<ref>` 解析。以及
+`skills list` 的长选项缺省被 clap 生成为 `--git-ref`，与本节承诺的 `--ref` 不符，现已对齐。
+
+**B2 未做的 / B3**：MCP 三家写入、plugin bundle 拆解、`degrade:` 真正生效（§9.1 的声明性占位，
+至今仍不改变报告）、`--prune`、`--harness <name>`。因此本节的 `.bak`、失败隔离与事务性（§9.7）
+目前只有 skills 交付那一条路径实装，配置文件的写路径尚未涉及。
 
 ### 9.1 范围
 
@@ -551,9 +565,12 @@ skill 目录里多出来的点文件」，而这正是 §9.11 刚记下的那类
 拷贝相对直链多付出的代价，必须真的实现，否则 harness 里的副本会**静默过期**——用户改了源、
 以为已生效，实际没有。三种源各有判据：
 
-- **git 源**：账本记着上次解析该 `ref` 得到的 sha。重跑时 `git fetch` 后 `git rev-parse <ref>`
-  比对，**不一致才重拷**。网络不可达则沿用缓存内容、把该条目标 `stale`，**不报失败**——
-  离线也要能用。
+- **git 源**：账本记着上次解析该 `ref` 得到的 sha。重跑时 `git fetch` 后按 **`origin/<ref>`**
+  解析比对，**不一致才重拷**。这里必须是 `origin/<ref>`：`fetch` 只更新远程跟踪引用、
+  **不移动本地分支**，对着本地分支解出来的是 **clone 那天**的提交——上游前进了也照样报
+  「新鲜」，正是本条要防的静默过期；非默认分支更是本地根本没有，只活在 `origin/<ref>` 里。
+  裸 `<ref>` 只作为回退，覆盖 `fetch` 管不到的形状（tag 进的是 `refs/tags/`、裸提交 sha）。
+  网络不可达则沿用缓存内容、把该条目标 `stale`，**不报失败**——离线也要能用。
 - **bundle 拆解**：比对账本记的 `bundle@from@version@sha` 与该 bundle 当前的值。
   **纯本地比对**，不需要网络。**「当前的值」取安装自带的 manifest 声明，不取 harness 的
   `gitCommitSha`**——§2.2 第 7 条实测 claude 的 `gitCommitSha` 陈旧（与安装内容不符），拿它比对
@@ -631,8 +648,14 @@ henv apply [-m env.yaml] [--yes] [--prune] [--harness <name>]
 henv skills list --repo <url> [--ref <r>] [--path <p>]        ← Plan B 新增
 ```
 
-`skills list`：clone 到临时目录，列出所有含 `SKILL.md` 的目录（名字 + 仓库内相对路径）。
-**只读**，不写任何东西。它是「用户给一个 git 地址」时的第一步。
+`skills list`：列出仓库里所有含 `SKILL.md` 的目录（目录名 + 仓库内相对路径），按相对路径排序，
+`--path` 限定只看某个子目录，`--ref` 缺省用仓库默认分支。它是「用户给一个 git 地址」时的第一步。
+
+**只读的准确含义**（2026-09-26 与实现对齐）：它要 clone 才能看，而 clone 必须落在一个目录里。
+落在 **henv 自己缓存下的一个进程独占子目录**：`~/.cache/henv/git/list-<repo-hash>-<pid>/`，
+命令返回前删掉（成功失败都删）。**除这个临时目录外不写任何东西**——不碰 harness 目录、
+不碰账本、不碰 `~/.cache/henv/git/` 下 `resolve` 用的那些缓存条目。放缓存下而不是系统临时
+目录，是为了少一处要解释的路径；独占名字（repo-key + pid）让并发的两次 list 不打架。
 
 **`--prune` 受不变式二（§9.3）约束**：它删除的范围**只有 provenance 里记着的条目**。
 §5 说「actual 有而 desired 无」就报 drift，但「actual 有」在 harness 目录里包含**用户手建的**

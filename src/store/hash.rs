@@ -32,6 +32,14 @@ pub fn hash_dir(path: &Path) -> anyhow::Result<Option<String>> {
     Ok(Some(hex(hasher.finalize().as_slice())))
 }
 
+/// 字符串指纹。给缓存键这类「路径不好直接当目录名」的场合用：
+/// 归一化后的 URL 里有 `/`、`:`，直接拼进路径既难看又有歧义。
+pub fn hash_str(s: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(s.as_bytes());
+    hex(hasher.finalize().as_slice())
+}
+
 fn hash_entry(root: &Path, path: &Path, hasher: &mut Sha256) -> anyhow::Result<()> {
     let meta = std::fs::symlink_metadata(path)
         .with_context(|| format!("cannot stat {}", path.display()))?;
@@ -195,6 +203,21 @@ mod tests {
             hash_dir(&t.path("d")).unwrap(),
             hash_dir(&t.path("f")).unwrap(),
             "空目录与空文件不是同一个东西"
+        );
+    }
+
+    #[test]
+    fn hash_str_is_stable_and_sized_like_a_sha256() {
+        assert_eq!(
+            hash_str("https://github.com/obra/superpowers.git").len(),
+            64
+        );
+        assert_eq!(hash_str("a"), hash_str("a"), "同一输入必须同一指纹");
+        assert_ne!(hash_str("a"), hash_str("b"));
+        assert_eq!(hash_str("").len(), 64, "空串也有指纹，不返回 None");
+        assert!(
+            hash_str("x").chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            "与 hash_dir 同一形态：小写十六进制"
         );
     }
 

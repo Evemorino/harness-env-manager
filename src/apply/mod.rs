@@ -1,5 +1,6 @@
 //! 执行层（spec §9.2/§9.7）。**这是全项目唯一落盘的地方**（§9.9 白名单）。
 
+use crate::capability::Kind;
 use crate::diff::{Action, HarnessPlan, Plan};
 use crate::home::Home;
 use crate::store::hash::hash_dir;
@@ -53,9 +54,17 @@ pub fn deliver_skills(
         if !matches!(e.action, Action::Install | Action::Update { .. }) {
             continue;
         }
-        // 源没解析出来（git / bundle / 源不存在）→ 内容层给不出路径，交给 Plan A 的
-        // 判定去报告，这里不猜路径也不失败。
+        // 源没解析出来（git / bundle / 源不存在）→ 内容层给不出路径。
         let Some(src) = content.sources.get(&e.id) else {
+            // 内容层只解析 skill（`Spec::Skill` 是唯一的来源形状），所以 mcp 与 plugin
+            // 的 install 条目走到这里时「没有内容」是**正常**的：它们的交付路径还没做
+            // （B3）。把那种情况报成失败，会让每一次带 plugin 的 apply 都刷出一串
+            // 假故障，真正该被看见的 skill 失败反而被淹掉。
+            if e.id.kind == Kind::Skill {
+                // skill 计划说要交付、内容层却没有它：这不是「跳过」，是「要做的没做成」。
+                // 重跑是修复路径（§9.7），但重跑的前提是用户知道出事了。
+                failures.push(format!("{}：源没有解析出内容，未交付", e.id.label()));
+            }
             continue;
         };
         let target = target_dir.join(&e.id.name);
@@ -196,6 +205,7 @@ mod tests {
                 path: t.path("src/foo"),
                 hash: "ignored-on-purpose".into(),
                 source_id: "agents-dir".into(),
+                stale: None,
             },
         );
         content
@@ -258,6 +268,7 @@ mod tests {
                 path: t.path("src/does-not-exist"),
                 hash: "h".into(),
                 source_id: "agents-dir".into(),
+                stale: None,
             },
         );
         content.sources.insert(
@@ -266,6 +277,7 @@ mod tests {
                 path: t.path("src/ok"),
                 hash: "h".into(),
                 source_id: "agents-dir".into(),
+                stale: None,
             },
         );
         let slice = HarnessPlan {
@@ -326,6 +338,73 @@ mod tests {
     }
 
     #[test]
+    fn a_planned_delivery_without_content_is_a_reported_failure() {
+        // 计划说要装，内容层却没有它。原来这里是 `continue`——一个字节不写，
+        // 也一个字不说：用户看到的是「我说了 y，然后什么都没发生」。
+        // 就算 diff 已经把这种条目变成可见的 undeliverable（B2），这一层也要
+        // 自己兜住：万一以后有人改了 `compute`，坏消息必须仍有一个出口。
+        let t = TempHome::new();
+        let slice = HarnessPlan {
+            harness: "claude-code".into(),
+            detected: true,
+            entries: vec![PlanEntry::new(
+                CapId::new(Kind::Skill, "ghost"),
+                Action::Install,
+            )],
+            actual_by_kind: Default::default(),
+        };
+        let mut ledger = Ledger::default();
+        let report = deliver_skills(
+            "claude-code",
+            Some(&t.path(".claude/skills")),
+            &slice,
+            &ContentIndex::default(),
+            &mut ledger,
+        )
+        .unwrap();
+
+        let failure = report.failure.expect("要交付却没有内容，必须报出来");
+        assert!(
+            failure.contains("skill/ghost"),
+            "要点名是哪一条，实际：{failure}"
+        );
+        assert!(!t.path(".claude/skills/ghost").exists(), "什么都没写才对");
+        assert!(ledger.entries.is_empty(), "失败的条目不记账");
+    }
+
+    #[test]
+    fn a_plugin_install_without_content_is_not_a_failure() {
+        // 这条是上一条的绊线，钉住它的作用范围。内容层只解析 skill（`Spec::Skill`
+        // 是唯一的来源形状），所以 plugin / mcp 的 install 条目「没有内容」是**正常**
+        // 状态——它们的交付路径还没做（B3）。无差别地把那段 `continue` 改成失败，
+        // 每一次带 plugin 的 apply 都会刷出一串假故障，真正的 skill 失败反而被淹掉。
+        let t = TempHome::new();
+        let slice = HarnessPlan {
+            harness: "claude-code".into(),
+            detected: true,
+            entries: vec![PlanEntry::new(
+                CapId::new(Kind::Plugin, "superpowers"),
+                Action::Install,
+            )],
+            actual_by_kind: Default::default(),
+        };
+        let mut ledger = Ledger::default();
+        let report = deliver_skills(
+            "claude-code",
+            Some(&t.path(".claude/skills")),
+            &slice,
+            &ContentIndex::default(),
+            &mut ledger,
+        )
+        .unwrap();
+
+        assert!(
+            report.failure.is_none(),
+            "plugin 的交付还没做，那不是失败，实际 {report:?}"
+        );
+    }
+
+    #[test]
     fn the_delivered_content_matches_the_source() {
         // 3、4 两步合起来就是 §9.10 的 roundtrip 断言：交付完的内容是清单要的。
         let t = TempHome::new();
@@ -371,8 +450,15 @@ mod tests {
             })
             .collect();
         let content = ContentIndex {
-            sources: crate::store::skills::resolve_sources(&desired, &t.home).unwrap(),
+            sources: crate::store::skills::resolve_sources(
+                &desired,
+                &t.home,
+                crate::store::git::SourceMode::Fetch,
+            )
+            .unwrap()
+            .sources,
             targets: Default::default(),
+            unresolved: Default::default(),
         };
         let inputs: Vec<crate::diff::HarnessInput> = states
             .iter()

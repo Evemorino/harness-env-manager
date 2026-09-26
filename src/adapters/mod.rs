@@ -396,6 +396,7 @@ mod tests {
                 path: t.path("src/foo"),
                 hash: "h".into(),
                 source_id: "agents-dir".into(),
+                stale: None,
             },
         );
         content

@@ -1,9 +1,11 @@
 //! henv：跨 harness 能力环境管理器。
 //!
-//! `diff` 只读：解析 `env.yaml` → 归一化能力 → 扫本机三家现状 → 纯函数 diff → 渲染，
-//! 全链路不写 `Home` 下任何文件。`apply`（Plan B1）在此基础上多走一步落盘——把 skills
-//! 真拷贝进各家、并把「放了什么」记进账本；它同样从 `plan_for` 的同一份计划出发，
-//! 且只经由 `apply::execute` 写盘。
+//! `diff` 只读：解析 `env.yaml` → 归一化能力 → 扫本机三家现状 → 纯函数 diff → 渲染。
+//! 它全链路不写 `Home` 下的任何文件，也不联网：git 源只读 henv 自己的缓存
+//! （`~/.cache/henv/git`），缓存里没有就如实报「这次判不了」（§9.4）。
+//! `apply`（Plan B1）在此基础上多走一步落盘——把 skills 真拷贝进各家、并把「放了什么」
+//! 记进账本；它同样从 `plan_for` 的同一份计划出发，且只经由 `apply::execute` 写盘。
+//! 唯一会改盘的是 `apply`（写 harness 目录、写账本、刷新 git 缓存）。
 //!
 //! Plan A 的「不写 `Home`」不变量由 `tests/read_only_guard.rs` 静态守卫，Plan B1 把它
 //! 收窄成**写入白名单**：只有 `src/apply/` 与 `src/store/` 下的代码允许出现写盘调用。
@@ -12,6 +14,7 @@ use adapters::HarnessAdapter;
 use anyhow::Context as _;
 use home::Home;
 use manifest::Manifest;
+use std::fmt::Write as _;
 use std::io::Write;
 use std::path::Path;
 
@@ -31,8 +34,10 @@ pub mod store;
 #[cfg(test)]
 use adapters::{CLAUDE_CODE, CODEX, KIMI_CODE};
 
-#[cfg(test)]
-mod testutil;
+// `tests/` 下的集成测试是独立 crate，看不到 `#[cfg(test)]` 模块；`testutil`
+// feature（非默认）把它们需要的夹具（`TempHome`/`GitFixture`）放出来。
+#[cfg(any(test, feature = "testutil"))]
+pub mod testutil;
 
 /// 交互闸门（§9.8）：`apply` 是 henv 唯一会问人一句话的地方。
 /// 抽成 trait 是为了让 `run_apply` 能被测——否则测一次 apply 就要喂真 stdin。
@@ -74,7 +79,11 @@ struct Planned {
     ledger: store::provenance::Ledger,
 }
 
-fn plan_for(manifest_path: &Path, home: &Home) -> anyhow::Result<Planned> {
+fn plan_for(
+    manifest_path: &Path,
+    home: &Home,
+    mode: store::skills::SourceMode,
+) -> anyhow::Result<Planned> {
     let text = std::fs::read_to_string(manifest_path)
         .with_context(|| format!("cannot read manifest: {}", manifest_path.display()))?;
     let manifest = Manifest::parse(&text)
@@ -84,7 +93,10 @@ fn plan_for(manifest_path: &Path, home: &Home) -> anyhow::Result<Planned> {
     let degrade = lower::DegradeTable::new(&manifest);
 
     // §9.2 第 1 步：全局来源解析。唯一在 compute 之前的 I/O。
-    let sources = store::skills::resolve_sources(&desired, home)?;
+    // `mode` 在这里分岔成全链路唯一的两种行为：`Cached` 不联网（`diff`），
+    // `Fetch` 会去取（`apply`）。模式必须一路传到这一层——分类「延期还是失败」
+    // 是它的责任（§9.4），而这一层是唯一知道「源到底取到没有」的地方。
+    let content_sources = store::skills::resolve_sources(&desired, home, mode)?;
 
     let registry = adapters::registry(home);
     // state 与它的 adapter 必须成对交给 compute，故先收进同一个 Vec 再借用。
@@ -129,7 +141,11 @@ fn plan_for(manifest_path: &Path, home: &Home) -> anyhow::Result<Planned> {
         })
         .collect();
 
-    let content = store::skills::ContentIndex { sources, targets };
+    let content = store::skills::ContentIndex {
+        sources: content_sources.sources,
+        targets,
+        unresolved: content_sources.unresolved,
+    };
     let ledger = store::provenance::Ledger::load(home)?;
     let plan = diff::compute(&desired, &inputs, &degrade, &content, &ledger);
     Ok(Planned {
@@ -147,9 +163,33 @@ fn plan_for(manifest_path: &Path, home: &Home) -> anyhow::Result<Planned> {
 /// 注：`degrade:` 在 Plan A 只是声明性占位——plugin 尚未拆解，策略两侧都不生效，
 /// 真正按策略静音/降级要等 Plan B 拆解落地。
 pub fn run_diff(manifest_path: &Path, home: &Home, out: &mut dyn Write) -> anyhow::Result<()> {
-    let planned = plan_for(manifest_path, home)?;
+    let planned = plan_for(manifest_path, home, store::skills::SourceMode::Cached)?;
     write!(out, "{}", render::render(&planned.plan))?;
     Ok(())
+}
+
+/// `henv skills list`：给一个 git 地址，列出里面所有含 `SKILL.md` 的目录（§9.8）。
+///
+/// 只读入口：不读清单、不碰 harness 目录、不写账本。唯一的写入是 henv 自己
+/// 缓存下的一个临时子目录（`store::git::list_skills` 自己负责删）。
+/// 名字对齐到最长的那个：好看，且便于 `awk '{print $2}'` 直接取路径。
+pub fn run_skills_list(
+    repo: &str,
+    git_ref: Option<&str>,
+    sub: Option<&str>,
+    home: &Home,
+) -> anyhow::Result<String> {
+    let found = store::git::list_skills(repo, sub, git_ref, &home.henv_git_cache())?;
+    if found.is_empty() {
+        // 空结果与「命令失败」是两回事：看过了，只是里面没有 skill。
+        return Ok(format!("没有找到含 SKILL.md 的目录（看了 {repo}）\n"));
+    }
+    let width = found.iter().map(|(n, _)| n.chars().count()).max().unwrap_or(0);
+    let mut out = String::new();
+    for (name, rel) in found {
+        let _ = writeln!(out, "{name}{}  {rel}", " ".repeat(width - name.chars().count()));
+    }
+    Ok(out)
 }
 
 /// 交付：把清单要的 skill 真拷贝到各家，并把「放了什么」记进账本（§9.2/§9.3）。
@@ -164,7 +204,7 @@ pub fn run_apply(
     out: &mut dyn Write,
     confirm: &mut dyn Confirm,
 ) -> anyhow::Result<()> {
-    let mut planned = plan_for(manifest_path, home)?;
+    let mut planned = plan_for(manifest_path, home, store::skills::SourceMode::Fetch)?;
     write!(out, "{}", render::render(&planned.plan))?;
 
     let conflicts = planned.plan.conflicts();
@@ -240,6 +280,37 @@ mod tests {
     use super::*;
     use crate::testutil::TempHome;
 
+    #[test]
+    fn skills_list_prints_a_name_padded_to_the_longest_one() {
+        let t = TempHome::new();
+        let repo = t.git_repo("upstream");
+        repo.write("skills/foo/SKILL.md", "# foo");
+        repo.write("skills/longer-name/SKILL.md", "# longer");
+        repo.commit("init");
+
+        let out = run_skills_list(&repo.url, None, None, &t.home).unwrap();
+        assert_eq!(
+            out,
+            "foo          skills/foo\nlonger-name  skills/longer-name\n"
+        );
+    }
+
+    #[test]
+    fn skills_list_writes_nothing_outside_henv_cache() {
+        // §9.8 说 `skills list` 只读。这里把「只读」钉在它最容易破的地方：
+        // 扫完一个仓库就顺手建了某家的目录（或账本），用户下次 diff 会看到
+        // 一个他没做过的改动。
+        let t = TempHome::new();
+        let repo = t.git_repo("upstream");
+        repo.write("skills/foo/SKILL.md", "# foo");
+        repo.commit("init");
+
+        run_skills_list(&repo.url, None, None, &t.home).unwrap();
+        for rel in [".claude", ".codex", ".kimi", ".agents", ".local"] {
+            assert!(!t.path(rel).exists(), "{rel} 不该被创建");
+        }
+    }
+
     /// 跑一次 run_diff，返回渲染文本。
     /// 用 `TempHome::write` 而非 `std::fs::write`：read_only_guard 扫的是整个
     /// `src/lib.rs`（含 `#[cfg(test)]`），只豁免 `testutil.rs`。
@@ -248,6 +319,42 @@ mod tests {
         let mut out = Vec::new();
         run_diff(&t.path("env.yaml"), &t.home, &mut out).expect("run_diff");
         String::from_utf8(out).expect("utf8")
+    }
+
+    #[test]
+    fn diff_plans_without_network_and_apply_plans_with_it() {
+        // 模式穿线的端到端证据：同一份清单、同一份缓存状态，两个入口必须得到
+        // 两种结果——否则 §9.4 的「diff 不联网」只是文档里的一句话。
+        let t = TempHome::new();
+        let repo = t.git_repo("upstream");
+        repo.write("skills/foo/SKILL.md", "# foo");
+        repo.commit("init");
+        t.write(
+            "env.yaml",
+            &format!(
+                "version: 1\nskills:\n  foo:\n    source: git\n    repo: {}\n    ref: main\n    path: skills/foo\n    targets: [claude-code]\n",
+                repo.url
+            ),
+        );
+        let m = t.path("env.yaml");
+
+        let cached = plan_for(&m, &t.home, store::skills::SourceMode::Cached).unwrap();
+        assert!(
+            cached
+                .content
+                .unresolved
+                .contains_key(&capability::CapId::new(capability::Kind::Skill, "foo")),
+            "diff 不联网：第一次跑时缓存是空的，源应当报「这次判不了」"
+        );
+
+        let fetched = plan_for(&m, &t.home, store::skills::SourceMode::Fetch).unwrap();
+        assert!(
+            fetched
+                .content
+                .sources
+                .contains_key(&capability::CapId::new(capability::Kind::Skill, "foo")),
+            "apply 会去取，所以同样一份清单在 Fetch 模式下应当解析出内容"
+        );
     }
 
     #[test]

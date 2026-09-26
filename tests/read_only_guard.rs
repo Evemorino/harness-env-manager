@@ -1,21 +1,20 @@
-//! 写路径守卫：`src/` 下只有白名单目录（`src/apply/`、`src/store/`）允许出现文件写 API。
+//! 写路径守卫：`src/` 下只有白名单目录（`src/apply/`、`src/store/`）允许出现文件写 API；
+//! **外部进程调用另算**——它不按目录豁免，只按具体文件豁免（spec §9.9）。
 //!
-//! Plan A 的形态是「哪里都不许写」；Plan B 落地后收窄成白名单（spec §9.9）。
-//! 收窄的方式是**加一层允许**，不是从 `FORBIDDEN` 里删模式——`Command::new(` 尤其
-//! 必须留着（B2 的 git 与 B3 的 `claude mcp add-json` 都要 shell out，那是这个项目
-//! 第一次真的调用外部程序），谁把某条模式从列表里删掉，`FORBIDDEN` 就少一道闸。
+//! Plan A 的形态是「哪里都不许写」；Plan B 落地后收窄成白名单。收窄的方式是**加一层允许**，
+//! 不是把模式从表里删掉：拆表之后，每一条模式仍然被某张表和某条测试看着，谁把表改松，
+//! 对应那条反向钉子就红（`the_allowlist_is_not_the_whole_tree`、`the_process_allowlist_…`）。
+//!
+//! 两张表分开的理由见 `PROCESS_CALLS` 的注释：写文件与起进程不是一个量级的权限。
 
 use std::path::{Path, PathBuf};
 
 /// 唯一允许落盘的目录前缀（相对仓库根，带尾斜杠）。spec §9.9。
 const WRITE_WHITELIST: &[&str] = &["src/apply/", "src/store/"];
 
-/// 带 `(` 的模式避免误伤 `fs::symlink_metadata` 这类只读 API。
-///
-/// `Command::new(` 今天在生产代码里**一个都匹配不上**，收在这里是防将来：Plan B 的真实写
-/// 路径就是 shell out 到 `claude mcp add-json`，那是 Plan A 这个只读承诺的第一次破口。
-/// 先把模式立好，Plan B 的第一行 shell out 会直接撞红一条测试，而不是悄悄溜进产物。
-const FORBIDDEN: &[&str] = &[
+/// 写 API：带 `(` 的模式避免误伤 `fs::symlink_metadata` 这类只读 API。
+/// 只允许出现在 `WRITE_WHITELIST` 下面的目录里。
+const WRITE_API: &[&str] = &[
     "fs::write(",
     "File::create(",
     "OpenOptions",
@@ -27,8 +26,21 @@ const FORBIDDEN: &[&str] = &[
     "fs::symlink(",
     "fs::hard_link(",
     "fs::set_permissions(",
-    "Command::new(",
 ];
+
+/// 外部进程调用：**不按目录豁免**，只按具体文件豁免（§9.9）。
+///
+/// 为什么单独一张表：`src/store/` 允许写文件，而 shell out 比写文件强得多——它能做这个
+/// 进程权限内的任何事。目录级豁免会把「这个目录可以写文件」悄悄升级成「这个目录可以起
+/// 进程」。B2 的 git 与 B3 的 `claude mcp add-json` 是这个项目第一次真的调用外部程序，
+/// 绊线必须收紧到文件名。
+const PROCESS_CALLS: &[&str] = &["Command::new("];
+
+/// 允许 shell out 的文件，白名单精确到路径全等。
+///
+/// - `src/store/git.rs`：git 源解析，整个模块的存在理由就是调 git（§9.12）。
+/// - `src/testutil.rs`：测试夹具要造本地 git 仓库，但它只在 `cfg(test)` 下编译。
+const PROCESS_ALLOWLIST: &[&str] = &["src/store/git.rs", "src/testutil.rs"];
 
 fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(rd) = std::fs::read_dir(dir) else {
@@ -59,14 +71,16 @@ fn is_whitelisted(path: &Path) -> bool {
     WRITE_WHITELIST.iter().any(|w| rel.starts_with(w))
 }
 
-fn offenders(path: &Path) -> Vec<String> {
-    let text = std::fs::read_to_string(path).expect("read src");
-    let mut hits = Vec::new();
-    // `#[cfg(test)]` 代码不进产物二进制，测试夹具对 TempDir 的写不是生产写路径。
-    // 逐行扫时按括号深度跳过 `#[cfg(test)]` 门控的块，只对生产（非测试）代码报写 API。
+/// 只留下**生产代码**的文本：`#[cfg(test)]` 门控的块整段去掉，注释行也去掉。
+///
+/// 为什么去掉测试块：`#[cfg(test)]` 代码不进产物二进制，测试夹具对 TempDir 的写不是生产
+/// 写路径。逐行扫时按括号深度跟踪，只把生产代码留给调用方。
+/// 为什么去掉注释行：文档与说明里提到这些 API 是正常的（本文件自己就写了满篇模式）。
+fn strip_cfg_test_blocks(text: &str) -> String {
+    let mut out = String::new();
     let mut test_depth = 0usize;
     let mut pending_cfg_test = false;
-    for (i, line) in text.lines().enumerate() {
+    for line in text.lines() {
         let opens = line.matches('{').count();
         let closes = line.matches('}').count();
 
@@ -94,13 +108,48 @@ fn offenders(path: &Path) -> Vec<String> {
         if line.trim_start().starts_with("//") {
             continue;
         }
-        for pat in FORBIDDEN {
-            if line.contains(pat) {
-                hits.push(format!("{}:{}: {pat}", path.display(), i + 1));
-            }
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
+}
+
+/// 一段文本里命中了哪些模式（每张表每个模式最多报一次，报模式本身）。
+///
+/// 只要模式字符串，是因为调用方要拿它**回表判定**（这个模式属于哪张表、这个文件有没有豁免）。
+fn offenders_of_text(text: &str) -> Vec<String> {
+    let stripped = strip_cfg_test_blocks(text);
+    let mut found: Vec<String> = Vec::new();
+    for pat in WRITE_API.iter().chain(PROCESS_CALLS.iter()) {
+        if stripped.contains(pat) && !found.contains(&pat.to_string()) {
+            found.push(pat.to_string());
         }
     }
-    hits
+    found
+}
+
+fn offenders(path: &Path) -> Vec<String> {
+    match std::fs::read_to_string(path) {
+        Ok(text) => offenders_of_text(&text),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// 这个文件里**真正违规**的模式：按两张表分别判定豁免。
+fn violations(path: &Path) -> Vec<String> {
+    let rel = rel_path(path);
+    offenders(path)
+        .into_iter()
+        .filter(|pat| {
+            if PROCESS_CALLS.contains(&pat.as_str()) {
+                // 外部进程调用：只有名字在允许位里的文件能过。
+                !PROCESS_ALLOWLIST.contains(&rel.as_str())
+            } else {
+                // 写 API：目录级白名单照旧。
+                !is_whitelisted(path)
+            }
+        })
+        .collect()
 }
 
 fn src_files() -> Vec<PathBuf> {
@@ -147,6 +196,31 @@ fn production_code_never_calls_the_lossy_skill_scanner() {
 }
 
 #[test]
+fn a_shell_out_outside_the_allowlist_is_refused() {
+    // 绊线本身要可证伪：拿一段合成文本，证明扫描器真的会认出 Command::new(。
+    // 合成文本比真文件可靠——它不会因为哪天 git.rs 改了实现而漂移。
+    let synthetic = "fn f() { let _ = Command::new(\"git\"); }";
+    assert_eq!(
+        offenders_of_text(synthetic),
+        vec![PROCESS_CALLS[0].to_string()]
+    );
+}
+
+/// 允许位是「这一个文件」，不是「这一片目录」。目录级豁免正是 B2 要避免的那件事：
+/// `src/store/` 已经可以写文件，若它同时豁免 shell out，守卫就等于没写。
+#[test]
+fn the_process_allowlist_names_files_not_directories() {
+    for p in PROCESS_ALLOWLIST {
+        assert!(p.ends_with(".rs"), "{p} 不是具体文件");
+        assert!(!p.ends_with('/'), "{p} 看着像目录");
+        assert!(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join(p).exists(),
+            "{p} 不存在：允许位不允许指向幽灵文件"
+        );
+    }
+}
+
+#[test]
 fn scanner_is_not_vacuous() {
     // 反证扫描器有效：testutil.rs 故意含写 API，必须被抓到。
     // 若这条失败，说明 walk() 没走到文件，上一条的 PASS 毫无意义。
@@ -175,19 +249,22 @@ fn scanner_is_not_vacuous() {
 fn write_api_is_allowed_only_inside_the_whitelist() {
     let mut all = Vec::new();
     for f in src_files() {
-        if is_whitelisted(&f) {
-            continue;
-        }
+        // testutil.rs 由 `#[cfg(test)] pub mod testutil;` 在模块声明处门控——
+        // 文件内部的括号跟踪看不到这层门，所以在这里按名字放行（它不进产物二进制）。
         if f.file_name().and_then(|n| n.to_str()) == Some("testutil.rs") {
             continue;
         }
-        all.extend(offenders(&f));
+        for pat in violations(&f) {
+            all.push(format!("{}: {pat}", rel_path(&f)));
+        }
     }
     assert!(
         all.is_empty(),
-        "白名单外的生产代码出现写 API：\n{}\n（写路径只允许出现在 {} 下）",
+        "白名单外的生产代码出现写 API 或未获豁免的 shell out：\n{}\n\
+         （写路径只允许出现在 {} 下；shell out 只允许 {} ）",
         all.join("\n"),
-        WRITE_WHITELIST.join(" / ")
+        WRITE_WHITELIST.join(" / "),
+        PROCESS_ALLOWLIST.join(" / ")
     );
 }
 
@@ -208,6 +285,33 @@ fn whitelist_matches_by_directory_prefix() {
         "前缀必须带尾斜杠：`src/store` 不该放行一个叫 src/store.rs 的文件"
     );
     assert!(!is_whitelisted(&root.join("src/adapters/codex.rs")));
+}
+
+/// 允许位必须点到文件，不能退化成目录前缀；且允许位之外的文件里出现 `Command::new(`
+/// 必须被拦下。少了这条，把 `PROCESS_ALLOWLIST` 写成 `&["src/store/"]` 也能让上面几条全绿。
+#[test]
+fn the_allowlist_is_not_the_whole_tree() {
+    for p in PROCESS_ALLOWLIST {
+        assert_ne!(p, &"src/");
+        assert_ne!(p, &"src/store/");
+    }
+    // 走一遍「读文件 → 找模式 → 按表判定」的完整路径：合成文本只测了前半段，
+    // 判定靠的是 rel 路径全等，这条测的正是它不会被目录前缀蒙混过去。
+    let dir = std::env::temp_dir().join(format!("henv-guard-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let evil = dir.join("evil.rs");
+    std::fs::write(&evil, "fn f() { let _ = Command::new(\"git\"); }\n").expect("write");
+    assert_eq!(violations(&evil), vec![PROCESS_CALLS[0].to_string()]);
+    std::fs::remove_dir_all(&dir).expect("cleanup");
+
+    // 既有文件里不该有 shell out：出现了就该显式加进 PROCESS_ALLOWLIST 并写理由，
+    // 而不是把判定放宽。用真实文件断言，是为了让这条在代码长出来时真的会响。
+    let real = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/capability.rs");
+    assert!(real.exists(), "这条断言针对真实文件，它改名了要跟着改");
+    assert!(
+        violations(&real).is_empty(),
+        "src/capability.rs 里出现 shell out —— 要显式加进 PROCESS_ALLOWLIST 并说明理由"
+    );
 }
 
 /// 白名单不能是摆设：它必须**真的**放行了一批写 API。少了这条，

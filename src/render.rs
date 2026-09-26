@@ -34,10 +34,12 @@ fn render_harness(h: &HarnessPlan, out: &mut String) {
         return;
     }
 
+    // InSync 只在**不带注记**时才折进汇总行：注记是「内容可能过时 / 未经过
+    // 上游确认」这类必须被看见的信息（§9.4 的 stale），汇总成一行就丢了。
     let pending: Vec<&PlanEntry> = h
         .entries
         .iter()
-        .filter(|e| !matches!(e.action, Action::InSync))
+        .filter(|e| !matches!(e.action, Action::InSync) || e.note.is_some())
         .collect();
 
     // 全同步 → 单行汇总实有数量；有待办 → 逐条列出（汇总行此时是噪音）。
@@ -54,9 +56,14 @@ fn render_harness(h: &HarnessPlan, out: &mut String) {
         let lead = if i == 1 { head.clone() } else { indent() };
         match &e.action {
             // install 无附加说明，合并成一行；diff 已按 label 排好序，故连续。
-            Action::Install => {
+            // **带注记的 install 不参与合并**：合并行没有地方放注记，一旦并进去
+            // 就是静默——「没报失败」又变回「什么都没说」。
+            Action::Install if e.note.is_none() => {
                 let mut labels = vec![e.id.label()];
-                while i < pending.len() && matches!(pending[i].action, Action::Install) {
+                while i < pending.len()
+                    && matches!(pending[i].action, Action::Install)
+                    && pending[i].note.is_none()
+                {
                     labels.push(pending[i].id.label());
                     i += 1;
                 }
@@ -66,6 +73,10 @@ fn render_harness(h: &HarnessPlan, out: &mut String) {
                     action_cell("+ install"),
                     labels.join(", ")
                 );
+            }
+            Action::Install => {
+                let line = format!("{lead}{}{}", action_cell("+ install"), e.id.label());
+                let _ = writeln!(out, "{}", with_note(line, e.note.as_ref()));
             }
             Action::Update { from, to } => {
                 let line = format!(
@@ -107,8 +118,11 @@ fn render_harness(h: &HarnessPlan, out: &mut String) {
                 );
                 let _ = writeln!(out, "{}", with_note(line, e.note.as_ref()));
             }
-            // pending 已过滤掉 InSync；match 需穷尽故留空臂，不 panic。
-            Action::InSync => {}
+            // 走到这里的 in-sync 一定带着注记（filter 只放这种进来）。
+            Action::InSync => {
+                let line = format!("{lead}{}{}", action_cell("✓ in-sync"), e.id.label());
+                let _ = writeln!(out, "{}", with_note(line, e.note.as_ref()));
+            }
         }
     }
 }
@@ -117,8 +131,8 @@ fn indent() -> String {
     " ".repeat(NAME_WIDTH + 1)
 }
 
-/// 行尾注记（§9.3）。install 的合并行不用它——note 只可能出现在
-/// update/conflict 这类逐条渲染的行上。
+/// 行尾注记（§9.3）。合并行不用它——合并只发生在**不带注记**的 install 之间，
+/// 所以每一处 `with_note` 都落在逐条渲染的行上。
 fn with_note(mut line: String, note: Option<&String>) -> String {
     if let Some(n) = note {
         let _ = write!(line, " [{n}]");
@@ -512,6 +526,57 @@ mod tests {
             out.contains("~ update   skill/a (aaaa → bbbb) [副本被手改过]\n"),
             "{out}"
         );
+    }
+
+    /// 注记必须活下来，而合并行是注记的头号杀手：`+ install  a, b, c` 的价值
+    /// 是短，可当其中一条带着「内容没经过上游确认」（§9.4 的 stale）时，短就是错。
+    ///
+    /// fixture 按 `compute` 的排序取（同动作内按 label），带注记的那条放**最前**：
+    /// 这样既验「注记条目不参与合并」，也验「它不会把后面的无注记条目一起吞掉」。
+    #[test]
+    fn a_noted_install_is_not_merged_into_the_coalesced_line() {
+        let plan = Plan {
+            harnesses: vec![hp(
+                "claude-code",
+                true,
+                vec![
+                    PlanEntry::new(CapId::new(Kind::Skill, "a"), Action::Install)
+                        .with_note(Some("未能刷新上游".into())),
+                    pe(Kind::Skill, "b", Action::Install),
+                    pe(Kind::Skill, "c", Action::Install),
+                ],
+                vec![(Kind::Skill, 3)],
+            )],
+        };
+        let out = render(&plan);
+        assert!(
+            out.contains("+ install  skill/a [未能刷新上游]\n"),
+            "带注记的条目要单独一行：\n{out}"
+        );
+        assert!(
+            out.contains("+ install  skill/b, skill/c\n"),
+            "无注记的相邻 install 照旧合并：\n{out}"
+        );
+    }
+
+    /// 汇总行 `✓ in-sync  skills:1` 装不下注记，而一条 stale 的 in-sync 恰恰是
+    /// 「看着没事、其实没经过上游确认」——最需要被看见的那种。
+    #[test]
+    fn a_noted_in_sync_is_not_folded_into_the_summary() {
+        let plan = Plan {
+            harnesses: vec![hp(
+                "claude-code",
+                true,
+                vec![
+                    PlanEntry::new(CapId::new(Kind::Skill, "a"), Action::InSync)
+                        .with_note(Some("未能刷新上游".into())),
+                ],
+                vec![(Kind::Skill, 1)],
+            )],
+        };
+        let out = render(&plan);
+        assert!(out.contains("skill/a"), "注记行的条目要露出来：\n{out}");
+        assert!(out.contains("未能刷新上游"), "注记必须显示出来：\n{out}");
     }
 
     /// 带注记的 update 与 install 相邻时，install 的合并逻辑不能被打乱。

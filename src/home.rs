@@ -135,6 +135,18 @@ impl Home {
     pub fn henv_provenance(&self) -> PathBuf {
         self.henv_state_dir().join("provenance.json")
     }
+
+    /// henv 自己的缓存根（§9.12）。放在 `root/.cache` 而不是 `.local/state`：
+    /// 状态目录存账本（丢了就分不清东西是谁放的），缓存目录存可以从上游重取的内容
+    /// （丢了只是下次慢一点）。两者的丢失代价不同，所以不放在一起。
+    pub fn henv_cache_dir(&self) -> PathBuf {
+        self.root.join(".cache/henv")
+    }
+
+    /// git 源的内容缓存：`<henv_cache>/git/<repo-hash>/repo` 是一次 clone。
+    pub fn henv_git_cache(&self) -> PathBuf {
+        self.henv_cache_dir().join("git")
+    }
 }
 
 #[cfg(test)]
@@ -280,5 +292,32 @@ mod tests {
             assert!(!h.henv_state_dir().starts_with(&d), "{d:?}");
         }
         assert!(!h.henv_state_dir().starts_with(h.agents_skills()));
+    }
+
+    #[test]
+    fn the_git_cache_lives_under_henv_own_cache_directory() {
+        let t = TempHome::new();
+        assert_eq!(t.home.henv_cache_dir(), t.path(".cache/henv"));
+        assert_eq!(t.home.henv_git_cache(), t.path(".cache/henv/git"));
+    }
+
+    #[test]
+    fn the_git_cache_is_not_inside_any_harness_directory() {
+        // 「diff 不写 Home 下任何文件」这条承诺在 B2 之后要收窄成
+        // 「除 henv 自己的 cache 外不写」——所以缓存路径必须能被单独指认出来。
+        let t = TempHome::new();
+        let cache = t.home.henv_git_cache();
+        for d in t.home.harness_dirs() {
+            assert!(
+                !cache.starts_with(&d),
+                "缓存 {} 落在了 harness 目录 {} 里",
+                cache.display(),
+                d.display()
+            );
+        }
+        assert!(
+            !cache.starts_with(t.home.henv_state_dir()),
+            "缓存不是状态：混进账本目录会让「哪些文件丢了要重取」说不清"
+        );
     }
 }

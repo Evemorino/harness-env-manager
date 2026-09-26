@@ -313,10 +313,15 @@ where
     d.deserialize_map(UniqueMap::<V>(PhantomData))
 }
 
-/// skill 名会直接参与路径拼接：`store::skills` 拿它找源（`agents_skills().join(name)`），
-/// `apply` 拿它定位目标（`target_dir.join(name)`）。`Path::join` 的语义让两类名字能逃出去：
-/// **绝对路径替换基路径**、`..` 逐级上溯——于是 henv 会去读/写 skills 目录**之外**，
-/// 静默覆盖用户没让它碰的东西，正是不变式二要消灭的形态。故名字必须是单一路径分量。
+/// 能力的名字（`skills`/`mcps`/`plugins` 三个映射的**键**）会直接参与路径拼接：
+/// `store::skills` 拿它找源（`agents_skills().join(name)`），`apply` 拿它定位目标
+/// （`target_dir.join(name)`），B3 的 plugin 安装目录与 `claude mcp add-json <name>`
+/// 同理。`Path::join` 的语义让两类名字能逃出去：**绝对路径替换基路径**、`..` 逐级上溯
+/// ——于是 henv 会去读/写目标目录**之外**，静默覆盖用户没让它碰的东西，正是不变式二
+/// 要消灭的形态。故名字必须是单一路径分量。
+///
+/// 「名字里真有斜杠」不是需要支持的情形：身份由 `marketplace`/`entry`/`repo` 那些字段
+/// 承载，键里出现分隔符只说明清单层次写错了。
 ///
 /// `\` 单列一条：它在 Unix 上是普通字符、在 Windows 上是分隔符，而清单是可移植的——
 /// 今天在 macOS 上它只是个怪名字，换台机器就是第二处逃逸。
@@ -334,6 +339,20 @@ fn name_is_a_single_component(name: &str) -> bool {
     }
     let mut parts = Path::new(name).components();
     matches!(parts.next(), Some(Component::Normal(_))) && parts.next().is_none()
+}
+
+/// git 源的 `path` 是**仓库内**的子目录：相对、不带 `..`、不以 `/` 开头。
+///
+/// 这不是防越权（读哪个目录用户在本机本来就有权限决定），是防清单自相矛盾：
+/// `source: git` 说「内容在这个仓库里」，`path: ../../x` 说的是「内容在这个仓库外」。
+/// 后者应当写成 `source: local`。另一半在 `git::resolve` 里：那边是「查不到就报错」。
+fn git_sub_path_is_safe(s: &str) -> bool {
+    if s.starts_with('/') {
+        return false;
+    }
+    Path::new(s)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_)))
 }
 
 /// 认得的 serde 标记里取**最靠前**的那个（值里可以自带标记词，实测
@@ -510,8 +529,25 @@ impl Manifest {
                     if s.repo.is_none() {
                         e.push(format!("{at}: source git requires `repo`"));
                     }
+                    // `repo` 原样进 `git clone` 的 argv（`repo_url` 只展开 owner/repo
+                    // 简写）。以 `-` 开头的值于是会被 git 当成**选项**：实测
+                    // `repo: --upload-pack=/tmp/x.sh` 能让 clone 把那个脚本跑起来。
+                    // 清单是最容易从别处复制来的文件，这道闸就断在值进来的地方。
+                    if s.repo.as_deref().is_some_and(|r| r.starts_with('-')) {
+                        e.push(format!(
+                            "{at}: repo must not start with `-` (git would read it as an option)"
+                        ));
+                    }
                     if s.git_ref.is_none() {
                         e.push(format!("{at}: source git requires `ref` (ref is the lock)"));
+                    }
+                    if let Some(p) = s.path.as_deref() {
+                        if !git_sub_path_is_safe(p) {
+                            e.push(format!(
+                                "{at}: path must be a relative path inside the repository \
+                                 (no leading `/`, no `..`)"
+                            ));
+                        }
                     }
                 }
                 SkillSourceKind::Local => {
@@ -524,6 +560,11 @@ impl Manifest {
 
         for (name, m) in &self.mcps {
             let at = format!("mcps.{name}");
+            if !name_is_a_single_component(name) {
+                e.push(format!(
+                    "{at}: name must be a single path component (no `/`, no `\\`, not `.`/`..`, not empty)"
+                ));
+            }
             // `command` 是 serde 必填字段，所以这里永远是 `Some`：缺失由反序列化挡，
             // 空白由这条挡（与上面两条同一个规则、同一个消息形状）。
             reject_blank(&at, "command", Some(&m.command), &mut e);
@@ -536,6 +577,11 @@ impl Manifest {
 
         for (name, p) in &self.plugins {
             let at = format!("plugins.{name}");
+            if !name_is_a_single_component(name) {
+                e.push(format!(
+                    "{at}: name must be a single path component (no `/`, no `\\`, not `.`/`..`, not empty)"
+                ));
+            }
             reject_blank(&at, "marketplace", p.marketplace.as_deref(), &mut e);
             reject_blank(&at, "entry", p.entry.as_deref(), &mut e);
             reject_blank(&at, "repo", p.repo.as_deref(), &mut e);
@@ -994,6 +1040,21 @@ plugins:
         assert!(err.contains("agents-dir"), "{err}");
     }
 
+    /// `repo` 会被原样交给 `git clone`（`repo_url` 只展开 owner/repo 简写）。以 `-`
+    /// 开头的值于是变成 git 的**选项**：实测 `repo: --upload-pack=/tmp/x.sh` 会让
+    /// clone 真的把那个脚本跑起来。清单是最容易被复制粘贴的东西（项目 README、
+    /// 同事的 env.yaml），所以这条必须在清单层断掉。
+    #[test]
+    fn rejects_repo_that_starts_with_a_dash() {
+        let err = Manifest::parse(
+            "version: 1\nskills:\n  a:\n    source: git\n    repo: --upload-pack=/tmp/x.sh\n    ref: main\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("repo"), "{err}");
+        assert!(err.contains("option"), "报错要说清为什么：{err}");
+    }
+
     #[test]
     fn rejects_claude_marketplace_plugin_without_marketplace_or_entry() {
         let yaml = "version: 1\nplugins:\n  a:\n    source: claude-marketplace\n";
@@ -1244,6 +1305,56 @@ plugins:
                 .to_string();
             assert!(err.contains("single path component"), "{name:?} → {err}");
         }
+    }
+
+    #[test]
+    fn a_git_sub_path_may_not_escape_the_checkout() {
+        // 逃出去的 path 会把缓存目录以外的内容当成 skill 内容读到、并拷进 harness。
+        // 用户的清单里写 `local` 源是明说「读这个目录」，写 `git` 源却指定 `../..`
+        // 就是清单自相矛盾——拒绝它，而不是照做。
+        for bad in ["../other", "skills/../../escape", "/etc", "a/../b"] {
+            let text = format!(
+                "version: 1\nskills:\n  s1:\n    source: git\n    repo: obra/superpowers\n    ref: main\n    path: {bad}\n    targets: [claude-code]\n"
+            );
+            let Err(err) = Manifest::parse(&text) else {
+                panic!("path = {bad:?} 应当被拒，却被接受");
+            };
+            assert!(
+                err.to_string().contains("path"),
+                "报错要点名 path，实际：{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_plain_git_sub_path_is_accepted() {
+        let text = "version: 1\nskills:\n  s1:\n    source: git\n    repo: obra/superpowers\n    ref: main\n    path: skills/foo\n    targets: [claude-code]\n";
+        assert!(Manifest::parse(text).is_ok());
+    }
+
+    #[test]
+    fn every_capability_key_is_a_single_path_component() {
+        // skill 一直有这个约束（B1 加的），mcp 与 plugin 没有——而它们的名字同样
+        // 会被 henv 拿去拼路径（plugin 的安装目录、`claude mcp add-json <name>`）。
+        // 键里带 `/` 是清单层次写错了，不是「名字里就有斜杠」：身份由
+        // `marketplace`/`entry`/`repo` 那些字段承载，不靠键。
+        for bad in ["a/b", "..", ".", "", "a\\b", "/etc"] {
+            // 单引号标量：双引号里 `\b` 是 YAML 的转义（退格），那样 `a\b` 这条
+            // 根本没把反斜杠喂给校验函数，测试会假绿。
+            let mcp = format!("version: 1\nmcps:\n  '{bad}':\n    command: npx\n");
+            let plugin = format!(
+                "version: 1\nplugins:\n  '{bad}':\n    source: claude-marketplace\n    marketplace: obra/superpowers\n    entry: superpowers\n"
+            );
+            for (kind, text) in [("mcps", mcp), ("plugins", plugin)] {
+                assert!(
+                    Manifest::parse(&text).is_err(),
+                    "{kind} 的键 {bad:?} 应当被拒"
+                );
+            }
+        }
+        // 反面的绊线：约束不能宽到把正常名字也拒了。
+        let ok = "version: 1\nmcps:\n  context7:\n    command: npx\nplugins:\n  superpowers:\n    source: claude-marketplace\n    marketplace: obra/superpowers\n    entry: superpowers\n";
+        assert!(Manifest::parse(ok).is_ok(), "正常名字要照收");
     }
 
     #[test]

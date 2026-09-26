@@ -13,7 +13,7 @@ use crate::capability::{
 use crate::lower::DegradeTable;
 use crate::manifest::DegradeAction;
 use crate::store::provenance::Ledger;
-use crate::store::skills::{ContentIndex, TargetContent};
+use crate::store::skills::{ContentIndex, ResolvedContent, TargetContent, Unresolved};
 use std::collections::{BTreeMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -185,11 +185,11 @@ fn content_verdict(
                 from: "断链".to_string(),
                 to: short_hash(&src.hash),
             },
-            note: None,
+            note: stale_note(src),
         }),
         TargetContent::Has(h) if h == &src.hash => Some(Verdict {
             action: Action::InSync,
-            note: None,
+            note: stale_note(src),
         }),
         TargetContent::Has(h) => {
             let action = Action::Update {
@@ -198,12 +198,19 @@ fn content_verdict(
             };
             match ledger.find(harness, &cap.id.name) {
                 // 账本记的就是盘上这个哈希：内容是 henv 放的，也没人动过。
-                Some(entry) if &entry.content_hash == h => Some(Verdict { action, note: None }),
+                Some(entry) if &entry.content_hash == h => Some(Verdict {
+                    action,
+                    note: stale_note(src),
+                }),
                 // 账本说这里该是别的哈希：有人手改过，或上次交付只成功了一半。
                 // 两种情况都照常覆盖（它终究是 henv 放的），但报告要显式说出来。
+                // 「手改过」与「源没刷新上」可以同时成立，两句话都要留着。
                 Some(_) => Some(Verdict {
                     action,
-                    note: Some("副本被手改过".to_string()),
+                    note: Some(match stale_note(src) {
+                        Some(s) => format!("副本被手改过；{s}"),
+                        None => "副本被手改过".to_string(),
+                    }),
                 }),
                 // 盘上有内容、不是我们放的、又和清单要的不一样 → 不动它。
                 None => Some(Verdict {
@@ -213,11 +220,17 @@ fn content_verdict(
                             short_hash(h)
                         ),
                     },
-                    note: None,
+                    note: stale_note(src),
                 }),
             }
         }
     }
+}
+
+/// 源这次是「沿用缓存」时给行尾的注记（§9.4）。它不参与任何判定，
+/// 只在报告里把「你看到的这份内容没经过上游确认」说出来。
+fn stale_note(src: &ResolvedContent) -> Option<String> {
+    src.stale.clone()
 }
 
 /// 报告里只显示哈希前 8 位：完整 64 位在终端里是噪音，而人要看的只是
@@ -291,7 +304,15 @@ pub fn compute(
                     let (verdict_action, verdict_note) =
                         match content_verdict(&state.name, cap, content, ledger) {
                             Some(v) => (Some(v.action), v.note),
-                            None => (None, None),
+                            // 内容层判不了（目标侧没扫到这条，或清单侧没解析出内容）不等于
+                            // 「没什么好说的」：源这次是沿用没刷新的缓存时，「你看到的这份内容
+                            // 没经过上游确认」照样成立，而且 install 是它最要紧的一条路——
+                            // 要写盘的正是这些没确认过的字节。stale 是源的属性，不该因为
+                            // 目标侧扫不到就消失。
+                            None => (
+                                None,
+                                content.sources.get(&cap.id).and_then(stale_note),
+                            ),
                         };
                     let action = match state.actual.iter().find(|a| a.id == cap.id) {
                         None => Action::Install,
@@ -317,7 +338,32 @@ pub fn compute(
                             },
                         },
                     };
-                    entries.push(PlanEntry::new(cap.id.clone(), action).with_note(verdict_note));
+                    // 源拿不到，怎么落到这一行（§9.1 说清楚 + §9.3 的失败隔离）：
+                    // - `Failed` 而这条动作**会写盘** → 换成可见的 undeliverable：
+                    //   计划承诺了要做，实际做不到，那是要报出来的事，不是「跳过」。
+                    // - 不写盘的动作（in-sync / unknown / conflict）只加注记：把一个
+                    //   准确的判定改成一个吓人的名词，是另一种失真。
+                    // - `Deferred`（diff 不联网）永远只加注记：apply 会去取。
+                    let unresolved = content.unresolved.get(&cap.id);
+                    let action = match (unresolved, &action) {
+                        (
+                            Some(Unresolved::Failed(reason)),
+                            Action::Install | Action::Update { .. },
+                        ) => Action::Undeliverable {
+                            reason: reason.clone(),
+                        },
+                        _ => action,
+                    };
+                    // 已经是 undeliverable 的行自带 reason，再挂一遍注记是同一句话说两遍。
+                    let note = match unresolved {
+                        Some(Unresolved::Deferred(r) | Unresolved::Failed(r))
+                            if !matches!(action, Action::Undeliverable { .. }) =>
+                        {
+                            verdict_note.or_else(|| Some(r.clone()))
+                        }
+                        _ => verdict_note,
+                    };
+                    entries.push(PlanEntry::new(cap.id.clone(), action).with_note(note));
                 }
             }
         }
@@ -364,7 +410,7 @@ mod tests {
     use crate::lower::DegradeTable;
     use crate::manifest::Manifest;
     use crate::store::provenance::{Ledger, LedgerEntry};
-    use crate::store::skills::{ContentIndex, ResolvedContent, TargetContent};
+    use crate::store::skills::{ContentIndex, ResolvedContent, TargetContent, Unresolved};
     use crate::testutil::{FakeAdapter, TempHome};
     use std::path::PathBuf;
 
@@ -1019,6 +1065,7 @@ mod tests {
                 path: PathBuf::from(format!("/src/{name}")),
                 hash: source_hash.into(),
                 source_id: "local:/src".into(),
+                stale: None,
             },
         );
         idx.targets
@@ -1026,6 +1073,144 @@ mod tests {
             .or_default()
             .insert(name.to_string(), target);
         idx
+    }
+
+    /// `content_plan` 只喂了 claude-code 一家，取它那一行。
+    fn entry_of<'a>(plan: &'a Plan, label: &str) -> &'a PlanEntry {
+        let hp = &plan.harnesses[0];
+        hp.entries
+            .iter()
+            .find(|e| e.id.label() == label)
+            .unwrap_or_else(|| panic!("没有 {label} 这一行：{:?}", labels(hp)))
+    }
+
+    /// 一条现状侧的 skill（adapter 扫到的形态）。
+    fn adopted_skill(name: &str) -> Capability {
+        let mut c = FakeAdapter::cap(
+            Kind::Skill,
+            name,
+            Spec::Skill {
+                source: SkillSource::AgentsDir,
+                path: Some(PathBuf::from(format!("/target/{name}"))),
+            },
+        );
+        c.origin = Origin::Adopted {
+            harness: "claude-code".into(),
+        };
+        c
+    }
+
+    fn content_with_unresolved(name: &str, u: Unresolved) -> ContentIndex {
+        let mut idx = ContentIndex::default();
+        idx.unresolved.insert(CapId::new(Kind::Skill, name), u);
+        idx
+    }
+
+    /// 与 `content_with` 同一份内容，只是这次是**沿用缓存**拿到的（§9.4）。
+    fn stale_content(name: &str, source_hash: &str, target: TargetContent, why: &str) -> ContentIndex {
+        let mut idx = content_with(name, source_hash, target);
+        idx.sources
+            .get_mut(&CapId::new(Kind::Skill, name))
+            .expect("content_with 刚插进去的那个源")
+            .stale = Some(why.into());
+        idx
+    }
+
+    #[test]
+    fn a_stale_source_marks_every_entry_it_touches() {
+        // §9.4：沿用缓存内容时条目要标 stale，且**不报失败**——离线也要能用。
+        // 但「不报失败」不等于「什么都不说」：用户得知道这份内容没经过上游确认。
+        let content = stale_content(
+            "foo",
+            &"a".repeat(64),
+            TargetContent::NoContent,
+            "未能刷新上游",
+        );
+        let plan = content_plan(vec![], &content, &Ledger::default());
+        let e = entry_of(&plan, "skill/foo");
+        assert!(matches!(e.action, Action::Install), "stale 不改动作");
+        assert!(
+            e.note.as_deref().unwrap_or_default().contains("未能刷新"),
+            "实际 note：{:?}",
+            e.note
+        );
+    }
+
+    #[test]
+    fn a_stale_source_still_marks_an_entry_the_target_side_never_scanned() {
+        // stale 是**源**的属性，不是「目标侧扫到了什么」的属性。目标目录还不存在
+        // （第一次 apply 之前的样子）时内容层给不出裁决，于是落回 Plan A 的
+        // `compare_versions`——但「这份内容没经过上游确认」依然成立，而且恰恰是
+        // 在 install 这条路上最要紧：要写盘的正是那些没确认过的字节。
+        let mut content = stale_content(
+            "foo",
+            &"a".repeat(64),
+            TargetContent::NoContent,
+            "未能刷新上游",
+        );
+        content.targets.clear(); // 目标侧一条都没扫到
+        let plan = content_plan(vec![], &content, &Ledger::default());
+        let e = entry_of(&plan, "skill/foo");
+        assert!(
+            matches!(e.action, Action::Install),
+            "内容层判不了就落回 Plan A 的动作，不改判定"
+        );
+        assert!(
+            e.note.as_deref().unwrap_or_default().contains("未能刷新"),
+            "换到哪条判定路径上，stale 这个事实都不能丢，实际 note：{:?}",
+            e.note
+        );
+    }
+
+    #[test]
+    fn a_failed_source_turns_a_promised_install_into_undeliverable() {
+        // 清单说了要装，源却拿不到——这不是「跳过」，是「承诺了的事做不到」。
+        // 计划里就必须看得见（§9.1），不能等交付层什么都不做、什么都不说。
+        let content = content_with_unresolved(
+            "foo",
+            Unresolved::Failed("源目录不存在：/nope".into()),
+        );
+        let plan = content_plan(vec![], &content, &Ledger::default());
+        match &entry_of(&plan, "skill/foo").action {
+            Action::Undeliverable { reason } => assert!(
+                reason.contains("源目录不存在"),
+                "理由要原样带到计划里，实际：{reason}"
+            ),
+            other => panic!("讲好要装却装不了，必须报 undeliverable，实际 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_deferred_source_keeps_the_plan_a_verdict_and_only_adds_a_note() {
+        // diff 不联网：动作照 Plan A 判（目标是空的 → install），行尾说明「这次判不了」。
+        // **不能**报 undeliverable——apply 会去取，那是吓唬人。
+        let content = content_with_unresolved(
+            "foo",
+            Unresolved::Deferred("diff 不联网；缓存里没有这个源的内容（apply 会去取）".into()),
+        );
+        let plan = content_plan(vec![], &content, &Ledger::default());
+        let e = entry_of(&plan, "skill/foo");
+        assert!(matches!(e.action, Action::Install), "实际 {:?}", e.action);
+        assert!(
+            e.note.as_deref().unwrap_or_default().contains("不联网"),
+            "判不了的原因要写在行尾，实际 {:?}",
+            e.note
+        );
+    }
+
+    #[test]
+    fn a_failed_source_does_not_override_a_verdict_that_asks_for_no_write() {
+        // 源拿不到、两边又比不出高低 → unknown。它不是「要做而做不到」，
+        // 只是「判不了」；把它换成 undeliverable 会把一个准确的判定改成一个吓人的名词。
+        let content = content_with_unresolved("foo", Unresolved::Failed("取不到".into()));
+        let plan = content_plan(vec![adopted_skill("foo")], &content, &Ledger::default());
+        let e = entry_of(&plan, "skill/foo");
+        assert!(
+            !matches!(e.action, Action::Undeliverable { .. }),
+            "不写盘的动作不该被改成 undeliverable，实际 {:?}",
+            e.action
+        );
+        assert!(e.note.is_some(), "但「为什么判不了」要说出来");
     }
 
     fn ledger_claiming(name: &str, hash: &str) -> Ledger {

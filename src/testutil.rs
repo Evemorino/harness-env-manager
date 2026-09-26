@@ -59,6 +59,88 @@ impl TempHome {
     }
 }
 
+/// 一个本地 git 仓库夹具（§9.10：git 源不联网）。
+///
+/// 每一条 git 调用都带**显式配置**，因为这些测试跑在开发机上：用户自己的
+/// `~/.gitconfig` 里可能有 `commit.gpgsign = true`、`init.defaultBranch = master`
+/// 之类的设置，那会让「同样的 fixture 在不同机器上产出不同的 sha」。测试要的是
+/// 可复现，不是「在我机器上能过」。
+pub struct GitFixture {
+    pub dir: PathBuf,
+    /// `file://` 形式的 clone 地址——绝对路径直接当 URL 传给 git 会被当成
+    /// 「本地路径优化」，行为与远端 clone 有差异，file:// 才是忠实的模拟。
+    pub url: String,
+}
+
+impl GitFixture {
+    fn git(&self, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .args(["-c", "commit.gpgsign=false", "-c", "init.defaultBranch=main"])
+            .args(args)
+            .current_dir(&self.dir)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_AUTHOR_NAME", "henv-fixture")
+            .env("GIT_AUTHOR_EMAIL", "fixture@example.invalid")
+            .env("GIT_COMMITTER_NAME", "henv-fixture")
+            .env("GIT_COMMITTER_EMAIL", "fixture@example.invalid")
+            .env("GIT_AUTHOR_DATE", "2026-01-01T00:00:00+0000")
+            .env("GIT_COMMITTER_DATE", "2026-01-01T00:00:00+0000")
+            .output()
+            .expect("git 必须可用：本项目要求开发机装有 git");
+        assert!(
+            out.status.success(),
+            "git {args:?} 失败：{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    pub fn write(&self, rel: &str, body: &str) {
+        let p = self.dir.join(rel);
+        std::fs::create_dir_all(p.parent().expect("夹具路径要有父目录")).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    /// 提交并返回 sha。返回 sha 是为了让测试能断言「账本记的是这个提交」。
+    pub fn commit(&self, msg: &str) -> String {
+        self.git(&["add", "-A"]);
+        self.git(&["commit", "-m", msg]);
+        self.git(&["rev-parse", "HEAD"])
+    }
+
+    pub fn tag(&self, name: &str) {
+        self.git(&["tag", name]);
+    }
+
+    /// 建一个分支并切过去。用于「非默认分支」的场景：clone 只为默认分支建
+    /// 本地分支，其余分支只活在 `origin/*` 里——那正是解析最容易出错的地方。
+    ///
+    /// 用完记得 `checkout` 回默认分支：clone 跟随的是**源仓库的 HEAD**，
+    /// 留着非默认分支的 HEAD 的话，clone 出来的本地分支就是它，
+    /// 「非默认分支」的场景于是被夹具自己抹平了。
+    pub fn branch(&self, name: &str) {
+        self.git(&["checkout", "-q", "-b", name]);
+    }
+
+    /// 切到已有的分支或提交。
+    pub fn checkout(&self, name: &str) {
+        self.git(&["checkout", "-q", name]);
+    }
+}
+
+impl TempHome {
+    /// 在临时 home 里造一个本地仓库。放在 home 下是因为夹具的一切都该随 TempDir 消失。
+    pub fn git_repo(&self, rel: &str) -> GitFixture {
+        let dir = self.path(rel);
+        std::fs::create_dir_all(&dir).unwrap();
+        let url = format!("file://{}", dir.display());
+        let f = GitFixture { dir, url };
+        f.git(&["init", "-q"]);
+        f
+    }
+}
+
 /// 测试替身：`read_state` 返回预置能力，`supports` 按 kind 查表。
 ///
 /// Task 13/14 的 diff 与 golden 测试靠它喂进可控能力，不依赖任何真实配置树——
@@ -207,6 +289,29 @@ impl crate::Confirm for RefuseAll {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_git_fixture_creates_a_hermetic_local_repo() {
+        // §9.10：git 源不联网，夹具必须是本地的；也绝不读用户 git 配置。
+        let t = TempHome::new();
+        let repo = t.git_repo("fixtures/upstream");
+        repo.write("skills/foo/SKILL.md", "# foo");
+        let first = repo.commit("init");
+        assert_eq!(first.len(), 40, "commit 返回完整 sha");
+
+        repo.write("skills/foo/SKILL.md", "# foo v2");
+        let second = repo.commit("v2");
+        assert_ne!(first, second);
+        repo.tag("v1");
+        assert!(repo.url.starts_with("file://"), "必须是本地 URL：{}", repo.url);
+
+        repo.branch("develop");
+        assert_eq!(
+            repo.git(&["branch", "--show-current"]),
+            "develop",
+            "branch() 要真的切过去，否则「非默认分支」的场景是假的"
+        );
+    }
 
     #[test]
     fn writes_files_and_symlinks_under_temp_root() {
