@@ -15,6 +15,14 @@ fn manifest() -> String {
         .to_string()
 }
 
+/// 不带凭据的那份：kimi 写不出任何「从环境取值」，所以它那半只能用这种条目验证
+/// 交付本身（带凭据的那条由 `credentials_on_kimi_are_reported_not_written` 覆盖）。
+fn manifest_without_credentials() -> String {
+    "version: 1\n\n\
+     mcps:\n  context7:\n    command: npx\n    args: [\"-y\", \"@upstash/context7-mcp\"]\n"
+        .to_string()
+}
+
 fn temp_home_with_codex() -> TempHome {
     let t = TempHome::new();
     t.mkdir(".codex");
@@ -92,7 +100,16 @@ fn a_codex_mcp_goes_from_absent_to_delivered_to_in_sync() {
     assert!(cfg.contains("# my codex config"), "注释要留住：\n{cfg}");
     assert!(cfg.contains("experimental_bearer_token"), "{cfg}");
     assert!(cfg.contains("context7"), "{cfg}");
-    assert!(cfg.contains("${K}"), "引用不许展开：\n{cfg}");
+    // 凭据要走 codex 的**取值字段**（`env_vars` = 同名转发），不能把 `${K}` 文本写进
+    // `env`——那是个字面量，codex 会把这段文本原样发给 MCP 服务端（2026-09-28 实测）。
+    assert!(
+        cfg.contains("env_vars"),
+        "凭据要走 codex 的取值字段：\n{cfg}"
+    );
+    assert!(
+        !cfg.contains("${K}"),
+        "codex 不展开 ${{VAR}}，写进去等于把它当字面量发出去：\n{cfg}"
+    );
 
     // 3) **性质**：apply 之后 codex 那一行必须是 in-sync。
     //    这条同时验了账本的哈希与从配置里读回来的 spec 是一致的——
@@ -137,7 +154,7 @@ fn a_kimi_mcp_lands_in_its_own_file_and_other_keys_survive() {
         ".kimi-code/mcp.json",
         "{\n  \"mcpServers\": {\n    \"user-own\": { \"command\": \"their-binary\" }\n  }\n}\n",
     );
-    t.write("env.yaml", &manifest());
+    t.write("env.yaml", &manifest_without_credentials());
 
     run_apply_to_string(&t);
 
@@ -149,7 +166,10 @@ fn a_kimi_mcp_lands_in_its_own_file_and_other_keys_survive() {
         "别人那条要留着"
     );
     assert_eq!(v["mcpServers"]["context7"]["command"], "npx");
-    assert_eq!(v["mcpServers"]["context7"]["env"]["K"], "${K}");
+    assert!(
+        v["mcpServers"]["context7"].get("env").is_none(),
+        "没有凭据就不该冒出 env 键"
+    );
 
     // apply 之后读回来的就是我们写下去的那条：清单声明的 context7 不再需要
     // install/update，报告里剩下的唯一动作是**没写进清单的** `user-own` 的 drift
@@ -163,6 +183,44 @@ fn a_kimi_mcp_lands_in_its_own_file_and_other_keys_survive() {
     assert!(
         after.contains("0 install, 0 update"),
         "apply 之后清单里那条不该还要装或改：\n{after}"
+    );
+}
+
+/// **kimi 上没有凭据的忠实写法**，所以带凭据的条目要如实报「交付不了」，
+/// 绝不能退化成「把 `${K}` 当字面量写进去」——那是这个项目最忌讳的静默失败
+/// （写下去之后没有任何一方会报错，效果却是服务端收到一段无意义的文本）。
+///
+/// 判据与三家实测依据见 `adapters::mcp_expressible`。
+#[test]
+fn credentials_on_kimi_are_reported_not_written() {
+    let t = TempHome::new();
+    t.mkdir(".kimi-code");
+    t.write("env.yaml", &manifest());
+    let before = std::fs::read(t.path(".kimi-code/mcp.json")).ok();
+
+    let plan = run_diff_to_string(&t);
+    assert!(
+        plan.contains("undeliverable") && plan.contains("kimi-code"),
+        "要报成交付不了：\n{plan}"
+    );
+    assert!(
+        plan.contains("字面量"),
+        "理由要说清是「字面量」这件事：\n{plan}"
+    );
+    assert!(
+        plan.contains("0 install, 0 update"),
+        "交付不了就不是 install：\n{plan}"
+    );
+
+    let applied = run_apply_to_string(&t);
+    assert!(
+        !applied.contains("delivered mcp/context7"),
+        "不许交付：\n{applied}"
+    );
+    assert_eq!(
+        std::fs::read(t.path(".kimi-code/mcp.json")).ok(),
+        before,
+        "一个字节都不该写"
     );
 }
 

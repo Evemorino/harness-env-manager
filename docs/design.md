@@ -143,7 +143,9 @@ Plan B 是写路径，以下 7 条经实测，修正或补充 §2.1 与 §5–§
    普通 JSON merge 足够，不需要特殊处理；只需保留未知的顶层键。远端 MCP 是同一个键下的
    `{ url, headers }`（2026-09-28 实测：kimi 自己的文档字符串写「A minimal http entry needs
    `url`」，字段映射表把 codex 的 `http_headers` 对成 `headers`），**没有 `type`**——与 claude
-   那份靠 `type` 区分传输的写法不同。
+   那份靠 `type` 区分传输的写法不同。`env` 与 `headers` 的值都是**字面量**（`mergeStdioEnv`
+   直接 `Object.assign`、`buildMcpRemoteHeaders` 直接 `{ ...config.headers }`），所以凭据在
+   它这儿只有 `bearerTokenEnvVar` 一条通道——三种取值方式见 §9.6。
 
 5. **两家配置目录都没有 `.bak` 残留** ⇒ `.bak` 是 Plan B 新引入的约定，**没有历史包袱要兼容**，
    命名与轮转规则可以自由定（§9.7）。
@@ -785,24 +787,46 @@ codex」正是这么写的）。理由同 §9.3：那份内容是**清单要求�
 `args`/`env` 只跟 `command` 走、`headers` 只跟 `url` 走。`headers` 的值与 `env` 同一条门禁：
 必须是裸 `${VAR}` 引用，字面量拒绝（那正是放凭据的地方）。
 
-三家对这两种形态的**字段拼法各不相同**，读写两侧都按这张表：
+三家对这两种形态的**拼法各不相同**，读写两侧都按这张表：
 
-| harness | stdio | http |
+| harness | 条目骨架 | 凭据怎么写 |
 |---|---|---|
-| claude-code | `command` / `args` / `env` | `type: "http"` + `url` + `headers` |
-| codex | `command` / `args` / `env`（**不写 `type`**） | `url` + `[mcp_servers.<n>.http_headers]` |
-| kimi-code | `command` / `args` / `env`（**不写 `type`**） | `url` + `headers` |
+| claude-code | stdio：`command` / `args`；http：`type: "http"` + `url` | `env` / `headers` 里**原样写** `${VAR}`——它会展开 |
+| codex | 同上，**不写 `type`** | stdio 走 `env_vars = ["VAR"]`（同名转发）；http 走 `[mcp_servers.<n>.env_http_headers]`，表里是「头名 → 变量名」 |
+| kimi-code | stdio：`command` / `args`；http：`url`（**不写 `type`**） | **写不出来**，见下 |
 
-- **claude 靠 `type` 区分传输**：上面那份 plugin 里是 `type: "http"`，stdio 条目则是
-  `type: "stdio"`（本机 `~/.claude.json` 的 `kimi-cu` 就是这样）。写路径是 shell out，
-  JSON 载荷原样交给 claude——隔离 HOME 实测 `claude mcp add-json -s user` 收下
-  `{"type":"http","url":…,"headers":…}` 并**逐字**写进 `~/.claude.json`。
-- **codex 把请求头叫 `http_headers`**（`headers` 是 SDK 侧的写法），而且 `type` 可省：
-  隔离 `CODEX_HOME` 实测，只写 `command` 的条目与只写 `url` + `http_headers` 的条目都被
-  `codex mcp list` 正常识别（后者显示 Auth = Bearer token）。henv 因此**不写 `type`**——
-  少一个字段就少一处要跟上游对齐的拼法。
-- **kimi 两者都不用**：它的 http 条目就是 `url` + `headers`（§2.2 第 4 条的实测），多一个
-  `type` 只会是个它不认识的键。
+骨架那几列的依据：claude 靠 `type` 区分传输（它自己那份 plugin 就是 `type: "http"`，
+stdio 条目则是 `type: "stdio"`，本机 `~/.claude.json` 的 `kimi-cu` 即如此）；codex 与 kimi
+都靠字段本身推（隔离 `CODEX_HOME` 实测，只写 `command` 的条目与只写 `url` + 请求头的条目
+都被 `codex mcp list` 正常识别），所以 henv 不写 `type`——少一个字段就少一处要跟上游对齐的
+拼法。
+
+**凭据那一列是 2026-09-28 实测出来的，与骨架同等重要：`${VAR}` 不是每家都会展开。**
+把它当字面量写进去，服务端收到的就是这段文本，而**没有任何一方会报错**——henv 比的是自己
+写下的规范形态，`diff` 于是永远报 `in-sync`。逐家的证据：
+
+- **claude 会展开**：它自己那份 context7 plugin 写的就是 `Authorization: ${CONTEXT7_API_KEY:-}`，
+  而 `claude mcp list` 会为解析不了的引用报「Missing environment variables」。
+- **codex 不展开**：`codex doctor` 只对 `env_vars` / `env_http_headers` /
+  `bearer_token_env_var` 报「env var … is not set」；把 `${CONTEXT7_API_KEY}` 放进
+  `http_headers` 或 `env` 时一声不响。`codex mcp add --env <KEY=VALUE>` 的说明也是
+  「Environment variables to set when launching the server」——字面量。
+- **kimi 不展开**：`buildMcpRemoteHeaders` 直接 `{ ...config.headers }`，stdio 的
+  `mergeStdioEnv` 直接 `Object.assign(merged, configEnv)`。它唯一的环境取值通道
+  `bearerTokenEnvVar` **固定发 `Bearer <token>`**。
+
+**表达不了的条目报 `undeliverable`，绝不退化成字面量。** 判据是纯函数
+`adapters::mcp_expressible`：`diff` 用它把**要写盘的动作**（`install` / `update`）改判成
+`undeliverable`，`in-sync` / `conflict` / `unknown` 照旧保留——那三个回答的是「本机现在是
+不是清单要的」，与能不能写无关。两条已知缺口都在 kimi 上，理由分别是：
+
+- `Authorization: ${VAR}` 这种**裸值**在 kimi 上没有写法：它的 `headers` 是字面量，而
+  `bearerTokenEnvVar` 会加上 `Bearer ` 前缀。那个前缀是一层语义，henv 不替用户决定。
+- stdio 的 `env`（哪怕同名）同样写不了：kimi 的 `env` 是字面量，henv 不会把值写死进配置。
+
+codex 那边唯一的缺口是**换名映射**（`K: ${OTHER}`）：它的 `env_vars` 只按原名转发。
+这三条都由 `mcp_expressible` 一句话说清，写器里再各留一道闸——计划错了也不会有半个字面量
+落到配置里。
 
 **传输类型进哈希。** `store::hash::hash_mcp_spec(&McpTransport)` 把形态作为首字节掺进去
 （`b"s"` / `b"h"`），于是「同一个名字从 stdio 换成 http」在账本上就是一次改动，`diff` 报

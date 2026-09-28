@@ -73,24 +73,41 @@ impl Codex {
             // `command` 缺键才是 `""`——「没有 command」和「command 是空串」同为没配；
             // `command = 5` 是故障。
             let transport = match toml_optional_string(cfg, "url", file, &context)? {
-                Some(url) => McpTransport::Http {
-                    url: url.to_string(),
-                    headers: toml_string_map(
-                        cfg.get("http_headers"),
+                Some(url) => {
+                    let mut headers =
+                        toml_string_map(cfg.get("http_headers"), file, &context, "http_headers")?;
+                    // `env_http_headers` 是「头名 → 变量名」——那才是**从环境取值**，
+                    // 读回成 `${VAR}` 引用（写路径就是那么写的，见 `mcp_toml`）。
+                    // 同一个头两边都有时以它为准：那也是 codex 侧取值的那个。
+                    for (header, var) in toml_string_map(
+                        cfg.get("env_http_headers"),
                         file,
                         &context,
-                        "http_headers",
-                    )?,
-                },
-                None => McpTransport::Stdio {
-                    command: toml_optional_string(cfg, "command", file, &context)?
-                        .unwrap_or_default()
-                        .to_string(),
-                    args: toml_string_array(cfg.get("args"), file, &context, "args")?,
-                    // 保持 `${VAR}` 引用形态，绝不展开。报错只到键名为止——actual 侧的
-                    // 值可能就是明文密钥，而这条消息会进终端输出和 Task 14 的快照。
-                    env: toml_string_map(cfg.get("env"), file, &context, "env")?,
-                },
+                        "env_http_headers",
+                    )? {
+                        headers.insert(header, format!("${{{var}}}"));
+                    }
+                    McpTransport::Http {
+                        url: url.to_string(),
+                        headers,
+                    }
+                }
+                None => {
+                    let mut env = toml_string_map(cfg.get("env"), file, &context, "env")?;
+                    // `env_vars` 是 codex 的**同名转发**：清单侧的等价写法就是 `K: ${K}`。
+                    for var in toml_string_array(cfg.get("env_vars"), file, &context, "env_vars")? {
+                        env.insert(var.clone(), format!("${{{var}}}"));
+                    }
+                    McpTransport::Stdio {
+                        command: toml_optional_string(cfg, "command", file, &context)?
+                            .unwrap_or_default()
+                            .to_string(),
+                        args: toml_string_array(cfg.get("args"), file, &context, "args")?,
+                        // 保持 `${VAR}` 引用形态，绝不展开。报错只到键名为止——actual 侧的
+                        // 值可能就是明文密钥，而这条消息会进终端输出和 Task 14 的快照。
+                        env,
+                    }
+                }
             };
 
             out.push(Capability {
@@ -704,7 +721,8 @@ env = {}
 
     /// `[mcp_servers]` 写了头却没配任何 server：类型对且为空 = 合法空结果，不是故障。
     /// 与 `mcp_servers_key_that_is_not_a_table_...` 一起把「空」和「坏」分开钉。
-    /// 远端 MCP：codex 用 `url` + `http_headers`（与 claude 的 `type: http` 拼法不同）。
+    /// 远端 MCP：codex 用 `url`；请求头有两种写法——`http_headers` 是**字面量**，
+    /// `env_http_headers` 才是「从环境取值」（值与写路径对称，见下一条测试）。
     #[test]
     fn reads_an_http_mcp_server() {
         let t = TempHome::new();
@@ -721,6 +739,48 @@ env = {}
             } => {
                 assert_eq!(url, "https://mcp.context7.com/mcp");
                 assert_eq!(headers["Authorization"], "${K}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `env_http_headers` 是「头名 → 变量名」：读回来必须是 `${VAR}` 引用，否则
+    /// 「henv 自己按这个写法交付的条目」在下一轮 diff 会被报成 update（写下去的和读回来
+    /// 的不是一个形状），或者更糟——被当成字面量。
+    #[test]
+    fn reads_env_http_headers_as_references() {
+        let t = TempHome::new();
+        write_config(
+            &t,
+            "[mcp_servers.ctx]\nurl = \"https://mcp.context7.com/mcp\"\n\
+             [mcp_servers.ctx.env_http_headers]\nAuthorization = \"CONTEXT7_API_KEY\"\n",
+        );
+        let caps = Codex::new(t.home.clone()).read_state().unwrap();
+        match &find(&caps, Kind::Mcp, "ctx").unwrap().spec {
+            Spec::Mcp {
+                transport: McpTransport::Http { headers, .. },
+                ..
+            } => assert_eq!(headers["Authorization"], "${CONTEXT7_API_KEY}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `env_vars` 是**同名转发**：清单侧的等价写法就是 `K: ${K}`。
+    #[test]
+    fn reads_env_vars_as_same_name_references() {
+        let t = TempHome::new();
+        write_config(
+            &t,
+            "[mcp_servers.ctx]\ncommand = \"npx\"\nenv_vars = [\"K\", \"W\"]\n",
+        );
+        let caps = Codex::new(t.home.clone()).read_state().unwrap();
+        match &find(&caps, Kind::Mcp, "ctx").unwrap().spec {
+            Spec::Mcp {
+                transport: McpTransport::Stdio { env, .. },
+                ..
+            } => {
+                assert_eq!(env["K"], "${K}");
+                assert_eq!(env["W"], "${W}");
             }
             other => panic!("{other:?}"),
         }

@@ -15,6 +15,11 @@ use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
 /// **整棵替换而不是逐键 merge**：清单改了一版之后，上一版多出来的 `args` / `env`
 /// 会留在新配置里，用户得到一份混着两版设置的配置。
 ///
+/// **凭据写成 codex 的取值字段，不写成 `${VAR}` 文本**（2026-09-28 实测）：codex 的
+/// `env` / `http_headers` 是**字面量**，把引用写进去它会原样发出去；从环境取值它另有
+/// `env_vars`（同名转发）与 `env_http_headers`（头名 → 变量名）。写成哪一个是
+/// [`crate::adapters::mcp_expressible`] 判的，这里只负责拼对。
+///
 /// 失败一律**不动文件**（`write_config` 的 rename 保证）：读不出来、解不开、
 /// 类型不对，都在这儿停下。
 pub fn upsert_codex_mcp(target: &Path, name: &str, transport: &McpTransport) -> anyhow::Result<()> {
@@ -34,9 +39,33 @@ pub fn upsert_codex_mcp(target: &Path, name: &str, transport: &McpTransport) -> 
         .entry("mcp_servers")
         .or_insert(Item::Table(Table::new()));
     let mut slots = Slots::of(item, target)?;
-    slots.replace(name, transport);
+    slots.replace(name, transport)?;
 
     write_config(target, doc.to_string().as_bytes())
+}
+
+/// 清单里的 `${VAR}` → 那个**变量名**。codex 的取值字段收的是变量名，不是引用文本。
+///
+/// 不是引用就报错而不是照抄：照抄的后果是 codex 把 `${VAR}` 这段文本当值发出去，
+/// 而那正是这次要根治的静默失败。计划侧（`mcp_expressible`）本来就不该放它过来，
+/// 这里是第二道闸——写不忠实，宁可失败。
+fn ref_var(value: &str) -> anyhow::Result<&str> {
+    crate::secrets::parse_ref(value).ok_or_else(|| {
+        anyhow::anyhow!("value is not a bare ${{VAR}} reference; refusing to write it")
+    })
+}
+
+/// 一条 stdio `env` 项 → codex `env_vars` 里的那个变量名。
+///
+/// codex 的 `env_vars` 是**同名转发**（子进程按原名拿到环境变量）：清单里 `K: ${K}`
+/// 正是它，`K: ${OTHER}` 在它这儿没有写法——那要求把环境变量换个名字塞给子进程，
+/// 而 `env` 只能放字面量。计划侧已经判过一遍，这里是第二道闸。
+fn forwarded_var<'a>(key: &str, value: &'a str) -> anyhow::Result<&'a str> {
+    let var = ref_var(value)?;
+    if var != key {
+        anyhow::bail!("codex forwards an env var under its own name only (`{key}` <- `{var}`)");
+    }
+    Ok(var)
 }
 
 /// 从 codex 的 `config.toml` 里摘掉 `[mcp_servers.<name>]`（`upsert_codex_mcp` 的逆操作，§9.8）。
@@ -94,7 +123,7 @@ impl<'a> Slots<'a> {
         }
     }
 
-    fn replace(&mut self, name: &str, transport: &McpTransport) {
+    fn replace(&mut self, name: &str, transport: &McpTransport) -> anyhow::Result<()> {
         match self {
             // 块表可以装子表，env 因此能写成 `[mcp_servers.<n>.env]`，
             // 与 codex 自己写出来的形状一致。
@@ -111,22 +140,22 @@ impl<'a> Slots<'a> {
                             server.insert("args", toml_edit::value(arr));
                         }
                         if !env.is_empty() {
-                            let mut e = Table::new();
+                            let mut vars = toml_edit::Array::new();
                             for (k, v) in env {
-                                e.insert(k, toml_edit::value(v.as_str()));
+                                vars.push(forwarded_var(k, v)?);
                             }
-                            server.insert("env", Item::Table(e));
+                            server.insert("env_vars", toml_edit::value(vars));
                         }
                     }
-                    // 远端 MCP：codex 把请求头放在 `http_headers`（读路径也认这个拼写）。
+                    // 远端 MCP：凭据走 `env_http_headers`（头名 → 变量名）。
                     McpTransport::Http { url, headers } => {
                         server.insert("url", toml_edit::value(url));
                         if !headers.is_empty() {
                             let mut h = Table::new();
-                            for (k, v) in headers {
-                                h.insert(k, toml_edit::value(v.as_str()));
+                            for (header, value) in headers {
+                                h.insert(header, toml_edit::value(ref_var(value)?));
                             }
-                            server.insert("http_headers", Item::Table(h));
+                            server.insert("env_http_headers", Item::Table(h));
                         }
                     }
                 }
@@ -146,27 +175,28 @@ impl<'a> Slots<'a> {
                             server.insert("args", Value::Array(arr));
                         }
                         if !env.is_empty() {
-                            let mut e = InlineTable::new();
+                            let mut vars = toml_edit::Array::new();
                             for (k, v) in env {
-                                e.insert(k, v.as_str().into());
+                                vars.push(forwarded_var(k, v)?);
                             }
-                            server.insert("env", Value::InlineTable(e));
+                            server.insert("env_vars", Value::Array(vars));
                         }
                     }
                     McpTransport::Http { url, headers } => {
                         server.insert("url", url.into());
                         if !headers.is_empty() {
                             let mut h = InlineTable::new();
-                            for (k, v) in headers {
-                                h.insert(k, v.as_str().into());
+                            for (header, value) in headers {
+                                h.insert(header, ref_var(value)?.into());
                             }
-                            server.insert("http_headers", Value::InlineTable(h));
+                            server.insert("env_http_headers", Value::InlineTable(h));
                         }
                     }
                 }
                 t.insert(name, Value::InlineTable(server));
             }
         }
+        Ok(())
     }
 
     /// 摘掉一条 MCP 子树，返回是否真的摘到了（§9.8 的撤销原语）。
@@ -207,13 +237,14 @@ mod tests {
         vec!["-y".to_string(), "@upstash/context7-mcp".to_string()]
     }
 
-    /// codex 的远端 MCP：`url` + `http_headers`（与 kimi 的 `headers` 拼法不同，
-    /// 与自家读路径必须一致）。
+    /// 远端 MCP 的凭据走 `env_http_headers`（头名 → 变量名），**不是** `http_headers`：
+    /// 后者是字面量，写进去 codex 会把 `${K}` 原样发出去（2026-09-28 实测，判据见
+    /// `adapters::mcp_expressible`）。
     #[test]
-    fn writes_an_http_server_with_url_and_http_headers() {
+    fn writes_an_http_server_with_url_and_env_http_headers() {
         let t = TempHome::new();
         let p = t.path(".codex/config.toml");
-        upsert_codex_mcp(&p, "ctx", &stdio_t("npx", &args2(), &env1())).unwrap();
+        upsert_codex_mcp(&p, "ctx", &stdio_t("npx", &args2(), &BTreeMap::new())).unwrap();
 
         let mut headers = BTreeMap::new();
         headers.insert("Authorization".to_string(), "${K}".to_string());
@@ -233,8 +264,16 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("[mcp_servers.ctx.http_headers]"),
-            "请求头要用 codex 自己的拼写：{text}"
+            text.contains("[mcp_servers.ctx.env_http_headers]"),
+            "凭据要走 codex 的取值表：{text}"
+        );
+        assert!(
+            text.contains("Authorization = \"K\""),
+            "表里放的是变量名，不是引用文本：{text}"
+        );
+        assert!(
+            !text.contains("[mcp_servers.ctx.http_headers]"),
+            "字面量表里不许出现这条凭据：{text}"
         );
         assert!(
             !text.contains("command"),
@@ -253,7 +292,8 @@ mod tests {
         let s = &doc["mcp_servers"]["context7"];
         assert_eq!(s["command"].as_str(), Some("npx"));
         assert_eq!(s["args"][0].as_str(), Some("-y"));
-        assert_eq!(s["env"]["K"].as_str(), Some("${K}"), "引用不许展开");
+        assert_eq!(s["env_vars"][0].as_str(), Some("K"), "同名转发要写成变量名");
+        assert!(s.get("env").is_none(), "`env` 是字面量，凭据不该出现在那儿");
     }
 
     /// §9.10 的 merge-safe：用户文件里**别的**东西一个字节都不许变。
@@ -410,26 +450,27 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap(), before);
     }
 
-    /// env 的值原样落盘，一个字节都不改——包括看起来像 shell 的东西。
+    /// stdio 的 env：**同名转发**（`K: ${K}`）写成 `env_vars`；换个变量名（`W: ${A_B1}`）
+    /// 在 codex 上没有写法，宁可报错也不写一个假的。
     #[test]
-    fn env_values_are_written_verbatim() {
+    fn stdio_env_becomes_env_vars_and_renames_are_refused() {
         let t = TempHome::new();
         let p = t.path(".codex/config.toml");
-        let mut e = BTreeMap::new();
-        e.insert("K".to_string(), "${K}".to_string());
-        e.insert("W".to_string(), "${A_B1}".to_string());
-        upsert_codex_mcp(&p, "context7", &stdio_t("npx", &[], &e)).unwrap();
+        upsert_codex_mcp(&p, "context7", &stdio_t("npx", &[], &env1())).unwrap();
 
         let text = std::fs::read_to_string(&p).unwrap();
         let doc: toml::Value = toml::from_str(&text).unwrap();
         assert_eq!(
-            doc["mcp_servers"]["context7"]["env"]["K"].as_str(),
-            Some("${K}")
+            doc["mcp_servers"]["context7"]["env_vars"][0].as_str(),
+            Some("K")
         );
-        assert_eq!(
-            doc["mcp_servers"]["context7"]["env"]["W"].as_str(),
-            Some("${A_B1}")
-        );
+
+        let before = std::fs::read(&p).unwrap();
+        let mut renamed = BTreeMap::new();
+        renamed.insert("W".to_string(), "${A_B1}".to_string());
+        let err = upsert_codex_mcp(&p, "other", &stdio_t("npx", &[], &renamed)).unwrap_err();
+        assert!(format!("{err:#}").contains("own name"), "{err:#}");
+        assert_eq!(std::fs::read(&p).unwrap(), before, "报错就不能动文件");
     }
 
     /// Review Focus 5：键不在就逐字节不动（这里连注释一起钉住），也不落 `.bak`。

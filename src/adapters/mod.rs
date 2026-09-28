@@ -6,7 +6,7 @@ pub mod kimi_code;
 
 use crate::apply::HarnessReport;
 use crate::apply::mcp::McpTarget;
-use crate::capability::{Capability, SkillSource, Support};
+use crate::capability::{Capability, McpTransport, SkillSource, Support};
 use crate::diff::HarnessPlan;
 use crate::home::Home;
 use crate::skills_dir::{SkillEntry, SkillStore, plugin_from_path};
@@ -27,6 +27,67 @@ pub const CLAUDE_CODE: &str = "claude-code";
 pub const CODEX: &str = "codex";
 /// 见 [`CLAUDE_CODE`]。
 pub const KIMI_CODE: &str = "kimi-code";
+
+/// 一条 MCP 在某家能不能**忠实**写成它的配置形态（§9.6）。
+///
+/// 「忠实」是关键：语法上写得出一个键，但它发出去的东西与清单要的不是一回事，那不算
+/// 表达得了。三家实测（2026-09-28）的取值通道完全不同：
+///
+/// - **claude-code 会展开 `${VAR}`**：它自己那份 context7 plugin 就写着
+///   `Authorization: ${CONTEXT7_API_KEY:-}`，`claude mcp list` 也会为难解析的引用报
+///   「Missing environment variables」。所以在它那儿把引用写进 `env` / `headers`
+///   就是「取这个环境变量」，**永远是忠实的**。
+/// - **codex 的 `env` / `http_headers` 是字面量**：`codex doctor` 只对
+///   `env_vars` / `env_http_headers` / `bearer_token_env_var` 报「env var … is not set」，
+///   把 `${CONTEXT7_API_KEY}` 写进 `http_headers` 时一声不响（= 按字面量发出去）。
+///   从环境取值只有那两个专用字段，且 `env_vars` 是**同名转发**。
+/// - **kimi-code 的 `env` / `headers` 也是字面量**：它的 `mergeStdioEnv` 直接
+///   `Object.assign(merged, configEnv)`，`buildMcpRemoteHeaders` 直接 `{ ...config.headers }`。
+///   唯一的环境取值通道是 `bearerTokenEnvVar`，而它**固定发 `Bearer <token>`**——
+///   把裸值 `Authorization: ${VAR}` 映射过去会悄悄改掉语义，宁可说交付不了。
+///
+/// 返回 `Err(理由)` 由 [`crate::diff`] 转成 `undeliverable`：**要写盘的动作**改判，
+/// 对账结果（in-sync / conflict / unknown）保留——它们回答的是「本机现在是不是清单要的」。
+pub(crate) fn mcp_expressible(harness: &str, transport: &McpTransport) -> Result<(), String> {
+    match (harness, transport) {
+        // claude 展开引用，两种传输、处处都忠实。
+        (CLAUDE_CODE, _) => Ok(()),
+        (CODEX, McpTransport::Stdio { env, .. }) => {
+            for (key, value) in env {
+                // 同名转发（`K: ${K}`）就是 codex 的 `env_vars`；换个名字它没有对应写法。
+                if crate::secrets::parse_ref(value) != Some(key.as_str()) {
+                    return Err(format!(
+                        "codex 的 `env` 只收字面量，从环境取值只能**同名**转发（`env_vars`）；\
+                         `{key}` 映射到别的变量名表达不了"
+                    ));
+                }
+            }
+            Ok(())
+        }
+        (CODEX, McpTransport::Http { .. }) => Ok(()),
+        (KIMI_CODE, McpTransport::Stdio { env, .. }) => {
+            if env.is_empty() {
+                return Ok(());
+            }
+            Err(
+                "kimi-code 的 MCP `env` 是字面量（不做 `${VAR}` 展开），henv 不会把值写死进配置"
+                    .to_string(),
+            )
+        }
+        (KIMI_CODE, McpTransport::Http { headers, .. }) => {
+            if headers.is_empty() {
+                return Ok(());
+            }
+            Err(
+                "kimi-code 的 MCP `headers` 是字面量，它唯一的环境取值通道 `bearerTokenEnvVar` \
+                 固定发 `Bearer <token>`；`Authorization: ${VAR}` 这种裸值表达不了"
+                    .to_string(),
+            )
+        }
+        // 只有上面三家；多出来的名字是 registry 出错，不该在这儿假装判断过。
+        (other, _) => Err(format!("unknown harness `{other}`")),
+    }
+}
 
 /// 一条 skill 条目（`try_read_skill_entries` 的产物）→ 清单侧那个来源。
 ///

@@ -340,6 +340,15 @@ fn mcp_verdict(
     }
 }
 
+/// 这条 MCP 在这家有没有**忠实**的写法（判据与三家的实测依据见
+/// [`crate::adapters::mcp_expressible`]）。不是 MCP、或写得出来 → `None`。
+fn mcp_shape_problem(harness: &str, cap: &Capability) -> Option<String> {
+    let Spec::Mcp { transport } = &cap.spec else {
+        return None;
+    };
+    crate::adapters::mcp_expressible(harness, transport).err()
+}
+
 /// 内容层判得动就内容层，判不动就账本层（§9.6）。
 ///
 /// 两层的适用面互斥：`content_verdict` 只认 `Spec::Skill`（第一行 `content.sources.get`），
@@ -721,6 +730,19 @@ pub fn compute(
                         } else {
                             action
                         };
+                    // §9.6：这家写不出这条 MCP 的**忠实**形态时，要写盘的动作改判
+                    // undeliverable——与上面 plugin 那条同一个形状、同一个理由：计划
+                    // 不该承诺做不到的事。**对账结果保留**（in-sync / conflict / unknown
+                    // 回答的是「本机现在是不是清单要的」，与能不能写无关）。
+                    //
+                    // 不放进 `supports()`：那条路会让本机已经有的同名条目同时掉进 drift，
+                    // 一条能力报两行。这里只改「要做的事」，不动「已经是什么」。
+                    let action = match (mcp_shape_problem(&state.name, cap), &action) {
+                        (Some(reason), Action::Install | Action::Update { .. }) => {
+                            Action::Undeliverable { reason }
+                        }
+                        _ => action,
+                    };
                     // 已经是 undeliverable 的行自带 reason，再挂一遍注记是同一句话说两遍。
                     let note = match unresolved {
                         Some(Unresolved::Deferred(r) | Unresolved::Failed(r))

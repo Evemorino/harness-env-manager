@@ -41,24 +41,35 @@ pub fn upsert_kimi_mcp(target: &Path, name: &str, transport: &McpTransport) -> a
         .ok_or_else(|| anyhow::anyhow!("{}: `mcpServers` must be an object", target.display()))?;
 
     // 整棵替换：上一版多出来的 args / env 不许留在新配置里。
+    //
+    // **凭据字段一个都不写**（2026-09-28 实测）：kimi 的 `env` / `headers` 是字面量
+    // （`mergeStdioEnv` 直接 `Object.assign`、`buildMcpRemoteHeaders` 直接
+    // `{ ...config.headers }`），把 `${VAR}` 写进去它会把这段文本原样发出去。它唯一
+    // 的环境取值通道 `bearerTokenEnvVar` 固定发 `Bearer <token>`，与清单里
+    // `Authorization: ${VAR}` 这种裸值不是一回事——所以带凭据的条目在 kimi 上是
+    // `undeliverable`（`mcp_expressible` 判的），走到这里还带着凭据就是计划错了。
     let mut server = serde_json::Map::new();
     match transport {
         McpTransport::Stdio { command, args, env } => {
+            if !env.is_empty() {
+                anyhow::bail!(
+                    "kimi-code cannot express MCP env values; refusing to write them literally"
+                );
+            }
             server.insert("command".into(), command.as_str().into());
             if !args.is_empty() {
                 server.insert("args".into(), serde_json::json!(args));
-            }
-            if !env.is_empty() {
-                server.insert("env".into(), serde_json::json!(env));
             }
         }
         // kimi 的远端 MCP 没有 `type` 字段（实测它的配置里只有 url/headers——
         // 与 claude 那份不同，那边靠 `type` 区分传输）。
         McpTransport::Http { url, headers } => {
-            server.insert("url".into(), url.as_str().into());
             if !headers.is_empty() {
-                server.insert("headers".into(), serde_json::json!(headers));
+                anyhow::bail!(
+                    "kimi-code cannot express MCP header values; refusing to write them literally"
+                );
             }
+            server.insert("url".into(), url.as_str().into());
         }
     }
     servers.insert(name.to_string(), serde_json::Value::Object(server));
@@ -131,22 +142,20 @@ mod tests {
         vec!["-y".to_string(), "@upstash/context7-mcp".to_string()]
     }
 
-    /// http 型写出来的是 `url` + `headers`，**没有 `command`**——整棵替换的语义要覆盖到
-    /// 换形态这一层（上一版是 stdio，这一版是 http，旧字段不许留下）。
+    /// http 型写出来的是 `url`，**没有 `command`**——整棵替换的语义要覆盖到换形态这一层
+    /// （上一版是 stdio，这一版是 http，旧字段不许留下）。
     #[test]
     fn writes_an_http_server_and_drops_the_stdio_fields() {
         let t = TempHome::new();
         let p = t.path(".kimi-code/mcp.json");
-        upsert_kimi_mcp(&p, "ctx", &stdio_t("npx", &args2(), &env1())).unwrap();
+        upsert_kimi_mcp(&p, "ctx", &stdio_t("npx", &args2(), &BTreeMap::new())).unwrap();
 
-        let mut headers = BTreeMap::new();
-        headers.insert("Authorization".to_string(), "${K}".to_string());
         upsert_kimi_mcp(
             &p,
             "ctx",
             &McpTransport::Http {
                 url: "https://mcp.context7.com/mcp".to_string(),
-                headers,
+                headers: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -155,27 +164,59 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         let s = &v["mcpServers"]["ctx"];
         assert_eq!(s["url"], "https://mcp.context7.com/mcp");
-        assert_eq!(s["headers"]["Authorization"], "${K}");
         assert!(
             s["command"].is_null(),
             "换成 http 后旧 command 不许留下：{text}"
         );
         assert!(s["args"].is_null(), "换成 http 后旧 args 不许留下：{text}");
+        assert!(
+            s.get("headers").is_none(),
+            "没有请求头就不该写这个键：{text}"
+        );
+    }
+
+    /// **带凭据的条目在 kimi 上写不出来**（2026-09-28 实测：它的 `env` / `headers` 是
+    /// 字面量，会把 `${VAR}` 原样发出去）。写器宁可失败，也不写一个假的。
+    #[test]
+    fn credential_values_are_refused_instead_of_written_literally() {
+        let t = TempHome::new();
+        let p = t.path(".kimi-code/mcp.json");
+        t.write(".kimi-code/mcp.json", "{\"keep\": 1}\n");
+        let before = std::fs::read(&p).unwrap();
+
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".to_string(), "${K}".to_string());
+        let err = upsert_kimi_mcp(
+            &p,
+            "ctx",
+            &McpTransport::Http {
+                url: "https://mcp.context7.com/mcp".to_string(),
+                headers,
+            },
+        )
+        .unwrap_err();
+        assert!(format!("{err:#}").contains("cannot express"), "{err:#}");
+
+        let err = upsert_kimi_mcp(&p, "ctx", &stdio_t("npx", &[], &env1())).unwrap_err();
+        assert!(format!("{err:#}").contains("cannot express"), "{err:#}");
+
+        assert_eq!(std::fs::read(&p).unwrap(), before, "拒绝就不能动文件");
     }
 
     #[test]
     fn writes_into_a_fresh_file() {
         let t = TempHome::new();
         let p = t.path(".kimi-code/mcp.json");
-        upsert_kimi_mcp(&p, "context7", &stdio_t("npx", &args2(), &env1())).unwrap();
+        upsert_kimi_mcp(&p, "context7", &stdio_t("npx", &args2(), &BTreeMap::new())).unwrap();
 
         let text = std::fs::read_to_string(&p).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["mcpServers"]["context7"]["command"], "npx");
         assert_eq!(v["mcpServers"]["context7"]["args"][0], "-y");
         assert_eq!(
-            v["mcpServers"]["context7"]["env"]["K"], "${K}",
-            "引用不许展开"
+            v["mcpServers"]["context7"].get("env"),
+            None,
+            "kimi 写不出 env 取值，空 env 就不该有这个键"
         );
     }
 
@@ -204,7 +245,7 @@ mod tests {
     fn replacing_a_server_drops_stale_keys() {
         let t = TempHome::new();
         let p = t.path(".kimi-code/mcp.json");
-        upsert_kimi_mcp(&p, "context7", &stdio_t("npx", &args2(), &env1())).unwrap();
+        upsert_kimi_mcp(&p, "context7", &stdio_t("npx", &args2(), &BTreeMap::new())).unwrap();
         upsert_kimi_mcp(&p, "context7", &stdio_t("uvx", &[], &BTreeMap::new())).unwrap();
 
         let v: serde_json::Value =
@@ -297,22 +338,6 @@ mod tests {
         assert_eq!(std::fs::read(&p).unwrap(), before);
     }
 
-    /// env 的值原样落盘，一个字节都不改——包括看起来像 shell 的东西。
-    #[test]
-    fn env_values_are_written_verbatim() {
-        let t = TempHome::new();
-        let p = t.path(".kimi-code/mcp.json");
-        let mut e = BTreeMap::new();
-        e.insert("K".to_string(), "${K}".to_string());
-        e.insert("W".to_string(), "${A_B1}".to_string());
-        upsert_kimi_mcp(&p, "context7", &stdio_t("npx", &[], &e)).unwrap();
-
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
-        assert_eq!(v["mcpServers"]["context7"]["env"]["K"], "${K}");
-        assert_eq!(v["mcpServers"]["context7"]["env"]["W"], "${A_B1}");
-    }
-
     /// Review Focus 5：键不在就**一个字节都不动**，也不落 `.bak`。
     /// 夹具里有意留了另一个 server 与一个顶层键——「不动」是逐字节的。
     #[test]
@@ -356,7 +381,7 @@ mod tests {
             &stdio_t("their-binary", &[], &BTreeMap::new()),
         )
         .unwrap();
-        upsert_kimi_mcp(&p, "context7", &stdio_t("npx", &args2(), &env1())).unwrap();
+        upsert_kimi_mcp(&p, "context7", &stdio_t("npx", &args2(), &BTreeMap::new())).unwrap();
 
         remove_kimi_mcp(&p, "context7").unwrap();
 
