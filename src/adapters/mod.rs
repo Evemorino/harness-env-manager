@@ -6,9 +6,10 @@ pub mod kimi_code;
 
 use crate::apply::HarnessReport;
 use crate::apply::mcp::McpTarget;
-use crate::capability::{Capability, Support};
+use crate::capability::{Capability, SkillSource, Support};
 use crate::diff::HarnessPlan;
 use crate::home::Home;
+use crate::skills_dir::{SkillEntry, SkillStore, plugin_from_path};
 use crate::store::provenance::Ledger;
 use crate::store::skills::ContentIndex;
 use std::path::PathBuf;
@@ -26,6 +27,35 @@ pub const CLAUDE_CODE: &str = "claude-code";
 pub const CODEX: &str = "codex";
 /// 见 [`CLAUDE_CODE`]。
 pub const KIMI_CODE: &str = "kimi-code";
+
+/// 一条 skill 条目（`try_read_skill_entries` 的产物）→ 清单侧那个来源。
+///
+/// 判据只有一份：四个分支（共享库 / 插件缓存 / harness 本地 / 说不清）一旦各写一份，
+/// 迟早在某个角落漂移——「共享库」与「插件缓存」的边界尤其如此，而它同时是 drift 豁免位
+/// 与 `supports` 的判据。claude 与 codex 原来各有一份逐字相同的 match，本函数把它们收成一份。
+///
+/// `SkillStore::Shared` 只说明「这条内容的真身落在 `~/.agents/skills` 里」，不代表它由 henv
+/// 放过——它可能是别的工具（`npx skills`、`dws skill setup`）铺的。`supports` 拿它判
+/// 「这家读得到吗」，而不是「这家归 henv 管吗」，正是这个区别。
+pub(crate) fn skill_source_of(entry: &SkillEntry) -> SkillSource {
+    match entry.store {
+        SkillStore::Shared => SkillSource::AgentsDir,
+        // 实测（spec §2.1 第 4 条）：claude/codex 的 skills 里有一批绝对 symlink，直接指向
+        // `~/.claude/plugins/cache/<mp>/<name>/<sha>/skills/<skill>`。
+        SkillStore::PluginCache => {
+            let resolved = entry.resolved.clone().unwrap_or_default();
+            match plugin_from_path(&resolved) {
+                Some(plugin) => SkillSource::PluginBundle { plugin },
+                None => SkillSource::Unknown,
+            }
+        }
+        SkillStore::HarnessLocal => SkillSource::Local {
+            path: entry.resolved.clone().unwrap_or_else(|| entry.path.clone()),
+        },
+        // 断链或指向库外：来源不可判定，交给 doctor 报告
+        SkillStore::Other => SkillSource::Unknown,
+    }
+}
 
 /// 一家 harness 的两件事：本机装没装（`detect`）、装成什么样（`read_state`），
 /// 以及「我们想给它这个能力，它接不接」——`supports`。
@@ -303,22 +333,24 @@ mod tests {
     }
 
     /// Task 12 把 `supports()` 从占位换成真实接纳度矩阵，这条把「kind × harness」的
-    /// **每一格**都钉死：唯一非 Native 的四个格是 kimi 对散装 Skill/Hook/Command/Agent
-    /// （无用户级目录/配置），其余 14 格全部 Native。能力一律用 `FakeAdapter::cap`
-    /// （`Origin::Adopted`）构造——若带 `Origin::Plugin`，kimi 的「bundle 随原生 plugin
-    /// 落地」例外会把那四个 Unsupported 格也判成 Native，整张矩阵就少钉了四格。
-    /// 逐格断言（而非一刀切 `matches!(.., Native | Unsupported { .. })`）正是为了守住
-    /// 「kimi 吃不下散装 skill」这个 degrade-or-not 的判定点，谁把某一格改成别的值都能
-    /// 被定位到。
+    /// **每一格**都钉死：唯一非 Native 的三个格是 kimi 对 Hook/Command/Agent
+    /// （无用户级目录/配置），其余 15 格全部 Native。
+    ///
+    /// `Kind::Skill` 为什么是 Native：`cap_of_kind` 造的 skill 是**共享库来源**，而 kimi
+    /// 读得到共享库——它按来源分岔，那条判据由下一条测试单独钉（2026-09-28 实测修正：
+    /// 旧矩阵把 Skill 归进「kimi 吃不下」，那个假设已经被证伪）。
+    ///
+    /// 能力一律用 `FakeAdapter::cap`（`Origin::Adopted`）构造。逐格断言（而非一刀切
+    /// `matches!(.., Native | Unsupported { .. })`）是为了谁把某一格改成别的值都能被定位到。
     #[test]
-    fn supports_matrix_is_native_except_kimi_loose_skill_hook_command_agent() {
+    fn supports_matrix_is_native_except_kimi_loose_hook_command_agent() {
         let t = TempHome::new();
         let reg = registry(&t.home);
         for kind in Kind::all() {
             let cap = cap_of_kind(kind);
             for a in &reg {
                 let is_kimi_loose = a.name() == KIMI_CODE
-                    && matches!(kind, Kind::Skill | Kind::Hook | Kind::Command | Kind::Agent);
+                    && matches!(kind, Kind::Hook | Kind::Command | Kind::Agent);
                 if is_kimi_loose {
                     assert!(
                         matches!(a.supports(&cap), Support::Unsupported { .. }),
@@ -334,6 +366,40 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `Kind::Skill` 在 kimi 上按**来源**分岔。
+    ///
+    /// 2026-09-28 实测：kimi 的 `USER_GENERIC_DIRS = [".agents/skills"]`，共享库里的 skill
+    /// 它直接读得到——判 `Unsupported` 会让报告对一条已经能用的能力说谎。反过来，
+    /// local / git / bundle 拆解出来的 skill 它确实没有落点（`skills_target_dir()` 是
+    /// `None`），判 `Native` 就成了「报告写着 install、盘上什么都没写」的假成功。
+    #[test]
+    fn kimi_takes_shared_skills_but_not_loose_ones() {
+        let t = TempHome::new();
+        let reg = registry(&t.home);
+        let kimi = lookup(&reg, KIMI_CODE).expect("kimi 在 registry 里");
+
+        assert_eq!(
+            kimi.supports(&cap_of_kind(Kind::Skill)),
+            Support::Native,
+            "`cap_of_kind` 造的正是共享库来源，kimi 读得到"
+        );
+
+        let loose = FakeAdapter::cap(
+            Kind::Skill,
+            "x",
+            Spec::Skill {
+                source: SkillSource::Local {
+                    path: PathBuf::from("/x"),
+                },
+                path: None,
+            },
+        );
+        assert!(
+            matches!(kimi.supports(&loose), Support::Unsupported { .. }),
+            "local 来源的 skill 在 kimi 上没有落点"
+        );
     }
 
     /// `.claude` 是一个**普通文件**或**断链**时，`exists()` 也返回 true，于是 detect 声称

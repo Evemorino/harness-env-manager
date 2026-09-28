@@ -10,8 +10,15 @@ use henv::testutil::TempHome;
 /// 只装 codex。`enabled: false` 那两家连 `pairs` 都不进。
 const ONLY_CODEX: &str = "harnesses:\n  claude-code: { enabled: false }\n  codex: { enabled: true }\n  kimi-code: { enabled: false }\n";
 
-fn manifest_with_foo() -> String {
-    format!("version: 1\n{ONLY_CODEX}skills:\n  foo:\n    source: agents-dir\n")
+/// 一个 **local 源**的 skill：内容放在 `src/foo`，codex 的扫描面里没有它，所以必然要交付。
+///
+/// 不用 agents-dir：那条来源现在是「共享库——读得到的不拷」（2026-09-28 的修正），
+/// codex 会直接判 in-sync，这些测试就钉不住交付与撤销了。
+fn manifest_with_foo(t: &TempHome) -> String {
+    format!(
+        "version: 1\n{ONLY_CODEX}skills:\n  foo:\n    source: local\n    path: {}\n",
+        t.path("src/foo").display()
+    )
 }
 
 fn manifest_without_foo() -> String {
@@ -44,13 +51,13 @@ fn run_apply(t: &TempHome, prune: bool) -> String {
 #[test]
 fn prune_removes_only_the_ledger_recorded_copy() {
     let t = TempHome::new();
-    t.write(".agents/skills/foo/SKILL.md", "# foo");
+    t.write("src/foo/SKILL.md", "# foo");
     t.mkdir(".codex");
     t.write(".codex/skills/handmade/SKILL.md", "# handmade");
     let handmade = std::fs::read(t.path(".codex/skills/handmade/SKILL.md")).unwrap();
 
     // 1) 交付。
-    t.write("env.yaml", &manifest_with_foo());
+    t.write("env.yaml", &manifest_with_foo(&t));
     let out = run_apply(&t, false);
     assert!(t.path(".codex/skills/foo/SKILL.md").exists(), "{out}");
     let ledger = henv::store::provenance::Ledger::load(&t.home).unwrap();
@@ -109,9 +116,9 @@ fn prune_removes_only_the_ledger_recorded_copy() {
 #[test]
 fn prune_is_idempotent() {
     let t = TempHome::new();
-    t.write(".agents/skills/foo/SKILL.md", "# foo");
+    t.write("src/foo/SKILL.md", "# foo");
     t.mkdir(".codex");
-    t.write("env.yaml", &manifest_with_foo());
+    t.write("env.yaml", &manifest_with_foo(&t));
     run_apply(&t, false);
     t.write("env.yaml", &manifest_without_foo());
 

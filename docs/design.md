@@ -93,13 +93,23 @@ skills / MCP / plugins 配置，格式互不兼容。任务写到一半切换 ha
    - `~/.codex/skills/brainstorming → ~/.claude/plugins/cache/claude-plugins-official/superpowers/b36e0829c6d0/skills/brainstorming`
      （codex 直接链进 claude 插件缓存，完全绕过 `.agents`）
    - `~/.claude/skills/{trim-cot-leakage,webapp-testing}` 是不属于任何共享库的真实目录
-   - `~/.kimi-code` **没有** skills 目录；kimi 的 skill 只随 plugin bundle 分发
-     （`plugins/managed/<id>/skills/`）
+   - `~/.kimi-code` 里没有 skills 目录，但 kimi **不是**没有 skill 入口：它原生读共享库
+     `~/.agents/skills`（`USER_GENERIC_DIRS`），另外才随 plugin bundle 分发
+     （`plugins/managed/<id>/skills/`）——见下面的 2026-09-28 修正
 
    **决策**：`read_state` 必须传递解析多跳符号链接、识别断链与环，并对每个条目分类
    `Shared | HarnessLocal | PluginCache | Other`。该分类是 drift 判定（插件缓存内的 skill 不计
-   drift）与 doctor 断链报告的基础。kimi 无用户级 skills 目录 ⇒ 散装 skill 对 kimi 判
-   `Unsupported`，这正是 diff 输出里 `!` 行的真实来源。
+   drift）与 doctor 断链报告的基础。
+
+   **2026-09-28 实测修正（推翻了本条第 4 点的原结论）**：**kimi 与 codex 都原生读
+   `~/.agents/skills`**，只有 claude 需要一条软链。证据：kimi 2.0.2 的二进制里
+   `USER_GENERIC_DIRS = [".agents/skills"]`（另有 `USER_BRAND_DIRS = ["skills"]`、项目级的
+   `.agents/skills` 与 `.kimi-code/skills`），它自带的内置 skill 也写着 "Kimi Code already
+   supports `.agents` skills and AGENTS files by default"；codex 一侧的表现是它的 skill
+   列表里直接出现 `~/.agents/skills` 下的条目。所以「散装 skill 对 kimi 一律判 `Unsupported`」
+   是错的——**判据是来源**：共享库来源（`source: agents-dir`）的 skill 三家都读得到，
+   对 kimi 是 `Native`；local / git / bundle 拆解出来的才在 kimi 上没有落点。原来的写法让
+   diff 对一条已经能用的能力报 `!`，也让 codex 把共享库里的能力重拷一份到自己的目录。
 
 5. **`serde_yaml` 已弃用**（crates.io 实测 `0.9.34+deprecated`）。§8 选型改用维护中的分支
    `serde_yaml_ng = "0.10"`（0.9 的直接 fork，API 兼容）。
@@ -483,8 +493,10 @@ codex `plugins/`）；`scan`；`doctor`；为 kimi 构造 bundle；除 `git` 外
 > **把信息产在报告里**（`ApplyReport` / diff 输出），使 doctor 落地时不必回头改数据结构。
 > 读到时不要把「doctor 里要报 X」理解成「本计划要实现 doctor」。
 
-**kimi 的散装 skill 与拆解出的 skill 仍判 undeliverable**——kimi 没有用户级 skills 目录
-（§2.1 第 4 条），**没有可交付的目标**。这是设计约束不是遗漏，**报告里必须写清楚**。
+**kimi 对散装 skill 的判定按来源分岔**（2026-09-28 修正，见 §2.1 第 4 条）：共享库来源
+（`source: agents-dir`）的 skill 它原生读得到，对账结果是 in-sync；local / git / bundle
+拆解出来的仍判 `undeliverable`——**那才是「没有可交付的目标」**。报告里必须写清楚是哪种，
+否则读者分不出「本来就能用」与「用不了」。
 
 ### 9.2 架构：规划与执行分离
 

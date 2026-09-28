@@ -1,10 +1,10 @@
 use crate::adapters::{CLAUDE_CODE, HarnessAdapter};
 use crate::apply::mcp::{McpMechanism, McpTarget};
 use crate::capability::{
-    CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets, normalize_locator,
+    CapId, Capability, Kind, Origin, Spec, Support, Targets, normalize_locator,
 };
 use crate::home::Home;
-use crate::skills_dir::{SkillStore, plugin_from_path, try_read_skill_entries};
+use crate::skills_dir::try_read_skill_entries;
 use anyhow::Context;
 use anyhow::anyhow;
 use serde_json::{Map, Value};
@@ -31,21 +31,7 @@ impl ClaudeCode {
     fn read_skills(&self) -> anyhow::Result<Vec<Capability>> {
         let mut out = Vec::new();
         for e in try_read_skill_entries(&self.home.claude_skills(), &self.home)? {
-            let source = match e.store {
-                SkillStore::Shared => SkillSource::AgentsDir,
-                SkillStore::PluginCache => {
-                    let resolved = e.resolved.clone().unwrap_or_default();
-                    match plugin_from_path(&resolved) {
-                        Some(plugin) => SkillSource::PluginBundle { plugin },
-                        None => SkillSource::Unknown,
-                    }
-                }
-                SkillStore::HarnessLocal => SkillSource::Local {
-                    path: e.resolved.clone().unwrap_or_else(|| e.path.clone()),
-                },
-                // 断链或指向库外：来源不可判定，交给 doctor 报告
-                SkillStore::Other => SkillSource::Unknown,
-            };
+            let source = crate::adapters::skill_source_of(&e);
             // §9.3：断链没有内容但有路径，自愈要能看见它（见 `SkillEntry::content_path`）。
             // 先取再搬 `e.name`——顺序反了就是对一个被部分移动的值借方法。
             let path = e.content_path();

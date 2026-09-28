@@ -649,13 +649,27 @@ mod tests {
         "version: 1\nskills:\n  foo:\n    source: agents-dir\n"
     }
 
+    /// 「一个 local 源的 skill」清单：内容放在 `src/foo`，**不落在任何 harness 的扫描面里**，
+    /// 所以三家都得真交付。
+    ///
+    /// 交付/撤销机制的那些测试用它而不是 `one_skill_manifest`：agents-dir 的语义现在是
+    /// 「共享库——读得到的不拷」，codex 与 kimi 都会判 in-sync，于是「拷了没有」这类断言
+    /// 不再说明机制是否正常。
+    fn local_skill_manifest(t: &TempHome) -> String {
+        format!(
+            "version: 1\nskills:\n  foo:\n    source: local\n    path: {}\n",
+            t.path("src/foo").display()
+        )
+    }
+
     #[test]
     fn apply_delivers_real_copies_and_records_them() {
         let t = TempHome::new();
-        t.write(".agents/skills/foo/SKILL.md", "# foo");
+        t.write("src/foo/SKILL.md", "# foo");
         t.mkdir(".claude").mkdir(".codex");
+        let manifest = local_skill_manifest(&t);
 
-        let out = apply(&t, one_skill_manifest(), &mut AssumeYes).expect("apply");
+        let out = apply(&t, &manifest, &mut AssumeYes).expect("apply");
         assert!(
             out.contains("~ update") || out.contains("+ install"),
             "{out}"
@@ -683,7 +697,7 @@ mod tests {
                 .find(CLAUDE_CODE, Kind::Skill, "foo")
                 .unwrap()
                 .source_id,
-            "agents-dir"
+            format!("local:{}", t.path("src/foo").display())
         );
         assert!(t.path(".local/state/henv/provenance.json").exists());
     }
@@ -730,12 +744,11 @@ mod tests {
                 .is_symlink(),
             "内容相同就不该动它——形态无关的判定单位正是为了这个"
         );
-        // codex 那边没有条目 → 照常交付真拷贝。
+        // codex 那边也不交付：它原生读 `~/.agents/skills`，这条内容就在它眼前
+        // （2026-09-28 的修正）。只扫 `~/.codex/skills` 时这里会多拷一份。
         assert!(
-            std::fs::symlink_metadata(t.path(".codex/skills/foo"))
-                .unwrap()
-                .file_type()
-                .is_dir()
+            !t.path(".codex/skills/foo").exists(),
+            "共享库来源的能力对 codex 是 in-sync，不该重拷"
         );
     }
 
@@ -856,12 +869,30 @@ mod tests {
     }
 
     #[test]
-    fn kimi_reports_a_loose_skill_as_undeliverable_and_apply_says_so() {
-        // §9.1：kimi 的散装 skill 交付不了，报告要说清楚，且 apply 不许因此失败。
+    fn kimi_reads_a_shared_skill_in_sync_and_never_copies_it() {
+        // 2026-09-28 修正：kimi 原生读 `~/.agents/skills`（它的 `USER_GENERIC_DIRS`），
+        // 所以共享库来源的 skill 在它这儿就是 in-sync——不是「交付不了」，也不该往
+        // `~/.kimi-code/skills` 拷一份。
         let t = TempHome::new();
         t.write(".agents/skills/foo/SKILL.md", "# foo");
         t.mkdir(".kimi-code").mkdir(".claude").mkdir(".codex");
+
         let out = apply(&t, one_skill_manifest(), &mut AssumeYes).unwrap();
+        // 只看行首那行；Plan 汇总里永远有 `0 undeliverable` 这个字样。
+        assert!(!out.contains("! undeliverable"), "{out}");
+        assert!(!t.path(".kimi-code/skills").exists(), "共享库的东西不用搬");
+    }
+
+    #[test]
+    fn kimi_reports_a_local_only_skill_as_undeliverable() {
+        // kimi 没有 henv 写得了的用户级 skills 目录：非共享库来源的能力确实交付不了，
+        // 报告要说清楚，且 apply 不许因此失败（§9.1）。
+        let t = TempHome::new();
+        t.write("src/foo/SKILL.md", "# foo");
+        t.mkdir(".kimi-code").mkdir(".claude").mkdir(".codex");
+        let manifest = local_skill_manifest(&t);
+
+        let out = apply(&t, &manifest, &mut AssumeYes).unwrap();
         assert!(out.contains("! undeliverable  skill/foo"), "{out}");
         assert!(out.contains("kimi-code 无用户级 skills 目录"), "{out}");
         assert!(!t.path(".kimi-code/skills").exists());
@@ -872,10 +903,11 @@ mod tests {
     #[test]
     fn harness_narrows_the_targets_only() {
         let t = TempHome::new();
-        t.write(".agents/skills/foo/SKILL.md", "# foo");
+        t.write("src/foo/SKILL.md", "# foo");
         t.mkdir(".claude").mkdir(".codex");
+        let manifest = local_skill_manifest(&t);
 
-        let out = apply_with(&t, one_skill_manifest(), false, Some("codex"));
+        let out = apply_with(&t, &manifest, false, Some("codex"));
 
         assert!(t.path(".codex/skills/foo").exists(), "{out}");
         assert!(
@@ -889,9 +921,10 @@ mod tests {
     #[test]
     fn apply_without_prune_never_deletes_a_drifted_copy() {
         let t = TempHome::new();
-        t.write(".agents/skills/foo/SKILL.md", "# foo");
+        t.write("src/foo/SKILL.md", "# foo");
         t.mkdir(".codex");
-        apply_with(&t, one_skill_manifest(), false, Some("codex"));
+        let manifest = local_skill_manifest(&t);
+        apply_with(&t, &manifest, false, Some("codex"));
         assert!(t.path(".codex/skills/foo").exists(), "先交付到盘上");
 
         // 清单里去掉 foo，再跑一次**不带** `--prune` 的 apply。
@@ -914,10 +947,11 @@ mod tests {
     #[test]
     fn prune_deletes_only_what_the_ledger_records() {
         let t = TempHome::new();
-        t.write(".agents/skills/foo/SKILL.md", "# foo");
+        t.write("src/foo/SKILL.md", "# foo");
         t.mkdir(".codex");
         t.write(".codex/skills/handmade/SKILL.md", "# handmade");
-        apply_with(&t, one_skill_manifest(), false, Some("codex"));
+        let manifest = local_skill_manifest(&t);
+        apply_with(&t, &manifest, false, Some("codex"));
         let handmade = std::fs::read(t.path(".codex/skills/handmade/SKILL.md")).unwrap();
 
         let out = apply_with(&t, "version: 1\n", true, Some("codex"));
@@ -953,9 +987,10 @@ mod tests {
         }
 
         let t = TempHome::new();
-        t.write(".agents/skills/foo/SKILL.md", "# foo");
+        t.write("src/foo/SKILL.md", "# foo");
         t.mkdir(".codex");
-        apply_with(&t, one_skill_manifest(), false, Some("codex"));
+        let manifest = local_skill_manifest(&t);
+        apply_with(&t, &manifest, false, Some("codex"));
 
         t.write("env.yaml", "version: 1\n");
         let mut out = Vec::new();

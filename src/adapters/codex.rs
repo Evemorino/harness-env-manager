@@ -3,7 +3,7 @@ use crate::adapters::{CODEX, HarnessAdapter};
 use crate::apply::mcp::{McpMechanism, McpTarget};
 use crate::capability::{CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets};
 use crate::home::Home;
-use crate::skills_dir::{SkillStore, plugin_from_path, try_read_skill_entries};
+use crate::skills_dir::try_read_skill_entries;
 use anyhow::anyhow;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -167,35 +167,36 @@ impl Codex {
     /// `IntoIterator`），而改用 lossy 的 `read_skill_entries` 就把「读不了」重新吞成空表。
     fn read_skills(&self) -> anyhow::Result<Vec<Capability>> {
         let mut out = Vec::new();
-        for e in try_read_skill_entries(&self.home.codex_skills(), &self.home)? {
-            let source = match e.store {
-                SkillStore::Shared => SkillSource::AgentsDir,
-                // 实测（spec §2.1 第 4 条）：codex 的 skills 是绝对 symlink，直接指向
-                // `~/.claude/plugins/cache/<mp>/<name>/<sha>/skills/<skill>`。
-                SkillStore::PluginCache => {
-                    let resolved = e.resolved.clone().unwrap_or_default();
-                    match plugin_from_path(&resolved) {
-                        Some(plugin) => SkillSource::PluginBundle { plugin },
-                        None => SkillSource::Unknown,
-                    }
-                }
-                SkillStore::HarnessLocal => SkillSource::Local {
-                    path: e.resolved.clone().unwrap_or_else(|| e.path.clone()),
-                },
-                // 断链或指向库外：来源不可判定，交给 doctor 报告
-                SkillStore::Other => SkillSource::Unknown,
-            };
-            // §9.3：断链没有内容但有路径，自愈要能看见它（见 `SkillEntry::content_path`）。
-            // 先取再搬 `e.name`——顺序反了就是对一个被部分移动的值借方法。
-            let path = e.content_path();
-            out.push(Capability {
-                id: CapId::new(Kind::Skill, e.name),
-                origin: Origin::Adopted {
-                    harness: CODEX.into(),
-                },
-                spec: Spec::Skill { source, path },
-                targets: Targets::All,
-            });
+        // 两个目录：harness 自己的，以及共享库。**顺序有意义**——`read_state` 的 `dedup_by`
+        // 保留先扫到的那一条，所以同名时赢的是 `~/.codex/skills` 里的那份（它就是交付目标）。
+        //
+        // 为什么也要扫共享库：codex 原生读 `~/.agents/skills`（与 kimi 共用的 `.agents`
+        // 约定，2026-09-28 实测）。只扫自己那个目录，共享库里的 skill 会被判 `install`——
+        // 对一个已经能用的能力重拷一份，报告和盘上都多出一次无意义的动作。
+        let shared_root = self.home.agents_skills();
+        for dir in [self.home.codex_skills(), shared_root.clone()] {
+            for e in try_read_skill_entries(&dir, &self.home)? {
+                // 来源说的是**入口**在哪，不是真身在哪：`~/.agents/skills/<name>` 本身是一条
+                // 软链时（实测就这么几条），codex 是从那个入口读到它的，与它最终指向谁的目录
+                // 无关。按真身判定会把「共享库来源」误记成「某个 harness 的本地目录」，
+                // 而 kimi 的 `supports` 正是按这个来源判它读不读得到。
+                let source = if dir == shared_root {
+                    SkillSource::AgentsDir
+                } else {
+                    crate::adapters::skill_source_of(&e)
+                };
+                // §9.3：断链没有内容但有路径，自愈要能看见它（见 `SkillEntry::content_path`）。
+                // 先取再搬 `e.name`——顺序反了就是对一个被部分移动的值借方法。
+                let path = e.content_path();
+                out.push(Capability {
+                    id: CapId::new(Kind::Skill, e.name),
+                    origin: Origin::Adopted {
+                        harness: CODEX.into(),
+                    },
+                    spec: Spec::Skill { source, path },
+                    targets: Targets::All,
+                });
+            }
         }
         Ok(out)
     }
@@ -372,6 +373,7 @@ fn toml_optional_bool(
 mod tests {
     use super::*;
     use crate::capability::{Kind, Origin, SkillSource, Spec, Targets};
+    use crate::skills_dir::plugin_from_path;
     use crate::testutil::TempHome;
     use std::path::{Path, PathBuf};
 

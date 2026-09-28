@@ -184,6 +184,33 @@ impl KimiCode {
         }
         Ok(out)
     }
+
+    /// 扫 `~/.agents/skills`：kimi 的 `USER_GENERIC_DIRS`（2026-09-28 从 kimi 2.0.2 的二进制
+    /// 常量实证；它自带的内置 skill 文案也写着 "Kimi Code already supports `.agents` skills
+    /// and AGENTS files by default"）。
+    ///
+    /// 这是**共享库**，内容的主人是别的工具（`npx skills`、`dws skill setup`…），kimi 只是
+    /// 读者之一。所以扫出来的条目是 `Origin::Adopted`——它表达「kimi 现在读得到这一条」，
+    /// 不表达「henv 往 kimi 写过什么」。`supports` 对这类条目放行，靠的就是这个来源。
+    fn read_shared_skills(&self) -> anyhow::Result<Vec<Capability>> {
+        let mut out = Vec::new();
+        for e in try_read_skill_entries(&self.home.agents_skills(), &self.home)? {
+            let path = e.content_path();
+            out.push(Capability {
+                id: CapId::new(Kind::Skill, e.name),
+                origin: Origin::Adopted {
+                    harness: KIMI_CODE.into(),
+                },
+                // 入口在共享库就是共享库来源，哪怕那一条本身是软链、真身在别家的目录里。
+                spec: Spec::Skill {
+                    source: SkillSource::AgentsDir,
+                    path,
+                },
+                targets: Targets::All,
+            });
+        }
+        Ok(out)
+    }
 }
 
 /// kimi `installed.json` 条目压平后的形状：一条记录同时喂 plugin 能力和 bundle skill 扫描。
@@ -211,6 +238,9 @@ impl HarnessAdapter for KimiCode {
         let plugins = self.read_plugins()?;
         let mut caps = self.read_mcps()?;
         caps.extend(self.read_bundled_skills(&plugins)?);
+        // 共享库排在 bundle 之后：同名时 `dedup_by` 保留先扫到的那条，而 kimi 自己那份
+        // （随 plugin 装进来的）比共享库的那份更贴近「它实际用的是哪个」。
+        caps.extend(self.read_shared_skills()?);
         for p in &plugins {
             caps.push(Capability {
                 id: CapId::new(Kind::Plugin, p.id.clone()),
@@ -248,20 +278,26 @@ impl HarnessAdapter for KimiCode {
         })
     }
 
-    /// kimi 原生接纳 MCP 与 Plugin 两种 kind；Skill/Hook/Command/Agent 在这家
-    /// **没有用户级落点**，一律 `Unsupported`——**不论它来自哪里**。
+    /// kimi 原生接纳 MCP 与 Plugin 两种 kind；skill 按**来源**分两种：
     ///
-    /// 判据是「这家有没有那个目录」，不是「它是不是来自 bundle」
-    /// （`Origin::Plugin` 曾经在这里换到 `Native`，那是错的：kimi 的
-    /// `skills_target_dir()` 是 `None`，判 `Native` 会让 `deliver_skills`
-    /// 提前返回空报告，报告写着 `+ install` 而盘上什么都没写）。
-    /// 拆解出的 skill 正是带着 `Origin::Plugin` 来的，所以这条判据必须落对。
+    /// - `SkillSource::AgentsDir` → `Native`：kimi 自己就读 `~/.agents/skills`（它的
+    ///   `USER_GENERIC_DIRS`），这条能力此刻就在它眼前，对账结果是 in-sync 而不是
+    ///   「交付不了」。
+    /// - 其余来源（`local` / `git` / bundle 拆解）→ `Unsupported`：kimi 没有 henv 写得了的
+    ///   用户级 skills 目录（`skills_target_dir()` 是 `None`），判 `Native` 会让
+    ///   `deliver_skills` 走一遍空交付——报告写着 `+ install` 而盘上什么都没写。
     fn supports(&self, cap: &Capability) -> Support {
         match cap.id.kind {
             Kind::Mcp | Kind::Plugin => Support::Native,
-            Kind::Skill => Support::Unsupported {
-                reason: "kimi-code 无用户级 skills 目录，拆解出的 skill 在它这儿没有落点"
-                    .to_string(),
+            Kind::Skill => match &cap.spec {
+                Spec::Skill {
+                    source: SkillSource::AgentsDir,
+                    ..
+                } => Support::Native,
+                _ => Support::Unsupported {
+                    reason: "kimi-code 无用户级 skills 目录，拆解出的 skill 在它这儿没有落点"
+                        .to_string(),
+                },
             },
             Kind::Hook => Support::Unsupported {
                 reason: "kimi-code 无用户级 hooks 配置".to_string(),
@@ -825,6 +861,30 @@ mod tests {
     }
 
     // ============ bundle 内的 skills（spec §2.1 第 4 条） ============
+
+    /// 共享库里的条目**本身是一条软链**时，来源仍记「共享库」。
+    ///
+    /// 入口在 `~/.agents/skills`，真身在别家目录里（实测：`mcp-builder` 指回
+    /// `~/.claude/skills/mcp-builder`、`superpowers` 指向 `~/.codex/superpowers/skills`）。
+    /// 按真身判会把这些记成 `Local`，于是 `supports` 判 kimi 交付不了——而它明明是通过那个
+    /// 入口读到的，报告就对一条能用的能力说谎（真机上正是这两条被误报成 undeliverable）。
+    #[test]
+    fn a_shared_entry_that_is_a_symlink_is_still_agents_dir() {
+        let t = TempHome::new();
+        t.write(".claude/skills/foo/SKILL.md", "# foo")
+            .symlink(".agents/skills/foo", "../../.claude/skills/foo");
+
+        let caps = KimiCode::new(t.home.clone()).read_state().unwrap();
+        let foo = find(&caps, Kind::Skill, "foo").expect("共享库里的条目要扫得到");
+        assert_eq!(
+            foo.spec,
+            Spec::Skill {
+                source: SkillSource::AgentsDir,
+                path: Some(t.path(".claude/skills/foo")),
+            },
+            "入口在共享库就是共享库来源，哪怕真身在 claude 的目录里"
+        );
+    }
 
     #[test]
     fn reads_bundled_skills_of_installed_plugins() {
