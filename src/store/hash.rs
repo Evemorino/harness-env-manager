@@ -1,7 +1,7 @@
 //! 目录内容指纹。spec §9.3 把「需不需要交付」的判定单位定成**内容是否等价**、
 //! 不是形态是否相同——所以这里要回答的是「这两坨字节一不一样」。
 
-use crate::capability::McpTransport;
+use crate::capability::{McpTransport, McpValue};
 use anyhow::Context as _;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
@@ -85,14 +85,17 @@ fn hash_list<'a>(hasher: &mut Sha256, items: impl Iterator<Item = &'a String>) {
 }
 
 /// 一串键值：键与值都算（与 `summary` 只渲染键名相反，理由见函数文档）。
-fn hash_pairs<'a>(hasher: &mut Sha256, pairs: impl Iterator<Item = (&'a String, &'a String)>) {
-    let pairs: Vec<(&String, &String)> = pairs.collect();
+fn hash_pairs<'a>(hasher: &mut Sha256, pairs: impl Iterator<Item = (&'a String, &'a McpValue)>) {
+    let pairs: Vec<(&String, &McpValue)> = pairs.collect();
     hasher.update((pairs.len() as u64).to_le_bytes());
     for (k, v) in pairs {
         hasher.update((k.len() as u64).to_le_bytes());
         hasher.update(k.as_bytes());
-        hasher.update((v.len() as u64).to_le_bytes());
-        hasher.update(v.as_bytes());
+        // **按 `to_text()` 取字节**：对今天所有合法形态它逐字节等于当初写进清单的那串文本，
+        // 所以账本不需要迁移、升级后也不会集体报「副本被手改过」（Plan F §4）。
+        let text = v.to_text();
+        hasher.update((text.len() as u64).to_le_bytes());
+        hasher.update(text.as_bytes());
     }
 }
 
@@ -160,9 +163,22 @@ mod tests {
             args: args.iter().map(|s| (*s).to_string()).collect(),
             env: env
                 .iter()
-                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .map(|(k, v)| ((*k).to_string(), McpValue::from_text_or_literal(v)))
                 .collect(),
         }
+    }
+
+    /// **哈希的字节布局是对外契约**（Plan F §4）：`McpValue` 化之后值仍按 `to_text()` 取
+    /// 字节，所以今天所有合法形态的哈希与改造前**逐字节相同**——账本不需要迁移，
+    /// 升级后也不会集体报「副本被手改过」。这条把布局钉死：真要改它，先想迁移。
+    #[test]
+    fn the_hash_layout_is_pinned() {
+        assert_eq!(
+            hash_mcp_spec(&stdio("npx", &["-y", "pkg"], &[("K", "${K}")])),
+            // 改造前的实现哈希的是那串原文（`"${K}"`），`McpValue::to_text()` 逐字节相同，
+            // 所以这个值在 Plan F 前后**必须一样**——它就是「账本不用迁移」的证据。
+            "4009fce5823fc3a8eae4b369603a094ed0d7d1e64b2f4bd27374461b75396820"
+        );
     }
 
     /// 与 `McpTransport::summary` 的关键区别：**值参与哈希**。`compare_versions` 的 Mcp arm

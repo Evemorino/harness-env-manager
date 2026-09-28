@@ -23,6 +23,21 @@ fn manifest_without_credentials() -> String {
         .to_string()
 }
 
+/// 一条 http MCP，凭据是**裸引用**——用来验「codex 的 `http_headers` 是字面量」这件事
+/// 在报告里的样子。
+fn http_manifest() -> String {
+    "version: 1\n\n\
+     mcps:\n  context7:\n    url: https://mcp.context7.com/mcp\n    headers:\n      \
+     Authorization: ${CONTEXT7_API_KEY}\n"
+        .to_string()
+}
+
+/// 升级前 henv 交付到 codex 的样子：引用文本躺在 `http_headers` 里（codex 当**字面量**发）。
+const LEGACY_CODEX_HTTP: &str = "[mcp_servers.context7]\n\
+                                 url = \"https://mcp.context7.com/mcp\"\n\n\
+                                 [mcp_servers.context7.http_headers]\n\
+                                 Authorization = \"${CONTEXT7_API_KEY}\"\n";
+
 fn temp_home_with_codex() -> TempHome {
     let t = TempHome::new();
     t.mkdir(".codex");
@@ -287,4 +302,73 @@ fn a_bearer_credential_lands_on_codex_and_kimi() {
         after.contains("0 install, 0 update") && after.contains("0 undeliverable"),
         "apply 之后两家都该 in-sync：\n{after}"
     );
+}
+
+/// **Plan F 的回归锁**：codex 的 `http_headers` 是**字面量**，所以配置里那段
+/// `"${CONTEXT7_API_KEY}"` 与清单要的引用**不是同一个东西**。
+///
+/// 修之前 `diff` 报 `in-sync`——两边都是同一串字符，模型里区分不出来——而 codex 实际把
+/// 那段文本当 Authorization 发出去（`codex doctor` 对这种写法一声不响，对
+/// `env_http_headers` 才报 `header env var … is not set`）。
+#[test]
+fn a_foreign_literal_that_looks_like_a_reference_is_not_in_sync() {
+    let t = temp_home_with_codex();
+    t.write(".codex/config.toml", LEGACY_CODEX_HTTP);
+    t.write("env.yaml", &http_manifest());
+
+    let report = run_diff_to_string(&t);
+    assert!(
+        report.contains("conflict") && !report.contains("in-sync  mcps:1"),
+        "同名、内容不同、账本里又没有 → conflict（§9.6），绝不能报同步：\n{report}"
+    );
+
+    // conflict 的语义是「绝不覆盖」：apply 整次拒绝，文件一个字节不动。
+    let before = std::fs::read(t.path(".codex/config.toml")).unwrap();
+    let mut out = Vec::new();
+    let mut confirm = AssumeYes;
+    assert!(
+        henv::run_apply(
+            &t.path("env.yaml"),
+            &t.home,
+            &mut out,
+            &mut confirm,
+            false,
+            None
+        )
+        .is_err(),
+        "有 conflict 时 apply 必须拒绝整次"
+    );
+    assert_eq!(
+        std::fs::read(t.path(".codex/config.toml")).unwrap(),
+        before,
+        "conflict 不许动别人的配置"
+    );
+}
+
+/// **升级前 henv 交付过的条目会自愈**：账本里记着它 → `diff` 报 `update`（不是假 in-sync）
+/// → `apply` 就地改写成 codex 那条真正的取值通道。
+#[test]
+fn a_legacy_henv_entry_heals_on_apply() {
+    let t = temp_home_with_codex();
+    t.write("env.yaml", &http_manifest());
+    run_apply_to_string(&t);
+    let cfg = std::fs::read_to_string(t.path(".codex/config.toml")).unwrap();
+    assert!(cfg.contains("env_http_headers"), "{cfg}");
+
+    // 把它拨回升级前那种写法：引用文本躺在 `http_headers` 里。
+    t.write(".codex/config.toml", LEGACY_CODEX_HTTP);
+    let before = run_diff_to_string(&t);
+    assert!(
+        before.contains("update") && before.contains("0 conflict"),
+        "账本记着它 → update（不是 conflict，更不是 in-sync）：\n{before}"
+    );
+
+    run_apply_to_string(&t);
+    let healed = std::fs::read_to_string(t.path(".codex/config.toml")).unwrap();
+    assert!(
+        healed.contains("env_http_headers") && !healed.contains("${CONTEXT7_API_KEY}\""),
+        "apply 应当把它改写成 codex 的取值通道：\n{healed}"
+    );
+    let after = run_diff_to_string(&t);
+    assert!(after.contains("0 install, 0 update"), "{after}");
 }

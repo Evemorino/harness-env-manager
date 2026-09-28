@@ -3,11 +3,27 @@
 
 use crate::adapters::HarnessAdapter;
 use crate::apply::mcp::McpTarget;
-use crate::capability::{CapId, Capability, Kind, McpTransport, Origin, Spec, Support, Targets};
+use crate::capability::{
+    CapId, Capability, Kind, McpTransport, McpValue, Origin, Spec, Support, Targets,
+};
 use crate::home::Home;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use tempfile::TempDir;
+
+/// 测试夹具：`&[("K", "${K}")]` → `BTreeMap<String, McpValue>`。
+///
+/// 按**清单门禁**那条规则解析（认得出的引用 → `Ref`，别的 → `Literal`），因为夹具要能写出
+/// 两边：合法清单要的引用，以及手写配置里那种「像引用的字面量」（`Literal("${K}")`）。
+///
+/// **生产读路径不许用它**：哪一格是引用由**字段**决定（codex 的 `http_headers` 恒字面量、
+/// `env_http_headers` 恒引用），照着文本猜正是 `McpValue` 要终结的东西。
+pub fn mcp_map(pairs: &[(&str, &str)]) -> BTreeMap<String, McpValue> {
+    pairs
+        .iter()
+        .map(|(k, v)| ((*k).to_string(), McpValue::from_text_or_literal(v)))
+        .collect()
+}
 
 pub struct TempHome {
     // 必须保活：drop 即删除整棵目录树

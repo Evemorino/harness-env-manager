@@ -173,7 +173,7 @@ fn adoptable(cap: &Capability) -> Result<(), String> {
                 McpTransport::Http { headers, .. } => headers.iter(),
             };
             for (key, value) in pairs {
-                if !crate::secrets::is_manifest_value(value) {
+                if matches!(value, crate::capability::McpValue::Literal(_)) {
                     return Err(format!(
                         "`{key}` 的值不是清单能表达的形态（只收 `${{VAR}}` / `${{VAR:-}}` / \
                          `Bearer ${{VAR}}`），照抄会写出一份解不开的清单"
@@ -270,7 +270,7 @@ fn shape(cap: &Capability, harnesses: &BTreeMap<String, Capability>) -> Adoption
                 if !env.is_empty() {
                     out.push_str("  env:\n");
                     for (k, v) in env {
-                        let _ = writeln!(out, "    {}: {}", scalar(k), scalar(v));
+                        let _ = writeln!(out, "    {}: {}", scalar(k), scalar(&v.to_text()));
                     }
                 }
                 let summary = if args.is_empty() {
@@ -286,7 +286,7 @@ fn shape(cap: &Capability, harnesses: &BTreeMap<String, Capability>) -> Adoption
                 if !headers.is_empty() {
                     out.push_str("  headers:\n");
                     for (k, v) in headers {
-                        let _ = writeln!(out, "    {}: {}", scalar(k), scalar(v));
+                        let _ = writeln!(out, "    {}: {}", scalar(k), scalar(&v.to_text()));
                     }
                 }
                 (out, format!("url={url}"))
@@ -679,11 +679,7 @@ mod tests {
     #[test]
     fn an_mcp_is_adopted_with_its_command_args_and_unexpanded_refs() {
         let manifest = Manifest::parse("version: 1\n").unwrap();
-        let mut env = std::collections::BTreeMap::new();
-        env.insert(
-            "CONTEXT7_API_KEY".to_string(),
-            "${CONTEXT7_API_KEY}".to_string(),
-        );
+        let env = crate::testutil::mcp_map(&[("CONTEXT7_API_KEY", "${CONTEXT7_API_KEY}")]);
         let states = vec![state(
             "codex",
             vec![cap(
@@ -1067,13 +1063,11 @@ mod tests {
     #[test]
     fn an_unexpressible_value_is_skipped_not_fatal() {
         let manifest = Manifest::parse("version: 1\n").unwrap();
-        let literal: std::collections::BTreeMap<String, String> = [(
-            "Authorization".to_string(),
-            "Bearer sk-live-9f3a".to_string(),
-        )]
-        .into();
-        let as_ref: std::collections::BTreeMap<String, String> =
-            [("Authorization".to_string(), "${K}".to_string())].into();
+        // 两条都是**同一格文本**，区别只在类型：手写配置里那种「像引用的字面量」与清单
+        // 要的引用。这正是 `McpValue` 要分开的东西——`mcp_map` 按门禁规则解析，
+        // 认不出的（`Bearer sk-live-…`）落成 `Literal`。
+        let literal = crate::testutil::mcp_map(&[("Authorization", "Bearer sk-live-9f3a")]);
+        let as_ref = crate::testutil::mcp_map(&[("Authorization", "${K}")]);
         let states = vec![state(
             "codex",
             vec![
@@ -1129,8 +1123,7 @@ mod tests {
     #[test]
     fn a_scan_report_renders_both_sections() {
         let manifest = Manifest::parse("version: 1\n").unwrap();
-        let mut env = std::collections::BTreeMap::new();
-        env.insert("KIMI_API_KEY".to_string(), "${KIMI_API_KEY}".to_string());
+        let env = crate::testutil::mcp_map(&[("KIMI_API_KEY", "${KIMI_API_KEY}")]);
         let states = vec![
             state(
                 "claude-code",

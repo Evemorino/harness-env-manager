@@ -692,7 +692,11 @@ fn mcp_body(transport: &McpTransport) -> String {
 }
 
 /// `env:` / `headers:` 那样的一小段嵌套映射。
-fn write_pairs(body: &mut String, field: &str, pairs: &std::collections::BTreeMap<String, String>) {
+fn write_pairs(
+    body: &mut String,
+    field: &str,
+    pairs: &std::collections::BTreeMap<String, capability::McpValue>,
+) {
     if pairs.is_empty() {
         return;
     }
@@ -702,7 +706,7 @@ fn write_pairs(body: &mut String, field: &str, pairs: &std::collections::BTreeMa
             body,
             "    {}: {}",
             manifest_edit::scalar(key),
-            manifest_edit::scalar(value)
+            manifest_edit::scalar(&value.to_text())
         );
     }
 }

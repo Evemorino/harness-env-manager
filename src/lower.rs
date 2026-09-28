@@ -4,7 +4,7 @@
 //! per-harness manifest，v1 以对账为主。拆解是 Plan B 在目标 harness 缺 manifest 时的降级路径。
 
 use crate::capability::{
-    CapId, Capability, Kind, McpTransport, Origin, SkillSource, Spec, normalize_locator,
+    CapId, Capability, Kind, McpTransport, McpValue, Origin, SkillSource, Spec, normalize_locator,
 };
 use crate::manifest::{
     DegradeAction, DegradePolicy, Manifest, PluginEntry, PluginSourceKind, SkillSourceKind,
@@ -60,6 +60,22 @@ pub(crate) fn plugin_identity(key: &str, p: &PluginEntry) -> String {
     p.entry.clone().unwrap_or_else(|| key.to_string())
 }
 
+/// 清单里的值 → `McpValue::Ref`。
+///
+/// **契约**：`Manifest::validate` 用的是同一条判据（`secrets::validate_env`），所以这里解不开
+/// 只可能是「两处规则漂了」。用 `unreachable!` 表达那句契约，**绝不降级成一个 `Literal` 兜底**
+/// ——那会静默放过一份坏清单，而「把坏清单列出来」正是 `diff` 存在的理由。
+fn mcp_values(name: &str, values: &BTreeMap<String, String>) -> BTreeMap<String, McpValue> {
+    values
+        .iter()
+        .map(|(key, text)| {
+            let parsed = McpValue::from_manifest_text(text)
+                .unwrap_or_else(|_| unreachable!("manifest 校验保证 `mcps.{name}.{key}` 是引用"));
+            (key.clone(), parsed)
+        })
+        .collect()
+}
+
 pub fn lower(m: &Manifest) -> Vec<Capability> {
     let mut out: Vec<Capability> = Vec::new();
 
@@ -97,13 +113,14 @@ pub fn lower(m: &Manifest) -> Vec<Capability> {
                     (Some(command), None) => McpTransport::Stdio {
                         command: command.clone(),
                         args: e.args.clone(),
-                        // env 值已由 `secrets::validate_env` 保证是裸 `${VAR}` 引用：
-                        // 原样搬运，绝不展开、绝不重新引号、绝不剥掉花括号。
-                        env: e.env.clone(),
+                        // 值 → `McpValue::Ref`：门禁（`secrets::validate_env`）已经放过一轮，
+                        // 这里是第二道闸——解不开就报错，**绝不降级成字面量**（那会把
+                        // 「清单要求引用」这件事悄悄抹掉，§9.6）。
+                        env: mcp_values(name, &e.env),
                     },
                     (None, Some(url)) => McpTransport::Http {
                         url: url.clone(),
-                        headers: e.headers.clone(),
+                        headers: mcp_values(name, &e.headers),
                     },
                     _ => unreachable!("manifest 校验保证 command 与 url 恰好二选一"),
                 },
@@ -499,7 +516,7 @@ plugins:
                 transport: McpTransport::Stdio { env, .. },
                 ..
             } => {
-                assert_eq!(env["K"], "${K}", "reference must not be expanded")
+                assert_eq!(env["K"].to_text(), "${K}", "reference must not be expanded")
             }
             other => panic!("expected Mcp, got {other:?}"),
         }

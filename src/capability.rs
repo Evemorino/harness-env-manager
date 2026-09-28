@@ -1,6 +1,104 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+/// 一条 MCP 的 env / header 值。
+///
+/// **「引用」与「字面量」在模型里就是两种东西**（2026-09-28）。两者混成同一个 `String` 时，
+/// 「恰好长得像引用的字面量」会与清单里的引用**逐字符相等**，于是 `diff` 报假 `in-sync`，
+/// 而配置里那段文本一直是坏的：codex 的 `http_headers` / `env` 是**字面量**（它原样发出去，
+/// 不展开 `${VAR}`，§9.6），实测 `http_headers.Authorization = "${CONTEXT7_API_KEY}"` 就曾被
+/// 判成同步。
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum McpValue {
+    /// 清单里的写法（三种形态各自记着：渲染、翻译、判定都不再靠解析字符串）。
+    Ref {
+        var: String,
+        /// `Bearer ${VAR}` —— 对应 codex 的 `bearer_token_env_var` 与 kimi 的
+        /// `bearerTokenEnvVar`（两家都发 `Authorization: Bearer <token>`）。
+        bearer: bool,
+        /// `${VAR:-}` —— 空默认值，意思是「这个变量可以缺」。
+        optional: bool,
+    },
+    /// 其它一切。**只可能来自读回来的配置**：清单门禁拒字面量（§3 决策 3）。
+    Literal(String),
+}
+
+impl McpValue {
+    /// 清单里的文本 → `Ref`。门禁（[`crate::secrets::validate_env`]）已经放过一轮，
+    /// 这里是第二道闸：解不开就报错，**绝不降级成 `Literal`**——那会把「清单要求引用」
+    /// 这件事悄悄抹掉。
+    pub fn from_manifest_text(text: &str) -> anyhow::Result<Self> {
+        // 前缀先剥掉，剩下的交给 `secrets` 的两条规则：先窄（裸引用）后宽（带空默认值）。
+        let (body, bearer) = match text.strip_prefix("Bearer ") {
+            Some(rest) => (rest, true),
+            None => (text, false),
+        };
+        let (var, optional) = match crate::secrets::parse_ref(body) {
+            Some(var) => (var, false),
+            None => match crate::secrets::parse_manifest_ref(body) {
+                Some(var) => (var, true),
+                None => anyhow::bail!(
+                    "not a supported reference form; refusing to treat it as a literal"
+                ),
+            },
+        };
+        Ok(McpValue::Ref {
+            var: var.to_string(),
+            bearer,
+            optional,
+        })
+    }
+
+    /// 文本 → 值：**认得出的引用就解析，认不出就当字面量**。
+    ///
+    /// 只有一处生产调用点需要这个语义：claude 的 `env` / `headers`（它**会展开** `${VAR}`，
+    /// 所以那一格既可能是指令也可能是字面量）。codex / kimi 的读路径**不许**用它——
+    /// 那两家要按**字段**决定（`http_headers` 恒字面量、`env_http_headers` 恒引用），
+    /// 那正是这个类型存在的理由。
+    pub fn from_text_or_literal(text: &str) -> Self {
+        Self::from_manifest_text(text).unwrap_or_else(|_| McpValue::Literal(text.to_string()))
+    }
+
+    /// 渲染回清单里的写法；字面量就是它自己。
+    ///
+    /// **账本哈希用它**（[`crate::store::hash::hash_mcp_spec`]）：对今天所有合法形态它逐字节
+    /// 等于当初写进清单的那串文本，所以账本不需要迁移、升级后也不会集体报「副本被手改过」。
+    pub fn to_text(&self) -> String {
+        match self {
+            McpValue::Ref {
+                var,
+                bearer,
+                optional,
+            } => {
+                let prefix = if *bearer { "Bearer " } else { "" };
+                let default = if *optional { ":-" } else { "" };
+                format!("{prefix}${{{var}{default}}}")
+            }
+            McpValue::Literal(text) => text.clone(),
+        }
+    }
+
+    /// 引用里的变量名（字面量 → `None`）。
+    pub fn var(&self) -> Option<&str> {
+        match self {
+            McpValue::Ref { var, .. } => Some(var),
+            McpValue::Literal(_) => None,
+        }
+    }
+
+    /// 「这个变量现在就得有值」才返回变量名——`${VAR:-}` 不算（空默认值就是「可以缺」）。
+    pub fn required_var(&self) -> Option<&str> {
+        match self {
+            McpValue::Ref {
+                var,
+                optional: false,
+                ..
+            } => Some(var),
+            _ => None,
+        }
+    }
+}
+
 /// 能力种类。`Plugin` 是一等公民——spec §2.1 第 2 条：三家 harness 都有 plugin 机制，
 /// v1 以 bundle manifest 对账为主，只在目标 harness 缺 manifest 时才降级拆解。
 #[derive(
@@ -101,12 +199,12 @@ pub enum McpTransport {
     Stdio {
         command: String,
         args: Vec<String>,
-        env: BTreeMap<String, String>,
+        env: BTreeMap<String, McpValue>,
     },
-    /// 远端：一个 URL，可选的请求头（放凭据的地方，所以值同样必须是 `${VAR}` 引用）。
+    /// 远端：一个 URL，可选的请求头（放凭据的地方，所以清单里同样只收引用）。
     Http {
         url: String,
-        headers: BTreeMap<String, String>,
+        headers: BTreeMap<String, McpValue>,
     },
 }
 
@@ -141,26 +239,20 @@ impl McpTransport {
     }
 }
 
-/// 一串 env / header 渲染成 `K=${K},W=***`：键序由 `BTreeMap` 保证稳定，值那一侧见
-/// [`shown_value`]。
-fn pairs(map: &std::collections::BTreeMap<String, String>) -> String {
+/// 一串 env / header 渲染成 `K=${K},W=***`：键序由 `BTreeMap` 保证稳定。
+///
+/// **引用照原样、字面量一律 `***`**——判据就是类型本身，不再有「看起来像不像引用」的启发式。
+/// 引用没有秘密可泄露（`${CONTEXT7_API_KEY}` 只是个变量名），而且必须渲染出来：只显示键名时，
+/// 把一个 header 从 `${A}` 改成 `${B}` 会让 `diff` 的 update 行左右一模一样。字面量则相反：
+/// 它可能是从活配置里读回来的明文密钥。
+fn pairs(map: &std::collections::BTreeMap<String, McpValue>) -> String {
     map.iter()
-        .map(|(k, v)| format!("{k}={}", shown_value(v)))
+        .map(|(k, v)| match v {
+            McpValue::Ref { .. } => format!("{k}={}", v.to_text()),
+            McpValue::Literal(_) => format!("{k}=***"),
+        })
         .collect::<Vec<_>>()
         .join(",")
-}
-
-/// 一个 env / header 值渲染成什么：**认得出的引用照原样**（那只是个变量名，`${K:-}` 的
-/// `:-` 与 `Bearer ` 前缀也是要看见的信息），其余一律 `***`。
-///
-/// 判据借清单门禁那条（[`crate::secrets::is_manifest_value`]）而不是「看起来像不像」的
-/// 启发式：门禁收什么，这里就显示什么，两份规则不会漂。
-fn shown_value(value: &str) -> &str {
-    if crate::secrets::is_manifest_value(value) {
-        value
-    } else {
-        "***"
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -669,7 +761,7 @@ mod tests {
                 args: args.into_iter().map(String::from).collect(),
                 env: env
                     .into_iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .map(|(k, v)| (k.to_string(), McpValue::from_text_or_literal(v)))
                     .collect(),
             },
         };
@@ -750,6 +842,61 @@ mod tests {
         );
     }
 
+    /// `McpValue` 的三条契约：清单文本 → `Ref`（四种形态各自记住）、渲染回**逐字节相同**
+    /// 的文本、解不开就报错。**绝不把「解不开」降级成 `Literal`**——那会把「清单要求引用」
+    /// 这件事悄悄抹掉，而 `Literal` 只该由**读路径按字段**产出。
+    #[test]
+    fn mcp_value_round_trips_the_four_manifest_forms() {
+        for text in ["${K}", "${K:-}", "Bearer ${K}", "Bearer ${K:-}"] {
+            let parsed = McpValue::from_manifest_text(text).expect(text);
+            assert_eq!(parsed.to_text(), text, "渲染必须逐字节回到清单那串");
+            assert_eq!(parsed.var(), Some("K"));
+        }
+        assert_eq!(
+            McpValue::from_manifest_text("Bearer ${K:-}").unwrap(),
+            McpValue::Ref {
+                var: "K".into(),
+                bearer: true,
+                optional: true,
+            }
+        );
+        // 门禁不收的形态一律报错，不猜。
+        for bad in [
+            "sk-live-abc",
+            "${K:-sk-live}",
+            "Basic ${K}",
+            "bearer ${K}",
+            "",
+        ] {
+            assert!(
+                McpValue::from_manifest_text(bad).is_err(),
+                "不该当成引用：{bad:?}"
+            );
+        }
+        // 「认不出就当字面量」是另一条路（只有 claude 的读路径与测试夹具该走它）。
+        assert_eq!(
+            McpValue::from_text_or_literal("sk-live-abc"),
+            McpValue::Literal("sk-live-abc".into())
+        );
+    }
+
+    /// `required_var` 是「这个变量现在就得有值」的判据：`${VAR:-}` 不算（空默认值就是
+    /// 「可以缺」），字面量更不算。doctor 的缺值检查用的就是它。
+    #[test]
+    fn only_a_required_reference_asks_for_a_value_now() {
+        let var = |text: &str| {
+            McpValue::from_manifest_text(text)
+                .unwrap()
+                .required_var()
+                .map(str::to_string)
+        };
+        assert_eq!(var("${K}").as_deref(), Some("K"));
+        assert_eq!(var("Bearer ${K}").as_deref(), Some("K"));
+        assert_eq!(var("${K:-}"), None);
+        assert_eq!(var("Bearer ${K:-}"), None);
+        assert_eq!(McpValue::Literal("${K}".into()).required_var(), None);
+    }
+
     /// 摘要的渲染规则：**引用照原样，其余一律 `***`**。这一条的两头都重要——
     /// `actual` 侧的 env 值由 adapter 从活配置里读出来，可能就是明文真密钥（安全约束），
     /// 而只渲染键名会让 `${A}` → `${B}` 这种改动在报告里看不见（可用性约束，2026-09-28）。
@@ -763,7 +910,7 @@ mod tests {
                 args: args.into_iter().map(String::from).collect(),
                 env: env
                     .into_iter()
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .map(|(k, v)| (k.to_string(), McpValue::from_text_or_literal(v)))
                     .collect(),
             },
         };

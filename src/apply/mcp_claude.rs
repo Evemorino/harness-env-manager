@@ -232,7 +232,7 @@ mod tests {
             } => {
                 assert_eq!(command, "npx");
                 assert_eq!(args[0], "-y");
-                assert_eq!(env["K"], "${K}", "引用原样保留");
+                assert_eq!(env["K"].to_text(), "${K}", "引用原样保留");
             }
             other => panic!("{other:?}"),
         }

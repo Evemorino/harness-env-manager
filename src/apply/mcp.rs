@@ -9,10 +9,11 @@
 
 use crate::apply::HarnessReport;
 use crate::apply::{mcp_claude, mcp_json, mcp_toml};
-use crate::capability::{Capability, Kind, McpTransport, Spec};
+use crate::capability::{Capability, Kind, McpTransport, McpValue, Spec};
 use crate::diff::{Action, HarnessPlan};
 use crate::store::hash::hash_mcp_spec;
 use crate::store::provenance::{Ledger, LedgerEntry};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// 一家的 MCP 写目标。
@@ -124,15 +125,30 @@ fn dispatch(
                 // 先摘再写。remove 失败就停在这儿——add 会覆盖掉一份我们并不认识的东西。
                 mcp_claude::claude_remove(binary, name)?;
             }
-            mcp_claude::claude_add_json(binary, name, &claude_spec_json(transport))
+            mcp_claude::claude_add_json(binary, name, &claude_spec_json(transport)?)
         }
     }
+}
+
+/// 清单侧的值 → claude 吃的文本（`${VAR}` / `${VAR:-}` / `Bearer ${VAR}` 照原样）。
+///
+/// **字面量到不了这儿**：清单门禁拒它，`lower` 只产出 `Ref`。真到了就是 bug——报错，
+/// 而不是顺手把一段可能是密钥的文本写进配置。
+fn claude_values(values: &BTreeMap<String, McpValue>) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for (key, value) in values {
+        if matches!(value, McpValue::Literal(_)) {
+            anyhow::bail!("`{key}` is a literal in the manifest, which only takes references");
+        }
+        out.insert(key.clone(), value.to_text());
+    }
+    Ok(out)
 }
 
 /// claude CLI 收的 `--json` 载荷。键名与它自己写出来的形状一致。
 /// `claude mcp add-json` 吃的载荷。http 型要带 `type: "http"`——实测 claude 靠它区分
 /// 传输（没有它会当成 stdio 去找 `command`）。
-fn claude_spec_json(transport: &McpTransport) -> String {
+fn claude_spec_json(transport: &McpTransport) -> anyhow::Result<String> {
     let mut v = serde_json::Map::new();
     match transport {
         McpTransport::Stdio { command, args, env } => {
@@ -141,18 +157,18 @@ fn claude_spec_json(transport: &McpTransport) -> String {
                 v.insert("args".into(), serde_json::json!(args));
             }
             if !env.is_empty() {
-                v.insert("env".into(), serde_json::json!(env));
+                v.insert("env".into(), serde_json::json!(claude_values(env)?));
             }
         }
         McpTransport::Http { url, headers } => {
             v.insert("type".into(), "http".into());
             v.insert("url".into(), url.as_str().into());
             if !headers.is_empty() {
-                v.insert("headers".into(), serde_json::json!(headers));
+                v.insert("headers".into(), serde_json::json!(claude_values(headers)?));
             }
         }
     }
-    serde_json::Value::Object(v).to_string()
+    Ok(serde_json::Value::Object(v).to_string())
 }
 
 #[cfg(test)]

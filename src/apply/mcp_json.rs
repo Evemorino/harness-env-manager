@@ -6,7 +6,7 @@
 //! 读取也用它，golden 会跟着动），收益只是键序——不值得。别的顶层键一个不少即可。
 
 use crate::apply::write::write_config;
-use crate::capability::McpTransport;
+use crate::capability::{McpTransport, McpValue};
 use anyhow::Context as _;
 use std::path::Path;
 
@@ -69,7 +69,15 @@ pub fn upsert_kimi_mcp(target: &Path, name: &str, transport: &McpTransport) -> a
         // 已经判成 undeliverable，走到这里还带着就是计划错了——宁可失败。
         McpTransport::Http { url, headers } => {
             for (header, value) in headers {
-                let Some(var) = crate::secrets::parse_bearer_var(value) else {
+                // 只有一种形态落得下来：`Authorization: Bearer ${VAR}` → `bearerTokenEnvVar`
+                // （kimi 固定发 `Bearer <token>`）。别的形态计划侧已经判成 undeliverable，
+                // 走到这里还带着就是计划错了。
+                let McpValue::Ref {
+                    var,
+                    bearer: true,
+                    optional: false,
+                } = value
+                else {
                     anyhow::bail!(
                         "kimi-code cannot express this MCP header; refusing to write it literally"
                     );
@@ -79,7 +87,7 @@ pub fn upsert_kimi_mcp(target: &Path, name: &str, transport: &McpTransport) -> a
                         "kimi-code's bearer channel only fills `Authorization`; refusing to drop `{header}`"
                     );
                 }
-                server.insert("bearerTokenEnvVar".into(), var.into());
+                server.insert("bearerTokenEnvVar".into(), var.as_str().into());
             }
             server.insert("url".into(), url.as_str().into());
         }
@@ -134,7 +142,7 @@ mod tests {
     use super::*;
 
     /// 测试里构造一条 stdio transport——调用点都只需要这一种形态。
-    fn stdio_t(command: &str, args: &[String], env: &BTreeMap<String, String>) -> McpTransport {
+    fn stdio_t(command: &str, args: &[String], env: &BTreeMap<String, McpValue>) -> McpTransport {
         McpTransport::Stdio {
             command: command.to_string(),
             args: args.to_vec(),
@@ -144,10 +152,8 @@ mod tests {
     use crate::testutil::TempHome;
     use std::collections::BTreeMap;
 
-    fn env1() -> BTreeMap<String, String> {
-        let mut e = BTreeMap::new();
-        e.insert("K".to_string(), "${K}".to_string());
-        e
+    fn env1() -> BTreeMap<String, McpValue> {
+        crate::testutil::mcp_map(&[("K", "${K}")])
     }
 
     fn args2() -> Vec<String> {
@@ -196,8 +202,7 @@ mod tests {
         t.write(".kimi-code/mcp.json", "{\"keep\": 1}\n");
         let before = std::fs::read(&p).unwrap();
 
-        let mut headers = BTreeMap::new();
-        headers.insert("Authorization".to_string(), "${K}".to_string());
+        let headers = crate::testutil::mcp_map(&[("Authorization", "${K}")]);
         let err = upsert_kimi_mcp(
             &p,
             "ctx",
@@ -222,8 +227,7 @@ mod tests {
     fn the_bearer_form_becomes_bearer_token_env_var() {
         let t = TempHome::new();
         let p = t.path(".kimi-code/mcp.json");
-        let mut headers = BTreeMap::new();
-        headers.insert("Authorization".to_string(), "Bearer ${K}".to_string());
+        let headers = crate::testutil::mcp_map(&[("Authorization", "Bearer ${K}")]);
         upsert_kimi_mcp(
             &p,
             "ctx",

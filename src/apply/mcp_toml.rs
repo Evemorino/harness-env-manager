@@ -5,7 +5,7 @@
 //! 文件，不是加一个键。§9.12 解禁 `toml_edit` 就是为了这一处。
 
 use crate::apply::write::write_config;
-use crate::capability::McpTransport;
+use crate::capability::{McpTransport, McpValue};
 use anyhow::Context as _;
 use std::path::Path;
 use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
@@ -44,28 +44,52 @@ pub fn upsert_codex_mcp(target: &Path, name: &str, transport: &McpTransport) -> 
     write_config(target, doc.to_string().as_bytes())
 }
 
-/// 清单里的 `${VAR}` → 那个**变量名**。codex 的取值字段收的是变量名，不是引用文本。
-///
-/// 不是引用就报错而不是照抄：照抄的后果是 codex 把 `${VAR}` 这段文本当值发出去，
-/// 而那正是这次要根治的静默失败。计划侧（`mcp_expressible`）本来就不该放它过来，
-/// 这里是第二道闸——写不忠实，宁可失败。
-fn ref_var(value: &str) -> anyhow::Result<&str> {
-    crate::secrets::parse_ref(value).ok_or_else(|| {
-        anyhow::anyhow!("value is not a bare ${{VAR}} reference; refusing to write it")
-    })
-}
-
 /// 一条 stdio `env` 项 → codex `env_vars` 里的那个变量名。
 ///
 /// codex 的 `env_vars` 是**同名转发**（子进程按原名拿到环境变量）：清单里 `K: ${K}`
 /// 正是它，`K: ${OTHER}` 在它这儿没有写法——那要求把环境变量换个名字塞给子进程，
 /// 而 `env` 只能放字面量。计划侧已经判过一遍，这里是第二道闸。
-fn forwarded_var<'a>(key: &str, value: &'a str) -> anyhow::Result<&'a str> {
-    let var = ref_var(value)?;
-    if var != key {
-        anyhow::bail!("codex forwards an env var under its own name only (`{key}` <- `{var}`)");
+fn forwarded_var<'a>(key: &str, value: &'a McpValue) -> anyhow::Result<&'a str> {
+    match value {
+        McpValue::Ref {
+            var,
+            bearer: false,
+            optional: false,
+        } if var == key => Ok(var),
+        // 别的形态（`Bearer` / `${VAR:-}` / 换名 / 字面量）在 codex 的 `env_vars` 里
+        // 都没有落点。计划侧已经判过一遍，这里是第二道闸——写不忠实，宁可失败。
+        _ => anyhow::bail!("codex forwards an env var under its own name only (`{key}`)"),
     }
-    Ok(var)
+}
+
+/// 一条 http 头 → codex 的两条通道之一：`Bearer ${VAR}` 走 `bearer_token_env_var`
+/// （只作用于 `Authorization`），裸引用走 `env_http_headers`（头名 → 变量名）。
+enum CodexHeader<'a> {
+    Bearer(&'a str),
+    Env(&'a str),
+}
+
+fn classify_header<'a>(header: &str, value: &'a McpValue) -> anyhow::Result<CodexHeader<'a>> {
+    match value {
+        McpValue::Ref {
+            var,
+            bearer: true,
+            optional: false,
+        } => {
+            if !header.eq_ignore_ascii_case("authorization") {
+                anyhow::bail!(
+                    "codex's bearer channel only fills `Authorization` (`{header}` has no form)"
+                );
+            }
+            Ok(CodexHeader::Bearer(var))
+        }
+        McpValue::Ref {
+            var,
+            bearer: false,
+            optional: false,
+        } => Ok(CodexHeader::Env(var)),
+        _ => anyhow::bail!("codex has no form for `{header}`"),
+    }
 }
 
 /// 从 codex 的 `config.toml` 里摘掉 `[mcp_servers.<name>]`（`upsert_codex_mcp` 的逆操作，§9.8）。
@@ -157,17 +181,12 @@ impl<'a> Slots<'a> {
                         let mut bearer: Option<&str> = None;
                         let mut env_headers = Table::new();
                         for (header, value) in headers {
-                            if let Some(var) = crate::secrets::parse_bearer_var(value) {
-                                if !header.eq_ignore_ascii_case("authorization") {
-                                    anyhow::bail!(
-                                        "codex's bearer channel only fills `Authorization` \
-                                         (`{header}` has no bearer form)"
-                                    );
+                            match classify_header(header, value)? {
+                                CodexHeader::Bearer(var) => bearer = Some(var),
+                                CodexHeader::Env(var) => {
+                                    env_headers.insert(header, toml_edit::value(var));
                                 }
-                                bearer = Some(var);
-                                continue;
                             }
-                            env_headers.insert(header, toml_edit::value(ref_var(value)?));
                         }
                         server.insert("url", toml_edit::value(url));
                         if let Some(var) = bearer {
@@ -205,17 +224,12 @@ impl<'a> Slots<'a> {
                         let mut bearer: Option<&str> = None;
                         let mut env_headers = InlineTable::new();
                         for (header, value) in headers {
-                            if let Some(var) = crate::secrets::parse_bearer_var(value) {
-                                if !header.eq_ignore_ascii_case("authorization") {
-                                    anyhow::bail!(
-                                        "codex's bearer channel only fills `Authorization` \
-                                         (`{header}` has no bearer form)"
-                                    );
+                            match classify_header(header, value)? {
+                                CodexHeader::Bearer(var) => bearer = Some(var),
+                                CodexHeader::Env(var) => {
+                                    env_headers.insert(header, var.into());
                                 }
-                                bearer = Some(var);
-                                continue;
                             }
-                            env_headers.insert(header, ref_var(value)?.into());
                         }
                         server.insert("url", url.into());
                         if let Some(var) = bearer {
@@ -250,7 +264,7 @@ mod tests {
     use super::*;
 
     /// 测试里构造一条 stdio transport——调用点都只需要这一种形态。
-    fn stdio_t(command: &str, args: &[String], env: &BTreeMap<String, String>) -> McpTransport {
+    fn stdio_t(command: &str, args: &[String], env: &BTreeMap<String, McpValue>) -> McpTransport {
         McpTransport::Stdio {
             command: command.to_string(),
             args: args.to_vec(),
@@ -260,10 +274,8 @@ mod tests {
     use crate::testutil::TempHome;
     use std::collections::BTreeMap;
 
-    fn env1() -> BTreeMap<String, String> {
-        let mut e = BTreeMap::new();
-        e.insert("K".to_string(), "${K}".to_string());
-        e
+    fn env1() -> BTreeMap<String, McpValue> {
+        crate::testutil::mcp_map(&[("K", "${K}")])
     }
 
     fn args2() -> Vec<String> {
@@ -279,8 +291,7 @@ mod tests {
         let p = t.path(".codex/config.toml");
         upsert_codex_mcp(&p, "ctx", &stdio_t("npx", &args2(), &BTreeMap::new())).unwrap();
 
-        let mut headers = BTreeMap::new();
-        headers.insert("Authorization".to_string(), "${K}".to_string());
+        let headers = crate::testutil::mcp_map(&[("Authorization", "${K}")]);
         upsert_codex_mcp(
             &p,
             "ctx",
@@ -499,8 +510,7 @@ mod tests {
         );
 
         let before = std::fs::read(&p).unwrap();
-        let mut renamed = BTreeMap::new();
-        renamed.insert("W".to_string(), "${A_B1}".to_string());
+        let renamed = crate::testutil::mcp_map(&[("W", "${A_B1}")]);
         let err = upsert_codex_mcp(&p, "other", &stdio_t("npx", &[], &renamed)).unwrap_err();
         assert!(format!("{err:#}").contains("own name"), "{err:#}");
         assert_eq!(std::fs::read(&p).unwrap(), before, "报错就不能动文件");
@@ -622,9 +632,8 @@ mod tests {
     fn the_bearer_form_becomes_bearer_token_env_var() {
         let t = TempHome::new();
         let p = t.path(".codex/config.toml");
-        let mut headers = BTreeMap::new();
-        headers.insert("Authorization".to_string(), "Bearer ${K}".to_string());
-        headers.insert("X-Extra".to_string(), "${W}".to_string());
+        let headers =
+            crate::testutil::mcp_map(&[("Authorization", "Bearer ${K}"), ("X-Extra", "${W}")]);
         upsert_codex_mcp(
             &p,
             "ctx",
@@ -654,8 +663,7 @@ mod tests {
         let p = t.path(".codex/config.toml");
         t.write(".codex/config.toml", "model = \"gpt-5\"\n");
         let before = std::fs::read(&p).unwrap();
-        let mut headers = BTreeMap::new();
-        headers.insert("X-Auth".to_string(), "Bearer ${K}".to_string());
+        let headers = crate::testutil::mcp_map(&[("X-Auth", "Bearer ${K}")]);
 
         let err = upsert_codex_mcp(
             &p,

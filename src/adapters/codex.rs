@@ -2,7 +2,7 @@ use crate::adapters::claude_code::split_plugin_key;
 use crate::adapters::{CODEX, HarnessAdapter};
 use crate::apply::mcp::{McpMechanism, McpTarget};
 use crate::capability::{
-    CapId, Capability, Kind, McpTransport, Origin, SkillSource, Spec, Support, Targets,
+    CapId, Capability, Kind, McpTransport, McpValue, Origin, SkillSource, Spec, Support, Targets,
 };
 use crate::home::Home;
 use crate::skills_dir::try_read_skill_entries;
@@ -74,18 +74,25 @@ impl Codex {
             // `command = 5` 是故障。
             let transport = match toml_optional_string(cfg, "url", file, &context)? {
                 Some(url) => {
+                    // `http_headers` 的值是**字面量**（codex 原样发出去）：照抄成 `Literal`，
+                    // **哪怕它长得像 `${VAR}`**——那正是这个模型要挡住的东西（§9.6）。
                     let mut headers =
-                        toml_string_map(cfg.get("http_headers"), file, &context, "http_headers")?;
-                    // `env_http_headers` 是「头名 → 变量名」——那才是**从环境取值**，
-                    // 读回成 `${VAR}` 引用（写路径就是那么写的，见 `mcp_toml`）。
-                    // 同一个头两边都有时以它为准：那也是 codex 侧取值的那个。
+                        toml_literal_map(cfg.get("http_headers"), file, &context, "http_headers")?;
+                    // `env_http_headers` 是「头名 → 变量名」——那才是**从环境取值**。
                     for (header, var) in toml_string_map(
                         cfg.get("env_http_headers"),
                         file,
                         &context,
                         "env_http_headers",
                     )? {
-                        headers.insert(header, format!("${{{var}}}"));
+                        headers.insert(
+                            header,
+                            McpValue::Ref {
+                                var,
+                                bearer: false,
+                                optional: false,
+                            },
+                        );
                     }
                     // `bearer_token_env_var` 是 codex 那条 bearer 通道——它固定送
                     // `Authorization: Bearer <token>`，所以读回成清单里的一等写法。
@@ -94,7 +101,14 @@ impl Codex {
                     if let Some(var) =
                         toml_optional_string(cfg, "bearer_token_env_var", file, &context)?
                     {
-                        headers.insert("Authorization".to_string(), format!("Bearer ${{{var}}}"));
+                        headers.insert(
+                            "Authorization".to_string(),
+                            McpValue::Ref {
+                                var: var.to_string(),
+                                bearer: true,
+                                optional: false,
+                            },
+                        );
                     }
                     McpTransport::Http {
                         url: url.to_string(),
@@ -102,10 +116,18 @@ impl Codex {
                     }
                 }
                 None => {
-                    let mut env = toml_string_map(cfg.get("env"), file, &context, "env")?;
+                    // `env` 与 `http_headers` 同理：**字面量**。
+                    let mut env = toml_literal_map(cfg.get("env"), file, &context, "env")?;
                     // `env_vars` 是 codex 的**同名转发**：清单侧的等价写法就是 `K: ${K}`。
                     for var in toml_string_array(cfg.get("env_vars"), file, &context, "env_vars")? {
-                        env.insert(var.clone(), format!("${{{var}}}"));
+                        env.insert(
+                            var.clone(),
+                            McpValue::Ref {
+                                var,
+                                bearer: false,
+                                optional: false,
+                            },
+                        );
                     }
                     McpTransport::Stdio {
                         command: toml_optional_string(cfg, "command", file, &context)?
@@ -371,6 +393,21 @@ fn toml_string_array(
         );
     }
     Ok(out)
+}
+
+/// `env` / `http_headers` → 值：这两格是**字面量**（codex 原样发出去，不展开 `${VAR}`），
+/// 所以一律照抄成 `Literal`，**哪怕它长得像引用**。`env_vars` / `env_http_headers` /
+/// `bearer_token_env_var` 才是「从环境取值」的那几格（见 `read_mcps`）。
+fn toml_literal_map(
+    value: Option<&TomlValue>,
+    file: &Path,
+    context: &str,
+    field: &str,
+) -> anyhow::Result<BTreeMap<String, McpValue>> {
+    Ok(toml_string_map(value, file, context, field)?
+        .into_iter()
+        .map(|(key, text)| (key, McpValue::Literal(text)))
+        .collect())
 }
 
 /// `env` / `http_headers` 一类的字符串映射。报错只到键名为止——值可能是明文密钥。
@@ -682,7 +719,7 @@ CONTEXT7_API_KEY = "${CONTEXT7_API_KEY}"
                 ..
             } => {
                 // 原样保留引用形态，绝不展开成真实密钥
-                assert_eq!(env["CONTEXT7_API_KEY"], "${CONTEXT7_API_KEY}");
+                assert_eq!(env["CONTEXT7_API_KEY"].to_text(), "${CONTEXT7_API_KEY}");
             }
             other => panic!("{other:?}"),
         }
@@ -747,7 +784,7 @@ env = {}
                 ..
             } => {
                 assert_eq!(url, "https://mcp.context7.com/mcp");
-                assert_eq!(headers["Authorization"], "${K}");
+                assert_eq!(headers["Authorization"].to_text(), "${K}");
             }
             other => panic!("{other:?}"),
         }
@@ -769,7 +806,7 @@ env = {}
             Spec::Mcp {
                 transport: McpTransport::Http { headers, .. },
                 ..
-            } => assert_eq!(headers["Authorization"], "${CONTEXT7_API_KEY}"),
+            } => assert_eq!(headers["Authorization"].to_text(), "${CONTEXT7_API_KEY}"),
             other => panic!("{other:?}"),
         }
     }
@@ -788,8 +825,8 @@ env = {}
                 transport: McpTransport::Stdio { env, .. },
                 ..
             } => {
-                assert_eq!(env["K"], "${K}");
-                assert_eq!(env["W"], "${W}");
+                assert_eq!(env["K"].to_text(), "${K}");
+                assert_eq!(env["W"].to_text(), "${W}");
             }
             other => panic!("{other:?}"),
         }
@@ -811,7 +848,10 @@ env = {}
             Spec::Mcp {
                 transport: McpTransport::Http { headers, .. },
                 ..
-            } => assert_eq!(headers["Authorization"], "Bearer ${CONTEXT7_API_KEY}"),
+            } => assert_eq!(
+                headers["Authorization"].to_text(),
+                "Bearer ${CONTEXT7_API_KEY}"
+            ),
             other => panic!("{other:?}"),
         }
     }

@@ -1,7 +1,8 @@
 use crate::adapters::{CLAUDE_CODE, HarnessAdapter};
 use crate::apply::mcp::{McpMechanism, McpTarget};
 use crate::capability::{
-    CapId, Capability, Kind, McpTransport, Origin, Spec, Support, Targets, normalize_locator,
+    CapId, Capability, Kind, McpTransport, McpValue, Origin, Spec, Support, Targets,
+    normalize_locator,
 };
 use crate::home::Home;
 use crate::skills_dir::try_read_skill_entries;
@@ -318,9 +319,23 @@ pub(crate) fn mcp_capability(
     // 两种传输**恰好一种**：有 `url` 就是 http，否则按 stdio 读 `command`。
     // 两边都没有时留 `command: ""`——那是"配了个空条目"的事实，由 doctor 报，
     // 不在这里编一个形态出来。
+    //
+    // **值那一侧逐家不同**（§9.6）：claude 的 `env` / `headers` 会**展开** `${VAR}`，
+    // 所以按引用解析；kimi 两个字段都是**字面量**（`buildMcpRemoteHeaders` 直接
+    // `{ ...config.headers }`），照抄成字面量才对。同一串文本在哪一格是什么意思，
+    // 由**字段**决定，不由文本长什么样决定——这正是 [`McpValue`] 存在的理由。
+    let expands_refs = harness == CLAUDE_CODE;
+    let read_map =
+        |value: Option<&Value>, field: &str| -> anyhow::Result<BTreeMap<String, McpValue>> {
+            if expands_refs {
+                read_value_map(value, file, &context, field)
+            } else {
+                read_literal_map(value, file, &context, field)
+            }
+        };
     let transport = match optional_string(cfg, "url", file, &context)? {
         Some(url) => {
-            let mut headers = read_string_map(cfg.get("headers"), file, &context, "headers")?;
+            let mut headers = read_map(cfg.get("headers"), "headers")?;
             // kimi 的 `bearerTokenEnvVar` 是「从环境取一个 token，发成
             // `Authorization: Bearer <token>`」——**它的唯一凭据通道**。读回成清单里
             // 那个一等写法，否则「henv 自己按 bearer 交付的条目」下一轮 diff 会被报成
@@ -329,7 +344,14 @@ pub(crate) fn mcp_capability(
             // claude 没有这个字段（它的 headers 直接吃 `${VAR}`），所以只在 kimi 上认。
             if harness == crate::adapters::KIMI_CODE {
                 if let Some(var) = optional_string(cfg, "bearerTokenEnvVar", file, &context)? {
-                    headers.insert("Authorization".to_string(), format!("Bearer ${{{var}}}"));
+                    headers.insert(
+                        "Authorization".to_string(),
+                        McpValue::Ref {
+                            var: var.to_string(),
+                            bearer: true,
+                            optional: false,
+                        },
+                    );
                 }
             }
             McpTransport::Http {
@@ -342,7 +364,7 @@ pub(crate) fn mcp_capability(
                 .map(String::from)
                 .unwrap_or_default(),
             args: read_string_array(cfg.get("args"), file, &context, "args")?,
-            env: read_string_map(cfg.get("env"), file, &context, "env")?,
+            env: read_map(cfg.get("env"), "env")?,
         },
     };
 
@@ -373,6 +395,35 @@ fn read_string_array(
         );
     }
     Ok(out)
+}
+
+/// `env` / `headers` → 值：**这家会展开** `${VAR}`（claude），所以按引用解析；解析不了的
+/// （`X-Foo: bar` 这类手写值）就是字面量——与写路径对称。
+fn read_value_map(
+    value: Option<&Value>,
+    file: &Path,
+    context: &str,
+    field: &str,
+) -> anyhow::Result<BTreeMap<String, McpValue>> {
+    let mut out = BTreeMap::new();
+    for (key, text) in read_string_map(value, file, context, field)? {
+        out.insert(key, McpValue::from_text_or_literal(&text));
+    }
+    Ok(out)
+}
+
+/// `env` / `headers` → 值：**这家不展开**（kimi 的 `headers` / `env` 都是字面量），
+/// 所以一律照抄成 `Literal`——哪怕那段文本长得像 `${VAR}`（§9.6 的实测）。
+fn read_literal_map(
+    value: Option<&Value>,
+    file: &Path,
+    context: &str,
+    field: &str,
+) -> anyhow::Result<BTreeMap<String, McpValue>> {
+    Ok(read_string_map(value, file, context, field)?
+        .into_iter()
+        .map(|(key, text)| (key, McpValue::Literal(text)))
+        .collect())
 }
 
 /// `env` / `headers` 一类的字符串映射。
@@ -742,11 +793,7 @@ mod tests {
                 transport: McpTransport::Stdio {
                     command: "npx".into(),
                     args: vec!["-y".into(), "@upstash/context7-mcp".into()],
-                    env: [(
-                        "CONTEXT7_API_KEY".to_string(),
-                        "${CONTEXT7_API_KEY}".to_string()
-                    )]
-                    .into(),
+                    env: crate::testutil::mcp_map(&[("CONTEXT7_API_KEY", "${CONTEXT7_API_KEY}")]),
                 },
             }
         );
@@ -805,7 +852,7 @@ mod tests {
                 ..
             } => {
                 assert_eq!(url, "https://mcp.context7.com/mcp");
-                assert_eq!(headers["Authorization"], "${K}", "引用原样保留");
+                assert_eq!(headers["Authorization"].to_text(), "${K}", "引用原样保留");
             }
             other => panic!("{other:?}"),
         }
@@ -824,8 +871,12 @@ mod tests {
                 transport: McpTransport::Stdio { env, .. },
                 ..
             } => {
-                assert_eq!(env["K"], "${HENV_TEST_SECRET_XYZ}", "must stay a reference");
-                assert!(!env.values().any(|v| v == "expanded-value"));
+                assert_eq!(
+                    env["K"].to_text(),
+                    "${HENV_TEST_SECRET_XYZ}",
+                    "must stay a reference"
+                );
+                assert!(!env.values().any(|v| v.to_text() == "expanded-value"));
             }
             other => panic!("{other:?}"),
         }
@@ -1821,7 +1872,10 @@ mod tests {
             Spec::Mcp {
                 transport: McpTransport::Http { headers, .. },
                 ..
-            } => assert_eq!(headers["Authorization"], "Bearer ${CONTEXT7_API_KEY}"),
+            } => assert_eq!(
+                headers["Authorization"].to_text(),
+                "Bearer ${CONTEXT7_API_KEY}"
+            ),
             other => panic!("{other:?}"),
         }
     }
@@ -1849,7 +1903,10 @@ mod tests {
                 transport: McpTransport::Stdio {
                     command: "npx".into(),
                     args: vec!["-y".into(), "pkg".into()],
-                    env: [("K".to_string(), "${K}".to_string())].into(),
+                    // **这是 kimi 的 `env`**：那是个字面量字段（kimi 不展开），所以
+                    // `${K}` 在这儿的真身份是「一段文本」，读成 `Literal` 才对——
+                    // 同一个 helper 在 claude 上会把同样的文本读成引用，差别只在字段归属。
+                    env: [("K".to_string(), McpValue::Literal("${K}".to_string()))].into(),
                 },
             }
         );

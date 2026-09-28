@@ -6,7 +6,7 @@ pub mod kimi_code;
 
 use crate::apply::HarnessReport;
 use crate::apply::mcp::McpTarget;
-use crate::capability::{Capability, McpTransport, SkillSource, Support};
+use crate::capability::{Capability, McpTransport, McpValue, SkillSource, Support};
 use crate::diff::HarnessPlan;
 use crate::home::Home;
 use crate::skills_dir::{SkillEntry, SkillStore, plugin_from_path};
@@ -54,57 +54,79 @@ pub(crate) fn mcp_expressible(harness: &str, transport: &McpTransport) -> Result
         (CLAUDE_CODE, _) => Ok(()),
         (CODEX, McpTransport::Stdio { env, .. }) => {
             for (key, value) in env {
-                // 同名转发（`K: ${K}`）就是 codex 的 `env_vars`。
-                if crate::secrets::parse_ref(value) == Some(key.as_str()) {
-                    continue;
+                match value {
+                    // 同名转发（`K: ${K}`）就是 codex 的 `env_vars`。
+                    McpValue::Ref {
+                        var,
+                        bearer: false,
+                        optional: false,
+                    } if var == key => {}
+                    // `Bearer ${VAR}` 是 header 的写法：codex 的 bearer 字段专指
+                    // `Authorization`，`env` 里没有它的位置。
+                    McpValue::Ref { bearer: true, .. } => {
+                        return Err(format!(
+                            "`Bearer ${{VAR}}` 是 header 的写法（codex 的 \
+                             `bearer_token_env_var` 专指 `Authorization`）；`{key}` 这个 env \
+                             表达不了"
+                        ));
+                    }
+                    // `${K:-}` 也是同名，但带着「变量缺失时取空值」那一层语义，而
+                    // `env_vars` 只收变量名——那层语义没有落点。**不能把默认值扔掉当成
+                    // 同名转发**：变量缺失时 codex 会报缺输入（可见），而清单说的是
+                    // 「缺了也行」。
+                    McpValue::Ref { optional: true, .. } => {
+                        return Err(format!(
+                            "codex 的 `env_vars` 只收变量名，表达不了 `{key}` 上 `${{VAR:-}}` 的\
+                             「变量缺失时取空值」语义"
+                        ));
+                    }
+                    // 剩下的 `Ref` 就是换名映射（`K: ${OTHER}`）：`env` 只能放字面量。
+                    McpValue::Ref { .. } => {
+                        return Err(format!(
+                            "codex 的 `env` 只收字面量，从环境取值只能**同名**转发\
+                             （`env_vars`）；`{key}` 映射到别的变量名表达不了"
+                        ));
+                    }
+                    // 清单不收字面量，所以这条不可达；真到了这儿也不能顺手写下去。
+                    McpValue::Literal(_) => {
+                        return Err(format!("`{key}` 的值是字面量，而清单只收引用"));
+                    }
                 }
-                // `Bearer ${VAR}` 是 header 的写法：codex 的 bearer 字段专指
-                // `Authorization`，`env` 里没有它的位置。
-                if crate::secrets::parse_bearer_ref(value).is_some() {
-                    return Err(format!(
-                        "`Bearer ${{VAR}}` 是 header 的写法（codex 的 `bearer_token_env_var` \
-                         专指 `Authorization`）；`{key}` 这个 env 表达不了"
-                    ));
-                }
-                // `${K:-}` 也是同名，但带着「变量缺失时取空值」那一层语义，而 `env_vars`
-                // 只收变量名——那层语义没有落点。**不能把默认值扔掉当成同名转发**：
-                // 变量缺失时 codex 会报缺输入（可见），而清单说的是「缺了也行」。
-                if crate::secrets::parse_manifest_ref(value) == Some(key.as_str()) {
-                    return Err(format!(
-                        "codex 的 `env_vars` 只收变量名，表达不了 `{key}` 上 `${{VAR:-}}` 的\
-                         「变量缺失时取空值」语义"
-                    ));
-                }
-                // 剩下的就是换名映射（`K: ${OTHER}`）：`env` 只能放字面量。
-                return Err(format!(
-                    "codex 的 `env` 只收字面量，从环境取值只能**同名**转发（`env_vars`）；\
-                     `{key}` 映射到别的变量名表达不了"
-                ));
             }
             Ok(())
         }
         (CODEX, McpTransport::Http { headers, .. }) => {
             for (name, value) in headers {
-                // 裸引用 → `env_http_headers`（头名 → 变量名）。
-                if crate::secrets::parse_ref(value).is_some() {
-                    continue;
-                }
-                // `Bearer ${VAR}` → `bearer_token_env_var`，但那个字段**只**管
-                // `Authorization`：别的头名它送不出去。
-                if crate::secrets::parse_bearer_var(value).is_some() {
-                    if name.eq_ignore_ascii_case("authorization") {
-                        continue;
+                match value {
+                    // 裸引用 → `env_http_headers`（头名 → 变量名）。
+                    McpValue::Ref {
+                        bearer: false,
+                        optional: false,
+                        ..
+                    } => {}
+                    // `Bearer ${VAR}` → `bearer_token_env_var`，但那个字段**只**管
+                    // `Authorization`：别的头名它送不出去。
+                    McpValue::Ref {
+                        bearer: true,
+                        optional: false,
+                        ..
+                    } if name.eq_ignore_ascii_case("authorization") => {}
+                    McpValue::Ref { bearer: true, .. } => {
+                        return Err(format!(
+                            "codex 的 `bearer_token_env_var` 只作用于 `Authorization`；\
+                             `{name}` 这个头写不出 `Bearer ${{VAR}}` 的语义"
+                        ));
                     }
-                    return Err(format!(
-                        "codex 的 `bearer_token_env_var` 只作用于 `Authorization`；`{name}` \
-                         这个头写不出 `Bearer ${{VAR}}` 的语义"
-                    ));
+                    McpValue::Ref { .. } => {
+                        return Err(format!(
+                            "codex 的取值字段收的是**变量名**（`env_http_headers` 或 \
+                             `bearer_token_env_var`），`{name}` 上 `${{VAR:-}}` 的默认值表达不了"
+                        ));
+                    }
+                    McpValue::Literal(_) => {
+                        return Err(format!("`{name}` 的值是字面量，而清单只收引用"));
+                    }
                 }
-                return Err(format!(
-                    "codex 的取值字段收的是**变量名**（`env_http_headers` 或 \
-                     `bearer_token_env_var`），`{name}` 上这种写法（比如 `${{VAR:-}}` 的\
-                     默认值）表达不了"
-                ));
             }
             Ok(())
         }
@@ -123,15 +145,19 @@ pub(crate) fn mcp_expressible(harness: &str, transport: &McpTransport) -> Result
             }
             // kimi 只有一条环境取值通道，而它固定发 `Bearer <token>`——所以
             // `Authorization: Bearer ${VAR}` 正是它能表达的那一种（且只有这一种）。
-            // `headers.len() == 1` 与 `next()` 是同一个条件的两半：只有恰好一个头时
-            // 它才可能是那条唯一的 bearer 通道。
-            if headers.len() == 1 {
-                if let Some((name, value)) = headers.iter().next() {
-                    if name.eq_ignore_ascii_case("authorization")
-                        && crate::secrets::parse_bearer_var(value).is_some()
-                    {
-                        return Ok(());
-                    }
+            if let Some((
+                name,
+                McpValue::Ref {
+                    bearer: true,
+                    optional: false,
+                    ..
+                },
+            )) = (headers.len() == 1)
+                .then(|| headers.iter().next())
+                .flatten()
+            {
+                if name.eq_ignore_ascii_case("authorization") {
+                    return Ok(());
                 }
             }
             Err(
@@ -330,14 +356,14 @@ mod tests {
             args: vec![],
             env: env
                 .iter()
-                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .map(|(k, v)| ((*k).to_string(), McpValue::from_text_or_literal(v)))
                 .collect(),
         };
         let http = |headers: &[(&str, &str)]| McpTransport::Http {
             url: "https://x/mcp".into(),
             headers: headers
                 .iter()
-                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .map(|(k, v)| ((*k).to_string(), McpValue::from_text_or_literal(v)))
                 .collect(),
         };
 

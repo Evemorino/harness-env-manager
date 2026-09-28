@@ -363,6 +363,22 @@ fn check_add_flags(
     Ok(())
 }
 
+/// `--env` / `--header` 收到的 `(KEY, 值)` → `McpValue`。
+///
+/// `parse_env` 已经用**与清单层同一条规则**判过一遍（`secrets::is_manifest_value`），
+/// 这里是转换本身：解不开就说明那两条规则漂了——报错，**绝不降级成字面量**。
+fn mcp_values(
+    pairs: &[(String, String)],
+) -> anyhow::Result<std::collections::BTreeMap<String, henv::capability::McpValue>> {
+    let mut out = std::collections::BTreeMap::new();
+    for (key, text) in pairs {
+        let parsed = henv::capability::McpValue::from_manifest_text(text)
+            .map_err(|_| anyhow::anyhow!("`{key}` 不是清单能表达的引用形态"))?;
+        out.insert(key.clone(), parsed);
+    }
+    Ok(out)
+}
+
 /// `status --kind` 的值域：复用 [`henv::capability::Kind::parse`]，不在 CLI 层另写一张表。
 fn parse_kind(s: &str) -> Result<henv::capability::Kind, String> {
     henv::capability::Kind::parse(s).ok_or_else(|| {
@@ -466,14 +482,14 @@ fn main() -> anyhow::Result<()> {
                 Some(match url.as_deref() {
                     Some(url) => henv::capability::McpTransport::Http {
                         url: url.to_string(),
-                        headers: headers.iter().cloned().collect(),
+                        headers: mcp_values(&headers)?,
                     },
                     None => henv::capability::McpTransport::Stdio {
                         command: command.clone().ok_or_else(|| {
                             anyhow::anyhow!("--mcp requires `--command` or `--url`")
                         })?,
                         args: args.clone(),
-                        env: env.iter().cloned().collect(),
+                        env: mcp_values(&env)?,
                     },
                 })
             } else {

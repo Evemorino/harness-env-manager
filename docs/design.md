@@ -346,6 +346,9 @@ Schema 决策：
    2026-09-28 起允许 `${VAR:-}`（**空**默认值，真实配置里有它）；非空默认值与带前缀的写法
    照旧拒绝——那是这道闸要挡的东西（判据只有一份：`secrets::parse_manifest_ref`，
    CLI 的 `--env` / `--header` 用的是同一个）。
+   **「引用」与「字面量」在模型里是两种东西**（`McpValue`，Plan F）：门禁放过的文本在
+   `lower` 那一步变成 `McpValue::Ref`，而 `Literal` **只可能由读路径产出**——因为 harness
+   配置里的值可以是字面量（codex 的 `http_headers` 就是），而清单里绝不允许。
 3. **degrade 策略按 plugin 条目声明**，不做全局开关：不同 bundle 对 hooks 的依赖程度不同。
 4. **`targets: all` 是默认值**：显式列表只用于定向分发场景。
 5. **`source_harness:` 的存在本身就是拆解请求**，不拿「`degrade:` 写没写」当开关：`degrade` 是
@@ -851,6 +854,28 @@ codex 的 `bearer_token_env_var` 与 kimi 的 `bearerTokenEnvVar`——两家都
 这几条都由 `mcp_expressible` 一句话说清，写器里再各留一道闸——计划错了也不会有半个字面量
 落到配置里。
 
+**「引用」与「字面量」是两种类型，不是同一串字符（Plan F，2026-09-28）。** 值在模型里是
+`McpValue`：`Ref { var, bearer, optional }` 或 `Literal(String)`。清单只产出前者，后者只可能
+来自读回来的配置——**因为同一串文本在哪一格是什么意思，由字段决定，不由文本长什么样决定**：
+
+| harness | 字段 | 读回来是什么 |
+|---|---|---|
+| claude-code | `env` / `headers` | 按引用解析（它真的会展开）；解不开的（`X-Foo: bar`）→ `Literal` |
+| codex | `env` / `http_headers` | **一律 `Literal`**（codex 原样发出去） |
+| codex | `env_vars` / `env_http_headers` / `bearer_token_env_var` | `Ref`（值/键那一侧给的是变量名） |
+| kimi-code | `env` / `headers` | **一律 `Literal`** |
+| kimi-code | `bearerTokenEnvVar` | `Ref { bearer: true }` |
+
+不加这一层会怎样：codex 的 `http_headers.Authorization = "${CONTEXT7_API_KEY}"`（升级前 henv
+自己写出来的样子）读回来是同一串文本，与清单里的引用**逐字符相等**，于是 `diff` 报
+`in-sync`——而 codex 实际把那段文本当 Authorization 发出去，没有任何一方会报错。
+分了类型之后：别人手工配的那种条目报 `conflict`（henv 不能证明是它写的，绝不覆盖），
+升级前 henv 交付过的报 `update` 并**就地自愈**成 `env_http_headers`。
+
+渲染与哈希都跟着这一层走：引用按 `to_text()` 原样显示（那只是变量名），字面量一律 `***`；
+账本哈希也用 `to_text()` 取字节，于是**今天所有合法形态的哈希与改造前逐字节相同**——账本
+不需要迁移，升级后不会集体报「副本被手改过」（真机上那份账本仍全 in-sync，就是这条的证据）。
+
 **`scan` 按条跳过表达不了的值，不再整场失败（2026-09-28）。** harness 配置里的值可以是
 字面量（手工写的 `Authorization = "Bearer sk-…"`），而清单只收引用。修之前那种条目会写出一份
 解不开的清单，落盘自检直接失败——**一条手工条目拖垮整次收养**。现在 `adoptable` 逐条判值：
@@ -912,7 +937,7 @@ config`，退出码非 0，没有 `--force` 之类的覆盖开关；`remove` 只
 
 `update` 的 from/to 用**可读摘要**（`mcp_summary`）而不是哈希：stdio 那条是命令行
 （`npx -y @upstash/context7-mcp`），http 那条是 `http <url>`，两者的 `env`/`headers`
-渲染成 `键=引用`（`K=${K}`、`Authorization=${TOKEN:-}`），**认不出的形态一律 `***`**——
+渲染成 `键=引用`（`K=${K}`、`Authorization=Bearer ${TOKEN}`），**字面量一律 `***`**——
 只列键名的话，「把 header 从 `${A}` 换成 `${B}`」在 update 行上左右一模一样，等于没说改了什么
 （2026-09-28 实测反馈：context7 那次 diff 就是这种看不出差别的行）。MCP 的「内容」就是这些
 字段，哈希在这里只是账本用的凭证。凭证由

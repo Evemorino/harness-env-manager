@@ -7,7 +7,7 @@
 
 use henv::capability::McpTransport;
 use henv::manifest::SkillSourceKind;
-use henv::testutil::TempHome;
+use henv::testutil::{mcp_map, TempHome};
 use henv::{AddKind, AddRequest, RemoveRequest, UpgradeRequest};
 
 const MANIFEST: &str = "env.yaml";
@@ -216,14 +216,9 @@ fn add_writes_an_http_mcp_entry() {
     let t = TempHome::new();
     t.write(MANIFEST, base_manifest());
     let manifest = t.path(MANIFEST);
-    let mut headers = std::collections::BTreeMap::new();
-    headers.insert(
-        "Authorization".to_string(),
-        "${CONTEXT7_API_KEY}".to_string(),
-    );
     let transport = McpTransport::Http {
         url: "https://mcp.context7.com/mcp".to_string(),
-        headers,
+        headers: mcp_map(&[("Authorization", "${CONTEXT7_API_KEY}")]),
     };
 
     add(
@@ -260,11 +255,10 @@ fn add_writes_an_mcp_entry() {
     t.write(MANIFEST, base_manifest());
     let manifest = t.path(MANIFEST);
     let args = vec!["-y".to_string(), "@upstash/context7-mcp".to_string()];
-    let env = [("API_KEY".to_string(), "${CONTEXT7_API_KEY}".to_string())];
     let transport = McpTransport::Stdio {
         command: "npx".to_string(),
         args: args.clone(),
-        env: env.iter().cloned().collect(),
+        env: mcp_map(&[("API_KEY", "${CONTEXT7_API_KEY}")]),
     };
 
     let out = add(
@@ -306,12 +300,10 @@ fn the_same_name_can_live_in_two_sections() {
     let manifest = t.path(MANIFEST);
 
     add_shared_foo(&t, &manifest, true).expect("先加 skill");
-    let args: Vec<String> = Vec::new();
-    let env: Vec<(String, String)> = Vec::new();
     let transport = McpTransport::Stdio {
         command: "npx".to_string(),
-        args: args.clone(),
-        env: env.iter().cloned().collect(),
+        args: Vec::new(),
+        env: mcp_map(&[]),
     };
     add(
         &t,

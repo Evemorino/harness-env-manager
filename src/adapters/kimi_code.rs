@@ -389,7 +389,7 @@ mod tests {
             Spec::Mcp {
                 transport: McpTransport::Stdio { env, .. },
                 ..
-            } => assert_eq!(env["CONTEXT7_API_KEY"], "${CONTEXT7_API_KEY}"),
+            } => assert_eq!(env["CONTEXT7_API_KEY"].to_text(), "${CONTEXT7_API_KEY}"),
             other => panic!("{other:?}"),
         }
     }
@@ -1248,7 +1248,10 @@ mod tests {
             Spec::Mcp {
                 transport: McpTransport::Http { headers, .. },
                 ..
-            } => assert_eq!(headers["Authorization"], "Bearer ${CONTEXT7_API_KEY}"),
+            } => assert_eq!(
+                headers["Authorization"].to_text(),
+                "Bearer ${CONTEXT7_API_KEY}"
+            ),
             other => panic!("{other:?}"),
         }
     }
