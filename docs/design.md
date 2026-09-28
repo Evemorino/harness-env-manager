@@ -1223,6 +1223,15 @@ plugins:
 §2.1 第 3 条的原话。`targets` 不含的家照旧报 `drift`——「清单说只记在 claude」而 kimi 也装着一份，
 那是「它铺到别的家去了」，是该看见的事，不是记录型条目要吞掉的噪音。
 
+**一个身份可以同时是「交付」和「记录」。** 身份是 `entry`（缺省 = key），不是键——两条不同
+键的条目可以有同一个 `entry`，前提是 `targets` **不相交**：一条写 `source_harness:` 请求拆解
+交付，另一条写 `source: snapshot` 记录另一家的自带副本。真机上的形状就是它：claude 侧是
+bundle（拆解交给 codex），kimi 侧自带一份同名 plugin、只做记录。**只把交付条目的 `targets`
+收窄而不补这一条**，那家就从「要求交付、交付不了」（`undeliverable`，问题）滑成「不在清单里」
+（`drift`，警告）——数字好看了，清单却不再如实描述本机（实测：`plugin` 一条 + 它分发的 15 条
+skill）。`targets` 相交的写法**没有定义**：`desired` 里会出现两个同 id 的能力，先处理哪条决定
+结果，别写。
+
 **载荷走旁路表（`SnapshotTable`），`Spec::Plugin` 一个字段都不加。** 与 `DegradeTable` /
 `SourceHarnessTable` 同一个先例：`Spec` 回答「装的是什么」，「这条只记录」是**条目语义**。
 表里**有这个名字** = 这条条目是记录型（哪怕 `versions` 是空的）——空表与不在表里是两件事：

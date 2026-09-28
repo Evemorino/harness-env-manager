@@ -1428,6 +1428,60 @@ mod tests {
         assert_eq!(plan.counts().drift, 0);
     }
 
+    /// §10.3：**同一个 plugin 身份可以同时有一条交付条目和一条记录条目**，各管几家。
+    /// 真机上的形状就是它——claude 侧是 bundle（拆解交给 codex），kimi 侧自带一份同名
+    /// plugin、只做记录。两条条目的 `entry` 同名、`targets` 不相交。
+    ///
+    /// 不这么写、只把交付条目的 `targets` 收窄，那家就从「要求交付但交付不了」
+    /// （`undeliverable`，问题）滑成「不在清单里」（`drift`，警告）——数字好看，
+    /// 但清单不再如实描述本机。这条钉住记录条目确实把它吸收掉。
+    #[test]
+    fn a_record_entry_can_share_an_identity_with_a_delivery_entry() {
+        let m = crate::manifest::Manifest::parse(
+            "version: 1\n\n\
+             plugins:\n  bundle:\n    source: github\n    repo: x/y\n    entry: superpowers\n    \
+             source_harness: claude-code\n    targets: [claude-code, codex]\n  \
+             kimi-copy:\n    source: snapshot\n    entry: superpowers\n    \
+             versions:\n      kimi-code: v6.3.0\n    targets: [kimi-code]\n",
+        )
+        .expect("同身份的两条条目是合法清单");
+        let desired = crate::lower::lower(&m);
+        let snapshots = SnapshotTable::new(&m);
+        let sources = SourceHarnessTable::new(&m);
+        let (states, adapters) = harness_states(vec![
+            fake("claude-code").with_caps(vec![FakeAdapter::plugin("superpowers", None, None)]),
+            fake("codex"),
+            fake("kimi-code").with_caps(vec![FakeAdapter::plugin(
+                "superpowers",
+                Some("v6.3.0"),
+                None,
+            )]),
+        ]);
+        let inputs = harness_inputs(&states, &adapters);
+
+        let plan = compute(
+            &desired,
+            &inputs,
+            &no_degrade(),
+            &ContentIndex::default(),
+            &Ledger::default(),
+            &sources,
+            &snapshots,
+        );
+
+        assert_eq!(plan.counts().conflict, 0, "{plan:?}");
+        let kimi = plan
+            .harnesses
+            .iter()
+            .find(|h| h.harness == "kimi-code")
+            .expect("kimi-code 在报告里");
+        assert_eq!(
+            kimi.entries,
+            vec![],
+            "记录条目要吸收 kimi 自带的那份，而不是报 drift：{plan:?}"
+        );
+    }
+
     /// 清单记着它、本机没有 → 一条行（`actual: None`）。记录过期了要说出来，
     /// 但它在 doctor 里是警告（Task 3），不是门禁。
     #[test]
