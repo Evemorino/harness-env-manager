@@ -21,6 +21,7 @@ use std::path::Path;
 
 pub mod adapters;
 pub mod apply;
+pub mod browse;
 pub mod capability;
 pub mod decompose;
 pub mod diff;
@@ -32,6 +33,7 @@ pub mod manifest_edit;
 pub mod render;
 pub mod scan;
 pub mod secrets;
+pub mod show;
 pub mod skills_dir;
 pub mod store;
 
@@ -255,36 +257,140 @@ pub fn run_diff(manifest_path: &Path, home: &Home, out: &mut dyn Write) -> anyho
     Ok(())
 }
 
-/// `henv skills list`：给一个 git 地址，列出里面所有含 `SKILL.md` 的目录（§9.8）。
-///
-/// 只读入口：不读清单、不碰 harness 目录、不写账本。唯一的写入是 henv 自己
-/// 缓存下的一个临时子目录（`store::git::list_skills` 自己负责删）。
-/// 名字对齐到最长的那个：好看，且便于 `awk '{print $2}'` 直接取路径。
-pub fn run_skills_list(
-    repo: &str,
-    git_ref: Option<&str>,
-    sub: Option<&str>,
+/// 扫三家的现状，**不看清单**。`status` 与 `browse` 共用：它们回答的都是「本机事实」，
+/// 与某份期望无关，所以 `read_harness_states`（那个要 manifest 判 `enabled`）在这里不适用。
+pub(crate) fn read_states(
     home: &Home,
-) -> anyhow::Result<String> {
-    let found = store::git::list_skills(repo, sub, git_ref, &home.henv_git_cache())?;
-    if found.is_empty() {
-        // 空结果与「命令失败」是两回事：看过了，只是里面没有 skill。
-        return Ok(format!("没有找到含 SKILL.md 的目录（看了 {repo}）\n"));
+    only: Option<&str>,
+) -> anyhow::Result<Vec<diff::HarnessState>> {
+    let registry = adapters::registry(home);
+    let mut states = Vec::new();
+    for adapter in &registry {
+        let name = adapter.name();
+        if only.is_some_and(|want| want != name) {
+            continue;
+        }
+        let detected = adapter.detect();
+        // 未安装的不去 `read_state`：对一个不存在的目录做 IO 没有意义，也让 `detected=false`
+        // 这个事实更干净。
+        let actual = if detected {
+            adapter
+                .read_state()
+                .with_context(|| format!("cannot scan {name} state"))?
+        } else {
+            Vec::new()
+        };
+        states.push(diff::HarnessState {
+            name: name.to_string(),
+            detected,
+            actual,
+        });
     }
-    let width = found
-        .iter()
-        .map(|(n, _)| n.chars().count())
-        .max()
-        .unwrap_or(0);
-    let mut out = String::new();
-    for (name, rel) in found {
-        let _ = writeln!(
-            out,
-            "{name}{}  {rel}",
-            " ".repeat(width - name.chars().count())
-        );
+    Ok(states)
+}
+
+/// `henv status`：列出本机每一家**当前装着的**能力（§9.8）。
+///
+/// 与 `diff` 的分工：`diff` 回答「清单要的和本机差在哪」，`status` 回答「本机现在有什么」。
+/// 所以它**不读清单**——没有清单也能用，被 `enabled: false` 排除的家照样列出来。排查
+/// 「codex 怎么会有这个 skill」这类问题时，人要的是现状，而不是现状与某份期望的差。
+///
+/// 只读：不写任何文件，连缓存都不碰（`read_state` 全程只读）。
+pub fn run_status(
+    home: &Home,
+    out: &mut dyn Write,
+    only: Option<&str>,
+    kind: Option<capability::Kind>,
+) -> anyhow::Result<()> {
+    // 账本只用来标 `[henv]`：这条是 henv 交付的，还是本机原生的/手放的。
+    let ledger = store::provenance::Ledger::load(home)?;
+    for state in read_states(home, only)? {
+        let name = state.name.as_str();
+        if !state.detected {
+            let _ = writeln!(out, "{name}  (not installed)");
+            continue;
+        }
+        let caps = &state.actual;
+        let _ = writeln!(out, "{name}");
+        for k in capability::Kind::all() {
+            if kind.is_some_and(|want| want != k) {
+                continue;
+            }
+            let rows: Vec<&capability::Capability> =
+                caps.iter().filter(|c| c.id.kind == k).collect();
+            if rows.is_empty() {
+                continue;
+            }
+            let _ = writeln!(out, "  {} ({})", plural(k), rows.len());
+            // 名字列对齐到最长的那条——与 `skills list` 同一个排版习惯。
+            let width = rows
+                .iter()
+                .map(|c| c.id.name.chars().count())
+                .max()
+                .unwrap_or(0);
+            for c in rows {
+                let managed = if ledger.find(name, c.id.kind, &c.id.name).is_some() {
+                    "  [henv]"
+                } else {
+                    ""
+                };
+                let _ = writeln!(
+                    out,
+                    "    {:<width$}  {}{managed}",
+                    c.id.name,
+                    source_summary(&c.spec, home.root()),
+                );
+            }
+        }
     }
-    Ok(out)
+    Ok(())
+}
+
+/// 分组标题的复数拼写。`Kind::as_str` 是单数（`skill`），这里只加 `s`——
+/// 六个词恰好都是规则复数，不值得为它建一张表。
+fn plural(kind: capability::Kind) -> String {
+    format!("{}s", kind.as_str())
+}
+
+/// 一条能力的来源摘要——**这是 `status` 存在的理由之一**：`diff` 只在你和清单不一致时
+/// 才说话，而「这条到底哪来的」是排查时最先要问的问题。
+fn source_summary(spec: &capability::Spec, home: &std::path::Path) -> String {
+    use capability::{SkillSource, Spec};
+    match spec {
+        Spec::Skill { source, .. } => match source {
+            SkillSource::AgentsDir => "agents-dir".to_string(),
+            SkillSource::Local { path } => format!("local  {}", tidy(path, home)),
+            SkillSource::Git { repo, git_ref, .. } => format!("git    {repo}@{git_ref}"),
+            SkillSource::PluginBundle { plugin } => format!("plugin {plugin}"),
+            SkillSource::Unknown => "unknown".to_string(),
+        },
+        // MCP 的摘要只渲染键名与命令/URL，绝不渲染值——那是 `mcp_summary` 的既有契约
+        // （actual 侧的值可能是明文密钥）。
+        Spec::Mcp { transport } => capability::mcp_summary(transport),
+        Spec::Plugin {
+            marketplace,
+            version,
+            ..
+        } => match (marketplace.as_deref(), version.as_deref()) {
+            (Some(m), Some(v)) => format!("{m} {v}"),
+            (Some(m), None) => m.to_string(),
+            (None, Some(v)) => v.to_string(),
+            (None, None) => "—".to_string(),
+        },
+        Spec::Command { path } | Spec::Agent { path } => tidy(path, home),
+        Spec::Hook { event, command } => format!("{event}  {command}"),
+    }
+}
+
+/// 路径里的家目录前缀写成 `~`：`status` 是给人看的，一行里出现四遍 `/Users/nava` 只会挤压
+/// 真正有信息的那部分。
+fn tidy(path: &std::path::Path, home: &std::path::Path) -> String {
+    let raw = path.display().to_string();
+    let prefix = home.display().to_string();
+    match raw.strip_prefix(&prefix) {
+        Some(rest) if !rest.is_empty() => format!("~{rest}"),
+        _ => raw,
+    }
 }
 
 /// 交付：把清单要的 skill 真拷贝到各家，并把「放了什么」记进账本（§9.2/§9.3）。
@@ -899,37 +1005,6 @@ mod tests {
     use crate::capability::Kind;
     use crate::testutil::TempHome;
 
-    #[test]
-    fn skills_list_prints_a_name_padded_to_the_longest_one() {
-        let t = TempHome::new();
-        let repo = t.git_repo("upstream");
-        repo.write("skills/foo/SKILL.md", "# foo");
-        repo.write("skills/longer-name/SKILL.md", "# longer");
-        repo.commit("init");
-
-        let out = run_skills_list(&repo.url, None, None, &t.home).unwrap();
-        assert_eq!(
-            out,
-            "foo          skills/foo\nlonger-name  skills/longer-name\n"
-        );
-    }
-
-    #[test]
-    fn skills_list_writes_nothing_outside_henv_cache() {
-        // §9.8 说 `skills list` 只读。这里把「只读」钉在它最容易破的地方：
-        // 扫完一个仓库就顺手建了某家的目录（或账本），用户下次 diff 会看到
-        // 一个他没做过的改动。
-        let t = TempHome::new();
-        let repo = t.git_repo("upstream");
-        repo.write("skills/foo/SKILL.md", "# foo");
-        repo.commit("init");
-
-        run_skills_list(&repo.url, None, None, &t.home).unwrap();
-        for rel in [".claude", ".codex", ".kimi", ".agents", ".local"] {
-            assert!(!t.path(rel).exists(), "{rel} 不该被创建");
-        }
-    }
-
     /// 跑一次 run_diff，返回渲染文本。
     /// 用 `TempHome::write` 而非 `std::fs::write`：read_only_guard 扫的是整个
     /// `src/lib.rs`（含 `#[cfg(test)]`），只豁免 `testutil.rs`。
@@ -1501,5 +1576,57 @@ mod tests {
             t.path(".codex/skills/foo").exists(),
             "拒绝之后什么都不该发生"
         );
+    }
+
+    /// `status` 回答的是「本机现在有什么」——与清单无关，被禁用的家照列，
+    /// 而且每条要能看出「是不是 henv 放的」。
+    #[test]
+    fn status_lists_every_harness_and_marks_what_henv_delivered() {
+        let t = TempHome::new();
+        t.mkdir(".claude").mkdir(".codex");
+        t.write(".claude/skills/foo/SKILL.md", "# foo");
+        t.write(".codex/skills/bar/SKILL.md", "# bar");
+        // 账本里只记 claude 的 foo：它就是「henv 交付的」那一条。
+        let mut ledger = crate::store::provenance::Ledger::default();
+        ledger.record(crate::store::provenance::LedgerEntry {
+            harness: CLAUDE_CODE.to_string(),
+            kind: Kind::Skill,
+            name: "foo".to_string(),
+            path: t.path(".claude/skills/foo"),
+            source_id: "agents-dir".to_string(),
+            content_hash: "deadbeef".to_string(),
+            delivered_at_unix: 1,
+        });
+        ledger.save(&t.home).unwrap();
+
+        let mut out = Vec::new();
+        run_status(&t.home, &mut out, None, None).unwrap();
+        let s = String::from_utf8(out).unwrap();
+
+        assert!(s.contains("claude-code"), "{s}");
+        assert!(s.contains("  skills (1)"), "按 kind 分组要带计数：{s}");
+        let foo = s.lines().find(|l| l.contains("foo")).expect("foo 要列出来");
+        assert!(foo.contains("[henv]"), "账本里的那条要标出来：{foo}");
+        let bar = s.lines().find(|l| l.contains("bar")).expect("bar 要列出来");
+        assert!(!bar.contains("[henv]"), "不在账本里的不该标：{bar}");
+        assert!(s.contains("kimi-code  (not installed)"), "{s}");
+    }
+
+    #[test]
+    fn status_can_be_narrowed_by_harness_and_kind() {
+        let t = TempHome::new();
+        t.mkdir(".claude").mkdir(".codex");
+        t.write(".claude/skills/foo/SKILL.md", "# foo");
+        t.write(".codex/skills/bar/SKILL.md", "# bar");
+
+        let mut out = Vec::new();
+        run_status(&t.home, &mut out, Some(CODEX), Some(Kind::Skill)).unwrap();
+        let s = String::from_utf8(out).unwrap();
+
+        assert!(s.contains("codex"), "{s}");
+        assert!(!s.contains("claude-code"), "点名一家就只看那一家：{s}");
+        assert!(s.contains("  skills ("), "{s}");
+        assert!(!s.contains("  plugins ("), "点名 kind 就只看那一类：{s}");
+        assert!(!s.contains("not installed"), "点名了就只列那一家：{s}");
     }
 }

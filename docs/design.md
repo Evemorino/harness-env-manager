@@ -911,7 +911,6 @@ config`，退出码非 0，没有 `--force` 之类的覆盖开关；`remove` 只
 
 ```text
 henv apply [-m env.yaml] [--yes] [--prune] [--harness <name>]
-henv skills list --repo <url> [--ref <r>] [--path <p>]        ← Plan B 新增
 henv add <name> [--source git|local|agents-dir] [--repo <r>] [--path <p>] [--ref <r>] \
          [--targets <list>] [-m env.yaml] [--dry-run] [--no-apply] [--yes] [--harness <name>]
 henv add <name> --mcp --command <c> [--arg <a>]... [--env KEY='${VAR}']... [同上其余开关]
@@ -919,16 +918,21 @@ henv add <name> --mcp --url <u> [--header KEY='${VAR}']...                   [�
 henv remove <name>... [-m env.yaml] [--dry-run] [--keep] [--yes] [--harness <name>]
 henv upgrade [<name>...] [--to <ref>] [-m env.yaml] [--dry-run] [--no-apply] [--yes]
              [--harness <name>]                                ← Plan E 新增
+henv status [--harness <name>] [--kind <kind>]                     ← 现状快照，只读
+henv browse [<query>] [--harness <name>] [--search <pattern>]      ← 可装清单，只读
+henv show <repo> [--ref <r>] [--path <p>]                          ← 仓库盘点，只读
 ```
 
-`skills list`：列出仓库里所有含 `SKILL.md` 的目录（目录名 + 仓库内相对路径），按相对路径排序，
-`--path` 限定只看某个子目录，`--ref` 缺省用仓库默认分支。它是「用户给一个 git 地址」时的第一步。
+`show` 的 skills 段列出仓库里所有含 `SKILL.md` 的目录（目录名 + 仓库内相对路径），按相对路径
+排序，`--path` 限定只看某个子目录，`--ref` 缺省用仓库默认分支。它是「用户给一个 git 地址」时的
+第一步。（2026-09-28：原先独立的 `skills list` 已并入 `show`——它的输出是 `show` 的 skills 段
+的子集，多出来的命令名只会在 `status`/`browse` 旁边加重选择负担。）
 
 **只读的准确含义**（2026-09-26 与实现对齐）：它要 clone 才能看，而 clone 必须落在一个目录里。
-落在 **henv 自己缓存下的一个进程独占子目录**：`~/.cache/henv/git/list-<repo-hash>-<pid>/`，
+落在 **henv 自己缓存下的一个进程独占子目录**：`~/.cache/henv/git/scratch-<repo-hash>-<pid>/`，
 命令返回前删掉（成功失败都删）。**除这个临时目录外不写任何东西**——不碰 harness 目录、
 不碰账本、不碰 `~/.cache/henv/git/` 下 `resolve` 用的那些缓存条目。放缓存下而不是系统临时
-目录，是为了少一处要解释的路径；独占名字（repo-key + pid）让并发的两次 list 不打架。
+目录，是为了少一处要解释的路径；独占名字（repo-key + pid）让并发的两次扫描不打架。
 
 **`--prune` 受不变式二（§9.3）约束**：它删除的范围**只有 provenance 里记着的条目**。
 §5 说「actual 有而 desired 无」就报 drift，但「actual 有」在 harness 目录里包含**用户手建的**
@@ -986,6 +990,46 @@ skill、stdio MCP、http MCP 三个形状；`--arg`/`--env` 只属于 stdio，`-
 用法正是就地重建（`~/.local/bin/henv` 是指向 `target/release/henv` 的软链，`cargo build
 --release` 一跑就生效）。描述由 `build.rs` 在构建时从 git 与 `date` 取，`-dirty` 只看已
 跟踪文件的改动；取不到就退化成 `unknown`——环境缺东西不该拦住构建。
+
+**`show` 盘点一个仓库**（2026-09-28）：`status` 读本机、`browse` 读各家的市场清单、`show`
+读**一个 git 仓库**——三者正交，输入、数据源、回答的问题都不同。
+
+它存在的理由是：**远程仓库不止有 skill**。实测 `obra/superpowers` 一个仓库里同时有 15 个
+skill、6 份 per-harness `plugin.json`（`.claude-plugin` / `.codex-plugin` / `.kimi-plugin`
+是 henv 认识的，`.cursor-plugin` / `.devin-plugin` / `.muse-plugin` 不是），以及 `.agents` /
+`.pi` / `.opencode` 这些 henv 不解析的约定。只看 skill（`skills list`）会漏掉「这个仓库其实
+是个 plugin bundle」这个事实。
+
+**认不出的 manifest 也列出来**，标成「（其它 harness）」——`show` 回答的是「仓库里有什么」，
+而不是「henv 能拿它做什么」，把没见过的藏起来反而不诚实。MCP 同理：看仓库根与各 manifest
+目录下的 `.mcp.json`，以及 manifest 里 `skills`/`hooks`/`mcpServers` 这类能力声明。
+
+**`browse` 是跨 harness 的「可装清单」**（2026-09-28）：`status` 说本机装了什么，`browse`
+说**还能装什么、以及同名条目在各家分别是什么状态**。位置参数先认家名（写 `claude-code`
+就是只看那家的市场），认不出就当关键词；`--harness` / `--search` 是等价的显式写法。
+
+范围**限于 plugin**：只有它有「市场」这个概念——skill 与 MCP 没有任何地方登记「有哪些可
+下载」，所以对它们不存在「推荐」（skill 的发现仍然是 `henv skills list --repo`）。数据来自
+各家的**内部文件**：claude 的 `plugins/marketplaces/<name>/.claude-plugin/marketplace.json`
+（实测 310 条，带 `description`）、codex 的 `.tmp/plugins/.agents/plugins/api_marketplace.json`
+（49 条，只有 `category`）；kimi 的 plugin 从远端 zip 装，本地**没有**可装清单，所以它那栏
+只列已装的，并如实说明原因。
+
+读别人的内部格式是本模块最脆的地方，所以每一处读取都**降级而不失败**：读不出某一家就记一条
+`(note)`，其余照常——一个格式变动不该把整条命令打掉。解析按字段取值（`serde_json::Value`）
+而不是强类型反序列化，同一个理由：多一个字段不该失败，少一个字段也不该。
+
+**`status` 回答的是「本机现在有什么」**（2026-09-28）：它**不读清单**——没有 `env.yaml`
+也能用，被 `enabled: false` 排除的家照列。与 `diff` 的分工是明确的：`diff` 说「清单要的
+和本机差在哪」，`status` 说「本机现在有什么」；排查「codex 怎么会有这个 skill」这类问题时，
+人要的是现状，不是现状与某份期望的差。
+
+每条带**来源摘要**（`agents-dir` / `local <路径>` / `git <repo>@<ref>` / `plugin <名>` /
+MCP 的 `mcp_summary`）和一处 **`[henv]` 标记**——有标记的是 henv 交付的（账本里查得到），
+没有的本机原生或手工放的。来源摘要里 MCP 只渲染键名与命令，绝不渲染 `env` 值
+（`mcp_summary` 的既有契约：actual 侧的值可能是明文密钥）。
+
+只读：不写任何文件，连 henv 自己的缓存都不碰——`read_state` 全程只读。
 
 **交互边界（已确认）**：henv 除落盘前的那一次 y/N 确认（`apply` 与上面三个命令）外
 **不提问**。「这个 skill 加给哪几家」

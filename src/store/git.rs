@@ -315,65 +315,218 @@ fn version_parts(tag: &str) -> Option<Vec<u64>> {
 /// 只读：它只写 henv 自己缓存下的一个**进程独占**子目录，并在返回前删掉。
 /// 放缓存下而不是系统临时目录，是因为 §9.12 已经把 henv 的缓存定在这里，
 /// 少一处要解释的路径；独占名字（repo-key + pid）让两个并发的 list 不打架。
-pub fn list_skills(
+/// 一次仓库盘点（`henv show` 的载荷）。
+///
+/// 与 [`list_skills`] 的关系：那个只回答「仓库里有哪些 skill」，这个回答「这个仓库提供了
+/// 什么」——skill、per-harness manifest、以及 MCP 声明。两者都用临时 clone，都不碰正式缓存。
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct RepoInspection {
+    /// skill：`(名字, 仓库内相对路径)`，与 `list_skills` 同形。
+    pub skills: Vec<(String, String)>,
+    /// 各 harness 的 `plugin.json`（`.claude-plugin/plugin.json` 这类）。
+    pub manifests: Vec<ManifestFound>,
+    /// 有 `.<name>` 目录、但不是 henv 认识的 manifest 形态（`.agents`、`.pi`、`.opencode`…）。
+    /// **只列名字不解析**：它们是别家的约定，henv 不认识不代表它们没内容。
+    pub other_dirs: Vec<String>,
+    /// 仓库里出现的 `.mcp.json`（相对仓库根）。
+    pub mcp_files: Vec<String>,
+}
+
+/// 一条 per-harness manifest。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManifestFound {
+    /// 相对仓库根的路径，如 `.claude-plugin/plugin.json`。
+    pub path: String,
+    /// 认得出是哪一家就填（`.claude-plugin` → claude-code，以此类推）。
+    pub harness: Option<&'static str>,
+    pub name: Option<String>,
+    pub version: Option<String>,
+    /// manifest 里声明了哪些能力段（`skills` / `hooks` / `mcpServers`…），按出现顺序。
+    pub abilities: Vec<String>,
+}
+
+/// 盘点一个仓库：clone 到临时目录、扫完即删（与 `list_skills` 同一套卫生习惯）。
+pub fn inspect(
     repo: &str,
     sub: Option<&str>,
     git_ref: Option<&str>,
     cache: &Path,
-) -> anyhow::Result<Vec<(String, String)>> {
-    let scratch = cache.join(format!("list-{}-{}", repo_key(repo), std::process::id()));
+) -> anyhow::Result<RepoInspection> {
+    with_scratch(repo, cache, |dir| {
+        if let Some(r) = git_ref {
+            git_output(dir, &["checkout", "--quiet", r])?;
+        }
+        let root = match sub {
+            Some(s) => dir.join(s),
+            None => dir.to_path_buf(),
+        };
+        anyhow::ensure!(root.is_dir(), "仓库里没有目录 `{}`", sub.unwrap_or(""));
+        Ok(inspect_tree(dir, &root))
+    })
+}
+
+/// 扫一棵已经 checkout 好的仓库树。纯读，与 git 无关，所以单独放出来便于测试。
+fn inspect_tree(dir: &Path, root: &Path) -> RepoInspection {
+    let mut out = RepoInspection::default();
+
+    // skill：和 `list_skills` 同一条判据（含 SKILL.md 的目录），同样跳过 `.git`。
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        for entry in std::fs::read_dir(&d).into_iter().flatten().flatten() {
+            let p = entry.path();
+            if p.is_dir() {
+                if p.file_name().is_some_and(|n| n == ".git") {
+                    continue;
+                }
+                stack.push(p);
+            }
+        }
+        if d.join("SKILL.md").is_file() {
+            out.skills.push((rel_name(&d, dir), rel_path(&d, dir)));
+        }
+    }
+    out.skills.sort_by(|a, b| a.1.cmp(&b.1));
+
+    // 根目录的直接子目录：`/plugin.json` 是 manifest，其它 `.x` 目录只记名字。
+    let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(root)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    dirs.sort();
+    for d in dirs {
+        let Some(name) = d.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        if name == ".git" {
+            continue;
+        }
+        let manifest = d.join("plugin.json");
+        if manifest.is_file() {
+            out.manifests.push(parse_manifest(
+                &rel_path(&manifest, dir),
+                &manifest,
+                harness_of(&name),
+            ));
+        } else if name.starts_with('.') {
+            // 形如 `.<harness>` 的目录但不是 henv 认识的 manifest（`.agents`、`.pi`…）。
+            out.other_dirs.push(name);
+        }
+        let mcp = d.join(".mcp.json");
+        if mcp.is_file() {
+            out.mcp_files.push(rel_path(&mcp, dir));
+        }
+    }
+
+    // 根目录里的 `*.plugin.json`：kimi 的第二种形态（`kimi.plugin.json`）。
+    for entry in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        let p = entry.path();
+        let Some(name) = p.file_name().map(|n| n.to_string_lossy().to_string()) else {
+            continue;
+        };
+        if p.is_file() && name.ends_with(".plugin.json") {
+            let harness = match name.as_str() {
+                "kimi.plugin.json" => Some(crate::adapters::KIMI_CODE),
+                _ => None,
+            };
+            out.manifests
+                .push(parse_manifest(&rel_path(&p, dir), &p, harness));
+        }
+    }
+    out.manifests.sort_by(|a, b| a.path.cmp(&b.path));
+
+    let root_mcp = root.join(".mcp.json");
+    if root_mcp.is_file() {
+        out.mcp_files.push(rel_path(&root_mcp, dir));
+    }
+    out.mcp_files.sort();
+    out
+}
+
+/// `.claude-plugin` → `claude-code`，以此类推。认不出就是 `None`——**不猜**。
+fn harness_of(dir_name: &str) -> Option<&'static str> {
+    match dir_name {
+        ".claude-plugin" => Some(crate::adapters::CLAUDE_CODE),
+        ".codex-plugin" => Some(crate::adapters::CODEX),
+        ".kimi-plugin" => Some(crate::adapters::KIMI_CODE),
+        _ => None,
+    }
+}
+
+/// 读一条 manifest 的元数据。**按字段取值**：别人的格式，多一个键不该失败。
+fn parse_manifest(path: &str, file: &Path, harness: Option<&'static str>) -> ManifestFound {
+    let mut found = ManifestFound {
+        path: path.to_string(),
+        harness,
+        name: None,
+        version: None,
+        abilities: Vec::new(),
+    };
+    let Ok(text) = std::fs::read_to_string(file) else {
+        return found;
+    };
+    let Ok(root) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return found;
+    };
+    found.name = root
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string);
+    found.version = root.get("version").and_then(|v| match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    });
+    for key in ["skills", "commands", "agents", "hooks", "mcpServers"] {
+        if root.get(key).is_some_and(|v| !v.is_null()) {
+            found.abilities.push(key.to_string());
+        }
+    }
+    found
+}
+
+/// 路径相对仓库根；算不出来就退回原名。
+fn rel_path(p: &Path, dir: &Path) -> String {
+    p.strip_prefix(dir)
+        .unwrap_or(p)
+        .to_string_lossy()
+        .to_string()
+}
+
+fn rel_name(p: &Path, _dir: &Path) -> String {
+    p.file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default()
+}
+
+/// 把仓库 clone 到一个**进程独占的临时目录**、跑 `f`、无论成败都删掉它。
+///
+/// 临时目录落在 henv 缓存下而不是系统临时目录：少一处要解释的路径；命名带 repo-key 与
+/// pid，并发的两次调用不会打架。`f` 拿到的是 clone 出来的仓库根。
+///
+/// 「无论成败都删」是契约：留着的话下次要靠 pid 撞不上去，而残留的半个 clone 会让人以为
+/// 缓存里有东西（`list_skills_writes_nothing_outside_henv_cache` 钉着这条）。
+fn with_scratch<T>(
+    repo: &str,
+    cache: &Path,
+    f: impl FnOnce(&Path) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let scratch = cache.join(format!("scratch-{}-{}", repo_key(repo), std::process::id()));
     if scratch.exists() {
         std::fs::remove_dir_all(&scratch)?;
     }
     std::fs::create_dir_all(&scratch)?;
 
-    let result = (|| -> anyhow::Result<Vec<(String, String)>> {
+    let result = (|| -> anyhow::Result<T> {
         let url = repo_url(repo);
         // 复用 `clone_args`（而不是手写 argv）：这里的 `repo` 直接来自命令行，
         // 是比清单更靠外的入口，`--` 那层保护同样要有。
         git_output(&scratch, &clone_args(&url, "repo"))?;
-        let dir = scratch.join("repo");
-        if let Some(r) = git_ref {
-            git_output(&dir, &["checkout", "--quiet", r])?;
-        }
-        let root = match sub {
-            Some(s) => dir.join(s),
-            None => dir.clone(),
-        };
-        anyhow::ensure!(root.is_dir(), "仓库里没有目录 `{}`", sub.unwrap_or(""));
-
-        let mut found: Vec<(String, String)> = Vec::new();
-        let mut stack = vec![root];
-        while let Some(d) = stack.pop() {
-            for entry in std::fs::read_dir(&d)? {
-                let p = entry?.path();
-                if p.is_dir() {
-                    // 跳过 .git：里面不会有 SKILL.md，但遍历它既慢又容易踩到怪东西。
-                    if p.file_name().is_some_and(|n| n == ".git") {
-                        continue;
-                    }
-                    stack.push(p);
-                }
-            }
-            if d.join("SKILL.md").is_file() {
-                let rel = d
-                    .strip_prefix(&dir)
-                    .unwrap_or(&d)
-                    .to_string_lossy()
-                    .to_string();
-                let name = d
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                found.push((name, rel));
-            }
-        }
-        found.sort_by(|a, b| a.1.cmp(&b.1));
-        Ok(found)
+        f(&scratch.join("repo"))
     })();
 
-    // 无论成败都删掉这次用的临时目录：留着的话下次要靠 pid 撞不上去，
-    // 而残留的半个 clone 会让人以为缓存里有东西。
     let _ = std::fs::remove_dir_all(&scratch);
     result
 }
@@ -384,7 +537,7 @@ mod tests {
     use crate::testutil::TempHome;
 
     #[test]
-    fn list_skills_finds_every_directory_holding_a_skill_md() {
+    fn inspect_finds_every_directory_holding_a_skill_md() {
         let t = TempHome::new();
         let repo = t.git_repo("upstream");
         repo.write("skills/foo/SKILL.md", "# foo");
@@ -393,9 +546,9 @@ mod tests {
         repo.write("skills/not-a-skill/README.md", "nope");
         repo.commit("init");
 
-        let got = list_skills(&repo.url, None, None, &t.home.henv_git_cache()).unwrap();
+        let got = inspect(&repo.url, None, None, &t.home.henv_git_cache()).unwrap();
         assert_eq!(
-            got,
+            got.skills,
             vec![
                 ("bar".to_string(), "skills/bar".to_string()),
                 ("nested".to_string(), "skills/bar/nested".to_string()),
@@ -406,19 +559,22 @@ mod tests {
     }
 
     #[test]
-    fn list_skills_stays_inside_the_requested_sub_path() {
+    fn inspect_stays_inside_the_requested_sub_path() {
         let t = TempHome::new();
         let repo = t.git_repo("upstream");
         repo.write("skills/foo/SKILL.md", "# foo");
         repo.write("other/baz/SKILL.md", "# baz");
         repo.commit("init");
 
-        let got = list_skills(&repo.url, Some("skills"), None, &t.home.henv_git_cache()).unwrap();
-        assert_eq!(got, vec![("foo".to_string(), "skills/foo".to_string())]);
+        let got = inspect(&repo.url, Some("skills"), None, &t.home.henv_git_cache()).unwrap();
+        assert_eq!(
+            got.skills,
+            vec![("foo".to_string(), "skills/foo".to_string())]
+        );
     }
 
     #[test]
-    fn list_skills_cleans_up_after_itself() {
+    fn inspect_cleans_up_after_itself() {
         // 只读的意思是「除了 henv 自己缓存里的那个唯一子目录，什么都不留下」。
         let t = TempHome::new();
         let repo = t.git_repo("upstream");
@@ -426,11 +582,11 @@ mod tests {
         repo.commit("init");
 
         let cache = t.home.henv_git_cache();
-        list_skills(&repo.url, None, None, &cache).unwrap();
+        inspect(&repo.url, None, None, &cache).unwrap();
         let leftovers: Vec<_> = std::fs::read_dir(&cache)
             .map(|d| d.filter_map(|e| e.ok()).map(|e| e.file_name()).collect())
             .unwrap_or_default();
-        assert!(leftovers.is_empty(), "列完就该删干净，实际剩下 {leftovers:?}");
+        assert!(leftovers.is_empty(), "扫完就该删干净，实际剩下 {leftovers:?}");
     }
 
     #[test]
