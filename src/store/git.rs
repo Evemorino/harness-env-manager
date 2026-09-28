@@ -273,6 +273,43 @@ pub fn resolve(
     }))
 }
 
+/// 仓库里最新的「version 形」tag（`v1.2.3` / `1.2.3`），按数字段比较大小。
+///
+/// 给 `henv upgrade` 用。**只认 version 形**：一个都没有时返回 `None`，由调用方提示用户
+/// 用 `--to` 指定——绝不回退到默认分支。「ref 就是锁」的前提是在两个明确的点之间移动，
+/// 回退到分支 HEAD 会让 ref 随上游漂移，那正是本项目的清单要防的事。
+///
+/// 走 `git ls-remote`，不 clone：查一次上游只要几百毫秒，而 clone 一个陌生的仓库不是。
+pub fn latest_version_tag(repo: &str, cache: &Path) -> anyhow::Result<Option<String>> {
+    let url = repo_url(repo);
+    // `ls-remote` 不读本地仓库，但需要一个存在的 cwd 才能跑起来。
+    std::fs::create_dir_all(cache)?;
+    let out = git_output(cache, &["ls-remote", "--tags", "--refs", "--", &url])?;
+    let mut best: Option<(Vec<u64>, String)> = None;
+    for line in out.lines() {
+        let Some(tag) = line.split_whitespace().nth(1) else {
+            continue;
+        };
+        let Some(tag) = tag.strip_prefix("refs/tags/") else {
+            continue;
+        };
+        let Some(parts) = version_parts(tag) else {
+            continue;
+        };
+        if best.as_ref().is_none_or(|(b, _)| parts > *b) {
+            best = Some((parts, tag.to_string()));
+        }
+    }
+    Ok(best.map(|(_, tag)| tag))
+}
+
+/// tag → 数字段。判据与 [`crate::capability::normalize_version`] 同源（去前导 `v` 后含
+/// 小数点），额外要求**每一段都是数字**——要真能比出大小，`v2.0.0-rc.1` 这种不算。
+fn version_parts(tag: &str) -> Option<Vec<u64>> {
+    let body = crate::capability::normalize_version(tag)?;
+    body.split('.').map(|part| part.parse().ok()).collect()
+}
+
 /// 列出一个仓库里所有含 `SKILL.md` 的目录（§9.8）。
 ///
 /// 只读：它只写 henv 自己缓存下的一个**进程独占**子目录，并在返回前删掉。
@@ -474,6 +511,48 @@ mod tests {
             .expect("缓存还在，内容就该给出来");
         assert!(got.stale.is_some(), "没刷新成功就必须标 stale");
         assert!(got.stale.unwrap().contains("未能刷新"));
+    }
+
+    /// `upgrade` 的选版本规则：只认 version 形，按**数字段**比大小。
+    #[test]
+    fn latest_version_tag_picks_the_highest_version_shaped_tag() {
+        let t = crate::testutil::TempHome::new();
+        let repo = t.git_repo("upstream");
+        repo.write("SKILL.md", "# x");
+        repo.commit("init");
+        for name in [
+            "v1.2.3",
+            "v1.9.0",
+            "v1.10.0",
+            "nightly",
+            "b36e082",
+            "v2.0.0-rc.1",
+        ] {
+            repo.tag(name);
+        }
+
+        let got = latest_version_tag(&repo.url, &t.home.henv_git_cache()).unwrap();
+        assert_eq!(
+            got.as_deref(),
+            Some("v1.10.0"),
+            "1.10.0 要压过 1.9.0（字典序会反）；nightly / sha / 预发布都不是 version 形"
+        );
+    }
+
+    #[test]
+    fn latest_version_tag_is_none_when_nothing_looks_like_a_version() {
+        let t = crate::testutil::TempHome::new();
+        let cache = t.home.henv_git_cache();
+
+        let repo = t.git_repo("upstream");
+        repo.write("SKILL.md", "# x");
+        repo.commit("init");
+        repo.tag("nightly");
+        assert_eq!(latest_version_tag(&repo.url, &cache).unwrap(), None);
+
+        // 一个 tag 都没有的仓库同样返回 None，不是错误——由调用方提示用 `--to`。
+        let empty = t.git_repo("empty");
+        assert_eq!(latest_version_tag(&empty.url, &cache).unwrap(), None);
     }
 
     #[test]

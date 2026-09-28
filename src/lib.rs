@@ -27,6 +27,7 @@ pub mod doctor;
 pub mod home;
 pub mod lower;
 pub mod manifest;
+pub mod manifest_edit;
 pub mod render;
 pub mod scan;
 pub mod secrets;
@@ -391,6 +392,377 @@ pub fn run_apply(
         }
     }
     Ok(())
+}
+
+/// `henv add` 的入参。
+///
+/// `targets` 为 `None` 时**不写** `targets:` 行——清单的默认值是 `all`，写与不写语义
+/// 相同，但让文件保持用户自己的样子。
+pub struct AddRequest<'a> {
+    pub name: &'a str,
+    pub source: manifest::SkillSourceKind,
+    pub repo: Option<&'a str>,
+    pub path: Option<&'a str>,
+    pub git_ref: Option<&'a str>,
+    pub targets: Option<Vec<String>>,
+    pub manifest: &'a Path,
+    pub dry_run: bool,
+    pub no_apply: bool,
+}
+
+/// 往清单里插一条 skill，可选接着交付。
+///
+/// 顺序是刻意的：**先验证源真的取得到，再改清单**。验证失败就一个字节都不写——否则会留下
+/// 一条指向不存在内容的条目，之后每次 `diff` 都报错，而用户不知道为什么。
+///
+/// 重名不静默覆盖：清单是事实源，`add` 只负责「这里还没有这条」。
+pub fn run_add(
+    req: &AddRequest<'_>,
+    home: &Home,
+    out: &mut dyn Write,
+    confirm: &mut dyn Confirm,
+    only: Option<&str>,
+) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(req.manifest)
+        .with_context(|| format!("cannot read manifest: {}", req.manifest.display()))?;
+    let manifest = Manifest::parse(&text)
+        .with_context(|| format!("invalid manifest: {}", req.manifest.display()))?;
+    if manifest.skills.contains_key(req.name) {
+        anyhow::bail!(
+            "清单里已经有 skill `{}`：换版本用 `henv upgrade {}`，要重来先 `henv remove {}`",
+            req.name,
+            req.name,
+            req.name
+        );
+    }
+
+    let body = skill_body(req)?;
+    verify_source(req, home)?;
+
+    if req.dry_run {
+        let _ = writeln!(out, "(dry-run) 会新增 skill/{}：", req.name);
+        let _ = writeln!(out, "  {}:", req.name);
+        for line in body.lines() {
+            let _ = writeln!(out, "  {line}");
+        }
+        return Ok(());
+    }
+
+    let entry = manifest_edit::EntryRef {
+        section: manifest_edit::Section::Skills,
+        name: req.name,
+        body: &body,
+    };
+    let new_text =
+        manifest_edit::insert_entries(&text, &[entry])?.expect("非空条目列表不会返回 None");
+    // 落盘前先自己解一遍：写出一份自己都读不回的清单，比不写坏得多。
+    Manifest::parse(&new_text).context("refusing to write a manifest that does not parse back")?;
+    apply::write::write_config(req.manifest, new_text.as_bytes())?;
+    let _ = writeln!(
+        out,
+        "已写入 {}：新增 skill/{}",
+        req.manifest.display(),
+        req.name
+    );
+
+    if req.no_apply {
+        let _ = writeln!(out, "（--no-apply：这次只改清单，交付留给 `henv apply`。）");
+        return Ok(());
+    }
+    run_apply(req.manifest, home, out, confirm, false, only)
+}
+
+/// 条目字段行的 YAML 文本（2 空格相对缩进），与 `scan` 收养出来的条目同形。
+fn skill_body(req: &AddRequest<'_>) -> anyhow::Result<String> {
+    use manifest::SkillSourceKind as Source;
+    let mut body = String::new();
+    match req.source {
+        Source::Git => {
+            let repo = req.repo.context("source git requires `--repo`")?;
+            let git_ref = req
+                .git_ref
+                .context("source git requires `--ref` (ref is the lock)")?;
+            let _ = writeln!(body, "  source: git");
+            let _ = writeln!(body, "  repo: {}", manifest_edit::scalar(repo));
+            if let Some(path) = req.path {
+                let _ = writeln!(body, "  path: {}", manifest_edit::scalar(path));
+            }
+            let _ = writeln!(body, "  ref: {}", manifest_edit::scalar(git_ref));
+        }
+        Source::Local => {
+            let path = req.path.context("source local requires `--path`")?;
+            let _ = writeln!(body, "  source: local");
+            let _ = writeln!(body, "  path: {}", manifest_edit::scalar(path));
+        }
+        Source::AgentsDir => {
+            let _ = writeln!(body, "  source: agents-dir");
+        }
+    }
+    if let Some(targets) = &req.targets {
+        let _ = writeln!(body, "  targets: [{}]", targets.join(", "));
+    }
+    Ok(body)
+}
+
+/// 源现在取得到吗？取不到就不该写进清单。
+fn verify_source(req: &AddRequest<'_>, home: &Home) -> anyhow::Result<()> {
+    use manifest::SkillSourceKind as Source;
+    match req.source {
+        Source::Git => {
+            let repo = req.repo.context("source git requires `--repo`")?;
+            let git_ref = req.git_ref.context("source git requires `--ref`")?;
+            let got = store::git::resolve(
+                repo,
+                req.path,
+                git_ref,
+                &home.henv_git_cache(),
+                store::skills::SourceMode::Fetch,
+            )?;
+            anyhow::ensure!(
+                got.is_some(),
+                "取不到 {repo} 的 {git_ref}（ref 或 path 对不对？先跑 \
+                 `henv skills list --repo {repo}`）"
+            );
+        }
+        Source::Local => {
+            let raw = req.path.context("source local requires `--path`")?;
+            let path = lower::expand_tilde_in(Some(home.root()), raw);
+            anyhow::ensure!(path.is_dir(), "本地源不是目录：{}", path.display());
+        }
+        Source::AgentsDir => {
+            let path = home.agents_skills().join(req.name);
+            anyhow::ensure!(path.is_dir(), "共享库里没有这个 skill：{}", path.display());
+        }
+    }
+    Ok(())
+}
+
+/// `henv remove` 的入参。
+pub struct RemoveRequest<'a> {
+    pub names: Vec<String>,
+    pub manifest: &'a Path,
+    pub dry_run: bool,
+    /// `true` = 只改清单，不动本机副本。
+    pub keep: bool,
+}
+
+/// 从清单删条目，可选接着撤销本机副本。
+///
+/// 撤销复用 `apply --prune` 的路径——它只删**账本里记着是 henv 放的**那些；用户手放的
+/// 副本照旧只报不删（§9.8）。顺序不能反：prune 的判据是「账本里有、清单里不要」。
+pub fn run_remove(
+    req: &RemoveRequest<'_>,
+    home: &Home,
+    out: &mut dyn Write,
+    confirm: &mut dyn Confirm,
+    only: Option<&str>,
+) -> anyhow::Result<()> {
+    let text = std::fs::read_to_string(req.manifest)
+        .with_context(|| format!("cannot read manifest: {}", req.manifest.display()))?;
+    let manifest = Manifest::parse(&text)
+        .with_context(|| format!("invalid manifest: {}", req.manifest.display()))?;
+    // 缺一个就整次不动：半删的清单比不删更难解释。
+    for name in &req.names {
+        anyhow::ensure!(
+            manifest.skills.contains_key(name),
+            "清单里没有 skill `{name}`"
+        );
+    }
+
+    if req.dry_run {
+        for name in &req.names {
+            let _ = writeln!(out, "(dry-run) 会从清单删掉 skill/{name}");
+        }
+        if !req.keep {
+            let _ = writeln!(out, "(dry-run) 并撤销本机由 henv 交付的副本");
+        }
+        return Ok(());
+    }
+
+    let mut new_text = text;
+    for name in &req.names {
+        let Some(next) =
+            manifest_edit::remove_entry(&new_text, manifest_edit::Section::Skills, name)?
+        else {
+            anyhow::bail!("解析出了 `{name}`，文本里却找不到它的条目——请检查清单排版");
+        };
+        new_text = next;
+    }
+    Manifest::parse(&new_text).context("refusing to write a manifest that does not parse back")?;
+    apply::write::write_config(req.manifest, new_text.as_bytes())?;
+    let _ = writeln!(
+        out,
+        "已写入 {}：删掉 {}",
+        req.manifest.display(),
+        req.names
+            .iter()
+            .map(|n| format!("skill/{n}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    if req.keep {
+        let _ = writeln!(
+            out,
+            "（--keep：本机副本没动，要清就再跑 `henv apply --prune`。）"
+        );
+        return Ok(());
+    }
+    run_apply(req.manifest, home, out, confirm, true, only)
+}
+
+/// `henv upgrade` 的入参。
+pub struct UpgradeRequest<'a> {
+    /// 空 = 清单里所有 `source: git` 的条目。
+    pub names: Vec<String>,
+    pub manifest: &'a Path,
+    /// 指定目标 ref；给了就不查上游。
+    pub to: Option<&'a str>,
+    pub dry_run: bool,
+    pub no_apply: bool,
+}
+
+/// 把清单里 git 源的 `ref:` 移到上游最新的 version 形 tag，可选接着交付。
+///
+/// 只认 version 形 tag：一个都没有时报错并提示 `--to`，**不猜**默认分支——「ref 就是锁」
+/// 的前提是在两个明确的点之间移动。每个条目独立判定（失败隔离）：一个仓库取不到不该
+/// 拦住别的条目。
+///
+/// 先确认新 ref 的内容真的取得到，再改清单：留一条指向不存在 ref 的条目比升级失败更糟。
+pub fn run_upgrade(
+    req: &UpgradeRequest<'_>,
+    home: &Home,
+    out: &mut dyn Write,
+    confirm: &mut dyn Confirm,
+    only: Option<&str>,
+) -> anyhow::Result<()> {
+    use manifest::SkillSourceKind as Source;
+    let text = std::fs::read_to_string(req.manifest)
+        .with_context(|| format!("cannot read manifest: {}", req.manifest.display()))?;
+    let manifest = Manifest::parse(&text)
+        .with_context(|| format!("invalid manifest: {}", req.manifest.display()))?;
+
+    let selected: Vec<String> = if req.names.is_empty() {
+        manifest
+            .skills
+            .iter()
+            .filter(|(_, e)| e.source == Source::Git)
+            .map(|(k, _)| k.clone())
+            .collect()
+    } else {
+        for name in &req.names {
+            let Some(entry) = manifest.skills.get(name) else {
+                anyhow::bail!("清单里没有 skill `{name}`");
+            };
+            anyhow::ensure!(
+                entry.source == Source::Git,
+                "`{name}` 不是 git 源，没有可升级的 ref"
+            );
+        }
+        req.names.clone()
+    };
+    if selected.is_empty() {
+        let _ = writeln!(out, "清单里没有 git 源的 skill，无事可做。");
+        return Ok(());
+    }
+
+    let mut new_text = text;
+    let mut changed: Vec<(String, String, String)> = Vec::new();
+    let mut problems: Vec<(String, String)> = Vec::new();
+    for name in &selected {
+        let entry = &manifest.skills[name];
+        let repo = entry.repo.as_deref().unwrap_or_default();
+        let path = entry.path.as_deref();
+        let old = entry.git_ref.as_deref().unwrap_or_default();
+        let target = match req.to {
+            Some(to) => to.to_string(),
+            None => match store::git::latest_version_tag(repo, &home.henv_git_cache()) {
+                Ok(Some(tag)) => tag,
+                Ok(None) => {
+                    problems.push((
+                        name.clone(),
+                        format!("{repo} 没有 version 形 tag；用 `--to <ref>` 指定目标"),
+                    ));
+                    continue;
+                }
+                Err(e) => {
+                    problems.push((name.clone(), format!("{e:#}")));
+                    continue;
+                }
+            },
+        };
+        if target == old {
+            continue; // 已经在这一版上：幂等，不写清单也不留备份。
+        }
+        match store::git::resolve(
+            repo,
+            path,
+            &target,
+            &home.henv_git_cache(),
+            store::skills::SourceMode::Fetch,
+        ) {
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                problems.push((name.clone(), format!("取不到 {repo} 的 {target}")));
+                continue;
+            }
+            Err(e) => {
+                problems.push((name.clone(), format!("{e:#}")));
+                continue;
+            }
+        }
+        match manifest_edit::set_entry_field(
+            &new_text,
+            manifest_edit::Section::Skills,
+            name,
+            "ref",
+            &target,
+        )? {
+            Some(next) => {
+                new_text = next;
+                changed.push((name.clone(), old.to_string(), target));
+            }
+            None => problems.push((
+                name.clone(),
+                "文本里找不到这条条目的 `ref:` 字段".to_string(),
+            )),
+        }
+    }
+
+    for (name, from, to) in &changed {
+        let _ = writeln!(out, "skill/{name}: {from} → {to}");
+    }
+    if changed.is_empty() {
+        let _ = writeln!(out, "没有需要升级的条目。");
+    }
+    if req.dry_run {
+        return Ok(());
+    }
+    if !changed.is_empty() {
+        Manifest::parse(&new_text)
+            .context("refusing to write a manifest that does not parse back")?;
+        apply::write::write_config(req.manifest, new_text.as_bytes())?;
+        let _ = writeln!(
+            out,
+            "已写入 {}：{} 条 ref 更新",
+            req.manifest.display(),
+            changed.len()
+        );
+    }
+    if !problems.is_empty() {
+        let _ = writeln!(out, "partial:");
+        for (name, why) in &problems {
+            let _ = writeln!(out, "  skill/{name}: {why}");
+        }
+    }
+    if changed.is_empty() {
+        return Ok(());
+    }
+    if req.no_apply {
+        let _ = writeln!(out, "（--no-apply：这次只改清单，交付留给 `henv apply`。）");
+        return Ok(());
+    }
+    run_apply(req.manifest, home, out, confirm, false, only)
 }
 
 /// `harnesses` 是 opt-out 列表：未列出 = 启用，只有显式 `enabled: false` 排除。

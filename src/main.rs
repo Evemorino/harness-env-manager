@@ -4,10 +4,15 @@ use clap::{Parser, Subcommand};
 use henv::{AssumeYes, Confirm, StdinConfirm};
 use std::path::PathBuf;
 
+/// `--version` 的完整串：Cargo 的版本号 + 构建时的 git 描述（由 `build.rs` 经
+/// `cargo:rustc-env` 注入）。光有 `0.1.0` 回答不了唯一要紧的问题——「我现在跑的是不是
+/// 刚编译的那份」。
+const VERSION: &str = concat!(env!("CARGO_PKG_VERSION"), " (", env!("HENV_BUILD"), ")");
+
 #[derive(Parser)]
 #[command(
     name = "henv",
-    version,
+    version = VERSION,
     about,
     // `--help` 是人读得到的第二处披露面（第一处是 `examples/env.yaml` 的注释与 lib.rs 的
     // rustdoc）。两件事必须在这里说清：`degrade:` 从 B3b 起真的生效（但只对写了
@@ -26,7 +31,10 @@ use std::path::PathBuf;
 并按门禁语义退出——0 = 没有问题、1 = 有问题、2 = henv 自己没跑成（清单读不了/解不开）。\n\
 `scan` 会写，但是只追加：它把本机已有、清单还没描述的能力接在对应段（skills/mcps/plugins）的末尾，\n\
 已有字节一个不动；落盘前先自己解一遍（解不开就拒绝写），并落一份 `env.yaml.henv.bak`。\n\
-`scan --dry-run` 只打印。它不做门禁——退出码只有 0（跑成了）与 2（工具没跑成）。\n\n\
+`scan --dry-run` 只打印。它不做门禁——退出码只有 0（跑成了）与 2（工具没跑成）。\n\
+`add`/`remove`/`upgrade` 会写清单：文本级编辑，只切自己那几行，注释与排版原样保留，落盘前自检并留 .bak；\n\
+默认接着交付或撤销（落盘前一次 y/N 确认），`--no-apply`（`remove` 是 `--keep`）只改清单，`--dry-run` 什么都不写。\n\
+`upgrade` 只升 `source: git` 条目的 ref，且只认 version 形 tag——没有就提示用 `--to`，不猜默认分支。\n\n\
 degrade: 政策决定「目标 harness 吃不下、但内容已经拆出来了」的能力是进报告还是静默丢弃（§9.5）。"
 )]
 struct Cli {
@@ -63,6 +71,85 @@ enum Command {
         #[arg(long, value_name = "NAME", value_parser = parse_harness)]
         harness: Option<String>,
     },
+    /// 添加一条 skill：写进清单，随后交付（会写文件）
+    Add {
+        /// skill 名，也就是清单里那个键
+        name: String,
+        /// 来源类型
+        #[arg(long, value_enum, default_value_t = SourceArg::Git)]
+        source: SourceArg,
+        /// 仓库地址或 GitHub 的 owner/repo 简写（source=git 时必需）
+        #[arg(long)]
+        repo: Option<String>,
+        /// 仓库内路径，指向 skill 目录本身（source=git/local 时用）
+        #[arg(long)]
+        path: Option<String>,
+        /// 分支 / tag / 提交（source=git 时必需，ref 就是锁）
+        #[arg(long = "ref", value_name = "REF")]
+        git_ref: Option<String>,
+        /// 交付目标，逗号分隔（claude-code,codex,kimi-code）；不写就是 all
+        #[arg(long, value_delimiter = ',', value_parser = parse_harness)]
+        targets: Option<Vec<String>>,
+        /// 清单路径
+        #[arg(short, long, default_value = "env.yaml")]
+        manifest: PathBuf,
+        /// 只打印将要做什么，不写清单也不交付
+        #[arg(long)]
+        dry_run: bool,
+        /// 只改清单，交付留给 `henv apply`
+        #[arg(long)]
+        no_apply: bool,
+        /// 不问确认直接执行（用于脚本与 CI）
+        #[arg(long)]
+        yes: bool,
+        /// 交付只对这一家生效
+        #[arg(long, value_name = "NAME", value_parser = parse_harness)]
+        harness: Option<String>,
+    },
+    /// 从清单删条目，并撤销本机由 henv 交付的副本（会写文件）
+    Remove {
+        /// 要删的 skill 名，可以给多个
+        #[arg(required = true)]
+        names: Vec<String>,
+        /// 清单路径
+        #[arg(short, long, default_value = "env.yaml")]
+        manifest: PathBuf,
+        /// 只打印将要做什么，不写清单也不撤销
+        #[arg(long)]
+        dry_run: bool,
+        /// 只改清单，本机副本原样留着
+        #[arg(long)]
+        keep: bool,
+        /// 不问确认直接执行（用于脚本与 CI）
+        #[arg(long)]
+        yes: bool,
+        /// 撤销只对这一家生效
+        #[arg(long, value_name = "NAME", value_parser = parse_harness)]
+        harness: Option<String>,
+    },
+    /// 把清单里 git 源的 ref 移到上游最新的 version 形 tag（会写文件）
+    Upgrade {
+        /// 只升级这些 skill；不写就是清单里所有 git 源条目
+        names: Vec<String>,
+        /// 指定目标 ref，给了就不查上游
+        #[arg(long, value_name = "REF")]
+        to: Option<String>,
+        /// 清单路径
+        #[arg(short, long, default_value = "env.yaml")]
+        manifest: PathBuf,
+        /// 只打印 old → new，不写清单也不交付
+        #[arg(long)]
+        dry_run: bool,
+        /// 只改清单，交付留给 `henv apply`
+        #[arg(long)]
+        no_apply: bool,
+        /// 不问确认直接执行（用于脚本与 CI）
+        #[arg(long)]
+        yes: bool,
+        /// 交付只对这一家生效
+        #[arg(long, value_name = "NAME", value_parser = parse_harness)]
+        harness: Option<String>,
+    },
     /// 只读体检：报出「必须处理」的问题，并按门禁语义退出（0/1/2）
     Doctor {
         /// 清单路径
@@ -78,6 +165,24 @@ enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+}
+
+/// `add --source` 的值域（§4 的三种 skill 来源）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum SourceArg {
+    Git,
+    Local,
+    AgentsDir,
+}
+
+impl From<SourceArg> for henv::manifest::SkillSourceKind {
+    fn from(value: SourceArg) -> Self {
+        match value {
+            SourceArg::Git => Self::Git,
+            SourceArg::Local => Self::Local,
+            SourceArg::AgentsDir => Self::AgentsDir,
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -148,6 +253,87 @@ fn main() -> anyhow::Result<()> {
                 prune,
                 harness.as_deref(),
             )?;
+        }
+        Command::Add {
+            name,
+            source,
+            repo,
+            path,
+            git_ref,
+            targets,
+            manifest,
+            dry_run,
+            no_apply,
+            yes,
+            harness,
+        } => {
+            let mut confirm: Box<dyn Confirm> = if yes {
+                Box::new(AssumeYes)
+            } else {
+                Box::new(StdinConfirm)
+            };
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            let req = henv::AddRequest {
+                name: &name,
+                source: source.into(),
+                repo: repo.as_deref(),
+                path: path.as_deref(),
+                git_ref: git_ref.as_deref(),
+                targets,
+                manifest: &manifest,
+                dry_run,
+                no_apply,
+            };
+            henv::run_add(&req, &home, &mut lock, confirm.as_mut(), harness.as_deref())?;
+        }
+        Command::Remove {
+            names,
+            manifest,
+            dry_run,
+            keep,
+            yes,
+            harness,
+        } => {
+            let mut confirm: Box<dyn Confirm> = if yes {
+                Box::new(AssumeYes)
+            } else {
+                Box::new(StdinConfirm)
+            };
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            let req = henv::RemoveRequest {
+                names,
+                manifest: &manifest,
+                dry_run,
+                keep,
+            };
+            henv::run_remove(&req, &home, &mut lock, confirm.as_mut(), harness.as_deref())?;
+        }
+        Command::Upgrade {
+            names,
+            to,
+            manifest,
+            dry_run,
+            no_apply,
+            yes,
+            harness,
+        } => {
+            let mut confirm: Box<dyn Confirm> = if yes {
+                Box::new(AssumeYes)
+            } else {
+                Box::new(StdinConfirm)
+            };
+            let stdout = std::io::stdout();
+            let mut lock = stdout.lock();
+            let req = henv::UpgradeRequest {
+                names,
+                manifest: &manifest,
+                to: to.as_deref(),
+                dry_run,
+                no_apply,
+            };
+            henv::run_upgrade(&req, &home, &mut lock, confirm.as_mut(), harness.as_deref())?;
         }
         Command::Skills { cmd } => match cmd {
             SkillsCmd::List {
@@ -230,5 +416,15 @@ mod tests {
             Err(err) => assert!(err.to_string().contains("unknown harness"), "{err}"),
         }
         assert!(Cli::try_parse_from(["henv", "apply", "--harness", "codex"]).is_ok());
+    }
+
+    /// `--version` 要能回答「跑的是哪一次构建」：`build.rs` 注入的 git 描述必须真的进到
+    /// 那个串里。构建脚本在没 git 的环境退化成 `unknown`，那时也必须是一段非空的描述——
+    /// 空括号比没有这段更糟。
+    #[test]
+    fn version_carries_the_build_description() {
+        assert!(VERSION.starts_with(env!("CARGO_PKG_VERSION")), "{VERSION}");
+        assert!(VERSION.contains('(') && VERSION.ends_with(')'), "{VERSION}");
+        assert!(!VERSION.contains("()"), "{VERSION}");
     }
 }

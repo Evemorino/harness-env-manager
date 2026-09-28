@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 /// 拆出来只为了让「HOME 缺失」那一支可测：走 `home_from_env()` 的那条路要读进程
 /// 环境，而测试并行跑、`set_var` 会互相踩（report C7 / 审计 U10）。分支顺序与原实现
 /// 逐字对应，只是 root 从「读环境」变成「传进来」。
-fn expand_tilde_in(root: Option<&Path>, raw: &str) -> PathBuf {
+pub(crate) fn expand_tilde_in(root: Option<&Path>, raw: &str) -> PathBuf {
     let base = || {
         root.map(PathBuf::from)
             // 没有 HOME 时 `~` 展开成文件系统根：留下字面量 `~` 会变成一个「看着像路径」

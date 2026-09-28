@@ -853,6 +853,11 @@ config`，退出码非 0，没有 `--force` 之类的覆盖开关；`remove` 只
 ```text
 henv apply [-m env.yaml] [--yes] [--prune] [--harness <name>]
 henv skills list --repo <url> [--ref <r>] [--path <p>]        ← Plan B 新增
+henv add <name> [--source git|local|agents-dir] [--repo <r>] [--path <p>] [--ref <r>] \
+         [--targets <list>] [-m env.yaml] [--dry-run] [--no-apply] [--yes] [--harness <name>]
+henv remove <name>... [-m env.yaml] [--dry-run] [--keep] [--yes] [--harness <name>]
+henv upgrade [<name>...] [--to <ref>] [-m env.yaml] [--dry-run] [--no-apply] [--yes]
+             [--harness <name>]                                ← Plan E 新增
 ```
 
 `skills list`：列出仓库里所有含 `SKILL.md` 的目录（目录名 + 仓库内相对路径），按相对路径排序，
@@ -874,7 +879,31 @@ henv skills list --repo <url> [--ref <r>] [--path <p>]        ← Plan B 新增
 **会做什么**——账本记着的写「未在清单中，--prune 可删」，其余写「未在清单中，只报不删」。
 判据与 `prune_plan` 用的 `ledger.find` 是同一个，所以报告不会承诺它做不到的删除。
 
-**交互边界（已确认）**：henv 除 `apply` 的 y/N 确认外**不提问**。「这个 skill 加给哪几家」
+**`add` / `remove` / `upgrade` 是清单编辑命令**（2026-09-28，Plan E）：它们的产物是**清单
+文本**，交付与撤销仍然走 `apply` / `apply --prune` 的同一条路径——三个命令不实现自己的
+交付，于是「绝不覆盖」与「只删账本记着的」仍然只有一个实现点。三条共同的边界：
+
+- **改清单是文本级编辑**：只拼接或切除属于该条目的行、只重写要改的那个字段值；注释、缩进、
+  空行、行尾注释原样保留。落盘前先 `Manifest::parse` 自检，写走 `apply::write::write_config`
+  的原子写 + 单槽 `.bak`（与 `scan` 同一条）。
+- **先验证源，再改清单**：`add` 与 `upgrade` 都要先确认新内容真取得到（git ref 存在、
+  `path` 有内容、local 路径存在），失败就一个字节都不写——不留指向不存在内容的条目。
+- **默认一条命令做到底**：改完清单接着交付（`remove` 则接撤销），落盘前问一次 y/N；
+  `--no-apply`（`remove` 是 `--keep`）只改清单，`--dry-run` 则什么都不写。
+
+`remove` 的撤销顺序不能反：它的判据是「账本里有、清单里不要」，所以先改清单再跑 prune。
+`upgrade` 只处理 `source: git` 的条目，且**只认 version 形 tag**（去前导 `v` 后含小数点、
+各段是数字）：一个都没有时报错并提示用 `--to <ref>`，**不回退到默认分支**——「ref 就是锁」
+的前提是在两个明确的点之间移动。已是最新时不写清单也不留备份（幂等）。
+
+**`--version` 带构建描述**（2026-09-28）：输出形如 `0.1.0 (ee090b6-dirty 2026-09-28)`。
+版本号本身回答不了唯一要紧的那个问题——「我现在跑的是不是刚编译的那份」——而 henv 的常见
+用法正是就地重建（`~/.local/bin/henv` 是指向 `target/release/henv` 的软链，`cargo build
+--release` 一跑就生效）。描述由 `build.rs` 在构建时从 git 与 `date` 取，`-dirty` 只看已
+跟踪文件的改动；取不到就退化成 `unknown`——环境缺东西不该拦住构建。
+
+**交互边界（已确认）**：henv 除落盘前的那一次 y/N 确认（`apply` 与上面三个命令）外
+**不提问**。「这个 skill 加给哪几家」
 这类对话由 agent 承担，产物是 env.yaml 里的一行 `targets:`（§4 已有字段，不引入新概念）。
 **理由**：交互式 CLI 的流程难以稳定测试，而 agent 对话正是用户的实际用法。
 

@@ -18,39 +18,16 @@ use crate::capability::{Capability, Kind, Origin, SkillSource, Spec};
 use crate::diff::HarnessState;
 use crate::home::Home;
 use crate::manifest::Manifest;
+use crate::manifest_edit::{self, EntryRef, scalar};
 use anyhow::Context as _;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::io::Write;
 use std::path::Path;
 
-/// 清单的三个可收养段。段的顺序就是渲染顺序，也是 `section.as_str()` 的拼写。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Section {
-    Skills,
-    Mcps,
-    Plugins,
-}
-
-impl Section {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Section::Skills => "skills",
-            Section::Mcps => "mcps",
-            Section::Plugins => "plugins",
-        }
-    }
-
-    /// `Kind` → 它落在哪个段；表达不了的 kind 返回 `None`（§4 的 schema 只有三段）。
-    fn of(kind: Kind) -> Option<Section> {
-        match kind {
-            Kind::Skill => Some(Section::Skills),
-            Kind::Mcp => Some(Section::Mcps),
-            Kind::Plugin => Some(Section::Plugins),
-            Kind::Command | Kind::Agent | Kind::Hook => None,
-        }
-    }
-}
+/// 清单的三个可收养段。[`Section`] 与它的渲染规则住在 [`crate::manifest_edit`]——
+/// 那是清单文本的概念，`scan` 只是它的一个调用方。
+pub use crate::manifest_edit::Section;
 
 /// 一条将要追加进清单的条目。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,8 +100,25 @@ pub fn adoptions(manifest: &Manifest, states: &[HarnessState]) -> AdoptionReport
         adoptions: found
             .into_values()
             .map(|by_harness| {
-                // 代表那份只用来取身份与 kind；载荷（plugin 的版本）逐家从表里取。
-                let representative = by_harness.values().next().expect("filled 至少插一条");
+                // 代表那份只用来取身份、kind 与**来源描述**；载荷（plugin 的版本）逐家从表里取。
+                //
+                // 挑法：**优先共享库来源**。同一条 skill 在几家可以各有各的描述——实测
+                // `mcp-builder` 在 claude 是真目录（`Local`）、在 kimi 是共享库入口
+                // （`AgentsDir`）。共享库是唯一跨家通用的那一份：写进清单后三家都读得到它，
+                // 而写 `local` 会让本来读得到它的 kimi 变成 `undeliverable`（真机上就是这么
+                // 冒出来的）。没有任何一家报共享库来源时，才退回先扫到的那份。
+                let representative = by_harness
+                    .values()
+                    .find(|c| {
+                        matches!(
+                            &c.spec,
+                            Spec::Skill {
+                                source: SkillSource::AgentsDir,
+                                ..
+                            }
+                        )
+                    })
+                    .unwrap_or_else(|| by_harness.values().next().expect("filled 至少插一条"));
                 shape(representative, &by_harness)
             })
             .collect(),
@@ -322,41 +316,6 @@ fn shape(cap: &Capability, harnesses: &BTreeMap<String, Capability>) -> Adoption
     }
 }
 
-/// YAML 标量渲染。安全就裸写，否则双引号包住并转义——**规则宁严勿宽**：多引一对引号
-/// 只是不好看，少引一对可能让清单解不开或解成别的值。
-///
-/// 判「安全」的条件：非空、首字符是字母或 `_`（数字开头会被 YAML 读成整数）、
-/// 其余字符属于 `[A-Za-z0-9_.\-/]`、且不是 `true/false/null/yes/no/on/off` 这类
-/// 会被隐式解析成别的东西的词。
-fn scalar(s: &str) -> String {
-    let mut chars = s.chars();
-    let plain = match chars.next() {
-        Some(c) if c.is_ascii_alphabetic() || c == '_' => {
-            chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/'))
-        }
-        _ => false,
-    } && !matches!(
-        s.to_ascii_lowercase().as_str(),
-        "true" | "false" | "null" | "yes" | "no" | "on" | "off"
-    );
-    if plain {
-        return s.to_string();
-    }
-    let mut out = String::from("\"");
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            other => out.push(other),
-        }
-    }
-    out.push('"');
-    out
-}
-
 /// 收养一次。I/O 只在两处：读现状（走与 `diff`/`apply`/`doctor` 共用的那一个
 /// `read_harness_states`）与写回（复用 `apply::write::write_config` 的
 /// temp → fsync → rename + `.henv.bak`）。
@@ -391,162 +350,21 @@ pub fn run_scan(
     Ok(report)
 }
 
-/// 把条目插进清单文本的对应段，**已有字节一个不动**（只做拼接，从不重写既有的行）。
-/// 返回 `None` = 没有条目可插（空报告是空操作）。
+/// 把条目插进清单文本的对应段，**已有字节一个不动**。返回 `None` = 没有条目可插
+/// （空报告是空操作）。
 ///
-/// 段定位：只认**列 0** 的顶层键行（`^[A-Za-z0-9_-]+:`，`#` 注释与空行不算）。段的范围
-/// 到下一个顶层键行为止；新条目接在该段的**最后一个非空非注释行之后**。段不存在就在文件
-/// 末尾新建。段头带了内联值（`mcps: {}` / `mcps: [a]`）时**拒绝**——把一个 flow 形态展开成
-/// block 而不动用户的其他字节做不到，宁可让他自己改一行。
-///
-/// 缩进跟着**已有段的第一行内容**走：用户的清单用 4 空格缩进条目，新条目也是 4 空格。
-/// 我们不替用户决定排版，也不要因为排版不同就把他的清单解不开。
+/// 段定位、缩进推断与拒绝规则住在 [`crate::manifest_edit`]——`scan` 只是它的一个调用方，
+/// 这里把 [`Adoption`] 翻译成通用的 [`EntryRef`]。
 pub fn insert_entries(text: &str, adoptions: &[Adoption]) -> anyhow::Result<Option<String>> {
-    if adoptions.is_empty() {
-        return Ok(None);
-    }
-    let mut by_section: BTreeMap<Section, Vec<&Adoption>> = BTreeMap::new();
-    for a in adoptions {
-        by_section.entry(a.section).or_default().push(a);
-    }
-    let mut out = text.to_string();
-    // 逐段处理，每次都基于「当前文本」重新定位：前一次插入挪动了偏移，重扫一遍最省心
-    // （清单是几百行的量级，不值得为它上一套偏移账本）。
-    for (section, entries) in by_section {
-        out = insert_section(&out, section, &entries)?;
-    }
-    Ok(Some(out))
-}
-
-/// 一行的范围（`start` 到 `end`，`end` 不含换行符）。
-fn line_ranges(text: &str) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
-    let mut at = 0usize;
-    for line in text.split_inclusive('\n') {
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        out.push((at, at + body.len()));
-        at += line.len();
-    }
-    out
-}
-
-/// 列 0 的顶层键行 → 键名。缩进行、注释行、空行、以及不是 `key:` 形状的行都不是。
-fn top_level_key(line: &str) -> Option<&str> {
-    if line.is_empty() || line.starts_with([' ', '\t', '#']) {
-        return None;
-    }
-    let (key, _) = line.split_once(':')?;
-    if key.is_empty()
-        || !key
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    {
-        return None;
-    }
-    Some(key)
-}
-
-/// 段内容里「非空」的行。**注释也算**：它属于这一段，新条目该排在它下面。
-fn is_nonblank(line: &str) -> bool {
-    !line.trim().is_empty()
-}
-
-/// 段缩进只看**非空非注释**的行：注释的缩进是排版的自由，不能拿来当基准。
-fn is_indented_content(line: &str) -> bool {
-    let t = line.trim();
-    !t.is_empty() && !t.starts_with('#')
-}
-
-fn insert_section(text: &str, section: Section, entries: &[&Adoption]) -> anyhow::Result<String> {
-    let name = section.as_str();
-    let lines = line_ranges(text);
-    let at = |i: usize| -> &str { &text[lines[i].0..lines[i].1] };
-
-    let mut header: Option<usize> = None;
-    let mut block_end = lines.len();
-    for i in 0..lines.len() {
-        let line = at(i);
-        let Some(key) = top_level_key(line) else {
-            continue;
-        };
-        match header {
-            None => {
-                if key == name {
-                    if line.trim_end() != format!("{name}:") {
-                        anyhow::bail!(
-                            "`{name}:` 带了内联值（`{}`）；scan 不会改写用户的排版，\
-                             请把它改成 block 形态（单独一行 `{name}:`）再跑",
-                            line.trim()
-                        );
-                    }
-                    header = Some(i);
-                }
-            }
-            Some(_) => {
-                if key != name {
-                    block_end = i;
-                    break;
-                }
-            }
-        }
-    }
-
-    // 缩进与插入点：段内第一个有意义的行的缩进，以及最后一个有意义行之后。
-    let Some(header) = header else {
-        return Ok(append_section(text, name, &render_entries(entries, 2)));
-    };
-    let nonblank: Vec<usize> = (header + 1..block_end)
-        .filter(|i| is_nonblank(at(*i)))
-        .collect();
-    let indent = nonblank
+    let entries: Vec<EntryRef<'_>> = adoptions
         .iter()
-        .find(|i| is_indented_content(at(**i)))
-        .map(|i| at(*i).len() - at(*i).trim_start().len())
-        .unwrap_or(2);
-    let after = nonblank.last().map(|i| i + 1).unwrap_or(header + 1);
-    let insert_at = lines.get(after).map(|(s, _)| *s).unwrap_or(text.len());
-
-    let mut out = String::with_capacity(text.len() + 128);
-    out.push_str(&text[..insert_at]);
-    if !out.ends_with('\n') {
-        out.push('\n');
-    }
-    out.push_str(&render_entries(entries, indent));
-    out.push_str(&text[insert_at..]);
-    Ok(out)
-}
-
-/// 条目文本：`<indent><name>:` + body。body 的 2 空格是**相对**缩进，这里补上段缩进——
-/// 所以新条目的字段永远比条目头深一级（2 空格），无论用户的旧条目用的是 2 还是 4 空格
-/// 一级：YAML 只要求子节点比父节点深，不要求兄弟节点的子节点对齐。
-fn render_entries(entries: &[&Adoption], indent: usize) -> String {
-    let pad = " ".repeat(indent);
-    let mut out = String::new();
-    for a in entries {
-        let _ = writeln!(out, "{pad}{}:", scalar(&a.name));
-        for line in a.body.lines() {
-            let _ = writeln!(out, "{pad}{line}");
-        }
-    }
-    out
-}
-
-/// 段不存在 → 在文件末尾新建，与已有内容之间隔一个空行（好读，也不影响解析）。
-fn append_section(text: &str, name: &str, rendered: &str) -> String {
-    let mut out = String::with_capacity(text.len() + rendered.len() + 24);
-    out.push_str(text);
-    if !out.is_empty() {
-        if !out.ends_with('\n') {
-            out.push('\n');
-        }
-        if !out.ends_with("\n\n") {
-            out.push('\n');
-        }
-    }
-    out.push_str(name);
-    out.push_str(":\n");
-    out.push_str(rendered);
-    out
+        .map(|a| EntryRef {
+            section: a.section,
+            name: &a.name,
+            body: &a.body,
+        })
+        .collect();
+    manifest_edit::insert_entries(text, &entries)
 }
 
 /// 报告渲染。段名风格与 `doctor` 一致，但渲染器各是各的（`doctor` 的 golden 不该被
