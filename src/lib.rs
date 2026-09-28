@@ -12,6 +12,7 @@
 
 use adapters::HarnessAdapter;
 use anyhow::Context as _;
+use capability::McpTransport;
 use home::Home;
 use manifest::Manifest;
 use std::fmt::Write as _;
@@ -157,7 +158,10 @@ pub(crate) fn plan_for(
         .into_iter()
         .map(|state| {
             let adapter = adapters::lookup(&registry, &state.name);
-            (state, adapter.expect("read_harness_states only yields registered names"))
+            (
+                state,
+                adapter.expect("read_harness_states only yields registered names"),
+            )
         })
         .collect();
 
@@ -394,16 +398,47 @@ pub fn run_apply(
     Ok(())
 }
 
+/// `add` 要加的东西：一条 skill，或者一条 MCP。
+///
+/// 两类共用同一个命令、同一套「改清单 → 交付」的流程，只有载荷不同——所以是 enum 而不是
+/// 两个平行的请求类型（否则「改清单」「验证」「dry-run」那几段会各写两遍）。
+pub enum AddKind<'a> {
+    Skill {
+        source: manifest::SkillSourceKind,
+        repo: Option<&'a str>,
+        path: Option<&'a str>,
+        git_ref: Option<&'a str>,
+    },
+    Mcp {
+        /// 已按 CLI 参数拼好的传输形态。stdio 与 http 的字段没有交集，所以在 CLI 层
+        /// 就把它们收敛成一个值——这里拿到的已经是**恰好一种**。
+        transport: &'a McpTransport,
+    },
+}
+
+impl AddKind<'_> {
+    fn section(&self) -> manifest_edit::Section {
+        match self {
+            AddKind::Skill { .. } => manifest_edit::Section::Skills,
+            AddKind::Mcp { .. } => manifest_edit::Section::Mcps,
+        }
+    }
+
+    fn kind_name(&self) -> &'static str {
+        match self {
+            AddKind::Skill { .. } => "skill",
+            AddKind::Mcp { .. } => "mcp",
+        }
+    }
+}
+
 /// `henv add` 的入参。
 ///
 /// `targets` 为 `None` 时**不写** `targets:` 行——清单的默认值是 `all`，写与不写语义
 /// 相同，但让文件保持用户自己的样子。
 pub struct AddRequest<'a> {
     pub name: &'a str,
-    pub source: manifest::SkillSourceKind,
-    pub repo: Option<&'a str>,
-    pub path: Option<&'a str>,
-    pub git_ref: Option<&'a str>,
+    pub kind: AddKind<'a>,
     pub targets: Option<Vec<String>>,
     pub manifest: &'a Path,
     pub dry_run: bool,
@@ -427,20 +462,27 @@ pub fn run_add(
         .with_context(|| format!("cannot read manifest: {}", req.manifest.display()))?;
     let manifest = Manifest::parse(&text)
         .with_context(|| format!("invalid manifest: {}", req.manifest.display()))?;
-    if manifest.skills.contains_key(req.name) {
+    let section = req.kind.section();
+    let kind_name = req.kind.kind_name();
+    // 重名只在**同一段**里判：`skills.foo` 与 `mcps.foo` 可以共存（它们是两种能力）。
+    let taken = match section {
+        manifest_edit::Section::Skills => manifest.skills.contains_key(req.name),
+        manifest_edit::Section::Mcps => manifest.mcps.contains_key(req.name),
+        manifest_edit::Section::Plugins => manifest.plugins.contains_key(req.name),
+    };
+    if taken {
         anyhow::bail!(
-            "清单里已经有 skill `{}`：换版本用 `henv upgrade {}`，要重来先 `henv remove {}`",
-            req.name,
+            "清单里已经有 {kind_name} `{}`：要重来先 `henv remove {}`",
             req.name,
             req.name
         );
     }
 
-    let body = skill_body(req)?;
+    let body = entry_body(req)?;
     verify_source(req, home)?;
 
     if req.dry_run {
-        let _ = writeln!(out, "(dry-run) 会新增 skill/{}：", req.name);
+        let _ = writeln!(out, "(dry-run) 会新增 {kind_name}/{}：", req.name);
         let _ = writeln!(out, "  {}:", req.name);
         for line in body.lines() {
             let _ = writeln!(out, "  {line}");
@@ -449,7 +491,7 @@ pub fn run_add(
     }
 
     let entry = manifest_edit::EntryRef {
-        section: manifest_edit::Section::Skills,
+        section,
         name: req.name,
         body: &body,
     };
@@ -460,7 +502,7 @@ pub fn run_add(
     apply::write::write_config(req.manifest, new_text.as_bytes())?;
     let _ = writeln!(
         out,
-        "已写入 {}：新增 skill/{}",
+        "已写入 {}：新增 {kind_name}/{}",
         req.manifest.display(),
         req.name
     );
@@ -473,24 +515,45 @@ pub fn run_add(
 }
 
 /// 条目字段行的 YAML 文本（2 空格相对缩进），与 `scan` 收养出来的条目同形。
-fn skill_body(req: &AddRequest<'_>) -> anyhow::Result<String> {
+fn entry_body(req: &AddRequest<'_>) -> anyhow::Result<String> {
+    let mut body = match &req.kind {
+        AddKind::Skill {
+            source,
+            repo,
+            path,
+            git_ref,
+        } => skill_body(source, *repo, *path, *git_ref)?,
+        AddKind::Mcp { transport } => mcp_body(transport),
+    };
+    // `targets` 是两类共有的：不写就是 `all`，写就落到同一行上。
+    if let Some(targets) = &req.targets {
+        let _ = writeln!(body, "  targets: [{}]", targets.join(", "));
+    }
+    Ok(body)
+}
+
+/// skill 条目的字段行。
+fn skill_body(
+    source: &manifest::SkillSourceKind,
+    repo: Option<&str>,
+    path: Option<&str>,
+    git_ref: Option<&str>,
+) -> anyhow::Result<String> {
     use manifest::SkillSourceKind as Source;
     let mut body = String::new();
-    match req.source {
+    match source {
         Source::Git => {
-            let repo = req.repo.context("source git requires `--repo`")?;
-            let git_ref = req
-                .git_ref
-                .context("source git requires `--ref` (ref is the lock)")?;
+            let repo = repo.context("source git requires `--repo`")?;
+            let git_ref = git_ref.context("source git requires `--ref` (ref is the lock)")?;
             let _ = writeln!(body, "  source: git");
             let _ = writeln!(body, "  repo: {}", manifest_edit::scalar(repo));
-            if let Some(path) = req.path {
+            if let Some(path) = path {
                 let _ = writeln!(body, "  path: {}", manifest_edit::scalar(path));
             }
             let _ = writeln!(body, "  ref: {}", manifest_edit::scalar(git_ref));
         }
         Source::Local => {
-            let path = req.path.context("source local requires `--path`")?;
+            let path = path.context("source local requires `--path`")?;
             let _ = writeln!(body, "  source: local");
             let _ = writeln!(body, "  path: {}", manifest_edit::scalar(path));
         }
@@ -498,22 +561,69 @@ fn skill_body(req: &AddRequest<'_>) -> anyhow::Result<String> {
             let _ = writeln!(body, "  source: agents-dir");
         }
     }
-    if let Some(targets) = &req.targets {
-        let _ = writeln!(body, "  targets: [{}]", targets.join(", "));
-    }
     Ok(body)
 }
 
+/// MCP 条目的字段行。`env`/`headers` 的值在 CLI 层就要求写成 `${VAR}`（见 `parse_env`），
+/// `scalar()` 会把它加上引号——那正好是合法的 YAML，解出来还是 `${VAR}`。
+fn mcp_body(transport: &McpTransport) -> String {
+    let mut body = String::new();
+    match transport {
+        McpTransport::Stdio { command, args, env } => {
+            let _ = writeln!(body, "  command: {}", manifest_edit::scalar(command));
+            if !args.is_empty() {
+                let items: Vec<String> = args.iter().map(|a| manifest_edit::scalar(a)).collect();
+                let _ = writeln!(body, "  args: [{}]", items.join(", "));
+            }
+            write_pairs(&mut body, "env", env);
+        }
+        McpTransport::Http { url, headers } => {
+            let _ = writeln!(body, "  url: {}", manifest_edit::scalar(url));
+            write_pairs(&mut body, "headers", headers);
+        }
+    }
+    body
+}
+
+/// `env:` / `headers:` 那样的一小段嵌套映射。
+fn write_pairs(body: &mut String, field: &str, pairs: &std::collections::BTreeMap<String, String>) {
+    if pairs.is_empty() {
+        return;
+    }
+    let _ = writeln!(body, "  {field}:");
+    for (key, value) in pairs {
+        let _ = writeln!(
+            body,
+            "    {}: {}",
+            manifest_edit::scalar(key),
+            manifest_edit::scalar(value)
+        );
+    }
+}
+
 /// 源现在取得到吗？取不到就不该写进清单。
+///
+/// **只对 skill 生效**：MCP 没有「源目录」可验证——它的 `--command` 多半由 `npx`/`uvx`
+/// 在运行时解析，而交付本来也不检查可执行性（claude 走它自己的 CLI，codex/kimi 只写配置）。
+/// 假装校验一遍只会给假信心。
 fn verify_source(req: &AddRequest<'_>, home: &Home) -> anyhow::Result<()> {
     use manifest::SkillSourceKind as Source;
-    match req.source {
+    let AddKind::Skill {
+        source,
+        repo,
+        path,
+        git_ref,
+    } = &req.kind
+    else {
+        return Ok(());
+    };
+    match source {
         Source::Git => {
-            let repo = req.repo.context("source git requires `--repo`")?;
-            let git_ref = req.git_ref.context("source git requires `--ref`")?;
+            let repo = repo.context("source git requires `--repo`")?;
+            let git_ref = git_ref.context("source git requires `--ref`")?;
             let got = store::git::resolve(
                 repo,
-                req.path,
+                *path,
                 git_ref,
                 &home.henv_git_cache(),
                 store::skills::SourceMode::Fetch,
@@ -521,11 +631,11 @@ fn verify_source(req: &AddRequest<'_>, home: &Home) -> anyhow::Result<()> {
             anyhow::ensure!(
                 got.is_some(),
                 "取不到 {repo} 的 {git_ref}（ref 或 path 对不对？先跑 \
-                 `henv skills list --repo {repo}`）"
+                 `henv show {repo}`）"
             );
         }
         Source::Local => {
-            let raw = req.path.context("source local requires `--path`")?;
+            let raw = path.context("source local requires `--path`")?;
             let path = lower::expand_tilde_in(Some(home.root()), raw);
             anyhow::ensure!(path.is_dir(), "本地源不是目录：{}", path.display());
         }
@@ -561,17 +671,28 @@ pub fn run_remove(
         .with_context(|| format!("cannot read manifest: {}", req.manifest.display()))?;
     let manifest = Manifest::parse(&text)
         .with_context(|| format!("invalid manifest: {}", req.manifest.display()))?;
+    // 名字落在哪一段：**三段都找**（skill / MCP / plugin 的条目都该删得掉）。
+    //
+    // plugin 按 **key** 匹配，不按它的身份（`entry`）：删条目删的是 YAML 的键，而
+    // `{key: superpowers-bundle, entry: superpowers}` 这种写法里两者不同（§10.3）。
     // 缺一个就整次不动：半删的清单比不删更难解释。
+    let mut found: Vec<(String, manifest_edit::Section)> = Vec::new();
     for name in &req.names {
-        anyhow::ensure!(
-            manifest.skills.contains_key(name),
-            "清单里没有 skill `{name}`"
-        );
+        let section = if manifest.skills.contains_key(name) {
+            manifest_edit::Section::Skills
+        } else if manifest.mcps.contains_key(name) {
+            manifest_edit::Section::Mcps
+        } else if manifest.plugins.contains_key(name) {
+            manifest_edit::Section::Plugins
+        } else {
+            anyhow::bail!("清单里没有 `{name}`");
+        };
+        found.push((name.clone(), section));
     }
 
     if req.dry_run {
-        for name in &req.names {
-            let _ = writeln!(out, "(dry-run) 会从清单删掉 skill/{name}");
+        for (name, section) in &found {
+            let _ = writeln!(out, "(dry-run) 会从清单删掉 {}/{name}", section.as_str());
         }
         if !req.keep {
             let _ = writeln!(out, "(dry-run) 并撤销本机由 henv 交付的副本");
@@ -580,10 +701,8 @@ pub fn run_remove(
     }
 
     let mut new_text = text;
-    for name in &req.names {
-        let Some(next) =
-            manifest_edit::remove_entry(&new_text, manifest_edit::Section::Skills, name)?
-        else {
+    for (name, section) in &found {
+        let Some(next) = manifest_edit::remove_entry(&new_text, *section, name)? else {
             anyhow::bail!("解析出了 `{name}`，文本里却找不到它的条目——请检查清单排版");
         };
         new_text = next;
@@ -594,9 +713,9 @@ pub fn run_remove(
         out,
         "已写入 {}：删掉 {}",
         req.manifest.display(),
-        req.names
+        found
             .iter()
-            .map(|n| format!("skill/{n}"))
+            .map(|(n, section)| format!("{}/{n}", section.as_str()))
             .collect::<Vec<_>>()
             .join(", ")
     );

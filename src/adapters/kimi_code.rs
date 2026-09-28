@@ -315,7 +315,7 @@ impl HarnessAdapter for KimiCode {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capability::{Kind, Origin, SkillSource, Spec, Targets};
+    use crate::capability::{Kind, McpTransport, Origin, SkillSource, Spec, Targets};
     use crate::testutil::TempHome;
     use std::path::{Path, PathBuf};
 
@@ -378,13 +378,18 @@ mod tests {
         assert_eq!(
             find(&caps, Kind::Mcp, "kimi-cu").unwrap().spec,
             Spec::Mcp {
-                command: "/Applications/KimiCU.app/Contents/MacOS/kimi-cu".into(),
-                args: vec!["mcp".into(), "-s".into(), "user".into()],
-                env: Default::default(),
+                transport: McpTransport::Stdio {
+                    command: "/Applications/KimiCU.app/Contents/MacOS/kimi-cu".into(),
+                    args: vec!["mcp".into(), "-s".into(), "user".into()],
+                    env: Default::default(),
+                },
             }
         );
         match &find(&caps, Kind::Mcp, "ctx").unwrap().spec {
-            Spec::Mcp { env, .. } => assert_eq!(env["CONTEXT7_API_KEY"], "${CONTEXT7_API_KEY}"),
+            Spec::Mcp {
+                transport: McpTransport::Stdio { env, .. },
+                ..
+            } => assert_eq!(env["CONTEXT7_API_KEY"], "${CONTEXT7_API_KEY}"),
             other => panic!("{other:?}"),
         }
     }
@@ -1234,9 +1239,11 @@ mod tests {
             let cap = Capability::new(
                 CapId::new(kind, "x"),
                 Spec::Mcp {
-                    command: "c".into(),
-                    args: vec![],
-                    env: Default::default(),
+                    transport: McpTransport::Stdio {
+                        command: "c".into(),
+                        args: vec![],
+                        env: Default::default(),
+                    },
                 },
             );
             assert_eq!(a.supports(&cap), Support::Native, "{kind:?}");

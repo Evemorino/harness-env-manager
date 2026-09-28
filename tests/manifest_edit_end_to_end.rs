@@ -5,9 +5,10 @@
 //!
 //! 夹具全部落在 `TempHome` 下，一个字节都不碰真实 `~`。
 
+use henv::capability::McpTransport;
 use henv::manifest::SkillSourceKind;
 use henv::testutil::TempHome;
-use henv::{AddRequest, RemoveRequest, UpgradeRequest};
+use henv::{AddKind, AddRequest, RemoveRequest, UpgradeRequest};
 
 const MANIFEST: &str = "env.yaml";
 
@@ -63,10 +64,12 @@ fn add_shared_foo(
         t,
         AddRequest {
             name: "foo",
-            source: SkillSourceKind::AgentsDir,
-            repo: None,
-            path: None,
-            git_ref: None,
+            kind: AddKind::Skill {
+                source: SkillSourceKind::AgentsDir,
+                repo: None,
+                path: None,
+                git_ref: None,
+            },
             targets: None,
             manifest,
             dry_run: false,
@@ -149,10 +152,12 @@ fn add_refuses_a_source_that_is_not_there_and_leaves_the_manifest_alone() {
         &t,
         AddRequest {
             name: "ghost",
-            source: SkillSourceKind::Local,
-            repo: None,
-            path: Some("/private/tmp/henv-does-not-exist-9f3a"),
-            git_ref: None,
+            kind: AddKind::Skill {
+                source: SkillSourceKind::Local,
+                repo: None,
+                path: Some("/private/tmp/henv-does-not-exist-9f3a"),
+                git_ref: None,
+            },
             targets: None,
             manifest: &manifest,
             dry_run: false,
@@ -201,8 +206,152 @@ fn remove_refuses_a_name_that_is_not_in_the_manifest() {
     let t = temp_home_with_a_shared_skill();
     let before = read(&t.path(MANIFEST));
     let err = remove(&t, &["nope"], true).expect_err("不存在必须报错");
-    assert!(err.to_string().contains("没有 skill"), "{err}");
+    assert!(err.to_string().contains("清单里没有"), "{err}");
     assert_eq!(read(&t.path(MANIFEST)), before);
+}
+
+/// `add --mcp --url`：写出一条 http 型条目（`url` + `headers`），与手写的一致。
+#[test]
+fn add_writes_an_http_mcp_entry() {
+    let t = TempHome::new();
+    t.write(MANIFEST, base_manifest());
+    let manifest = t.path(MANIFEST);
+    let mut headers = std::collections::BTreeMap::new();
+    headers.insert(
+        "Authorization".to_string(),
+        "${CONTEXT7_API_KEY}".to_string(),
+    );
+    let transport = McpTransport::Http {
+        url: "https://mcp.context7.com/mcp".to_string(),
+        headers,
+    };
+
+    add(
+        &t,
+        AddRequest {
+            name: "context7",
+            kind: AddKind::Mcp {
+                transport: &transport,
+            },
+            targets: None,
+            manifest: &manifest,
+            dry_run: false,
+            no_apply: true,
+        },
+    )
+    .expect("add");
+
+    let text = read(&manifest);
+    assert!(
+        text.contains(r#"    url: "https://mcp.context7.com/mcp""#),
+        "{text}"
+    );
+    assert!(
+        text.contains(r#"      Authorization: "${CONTEXT7_API_KEY}""#),
+        "{text}"
+    );
+    assert!(!text.contains("command:"), "http 型不该写 command：{text}");
+}
+
+/// `add --mcp`：写出一条 MCP 条目，字段形状与手写的一致。
+#[test]
+fn add_writes_an_mcp_entry() {
+    let t = TempHome::new();
+    t.write(MANIFEST, base_manifest());
+    let manifest = t.path(MANIFEST);
+    let args = vec!["-y".to_string(), "@upstash/context7-mcp".to_string()];
+    let env = [("API_KEY".to_string(), "${CONTEXT7_API_KEY}".to_string())];
+    let transport = McpTransport::Stdio {
+        command: "npx".to_string(),
+        args: args.clone(),
+        env: env.iter().cloned().collect(),
+    };
+
+    let out = add(
+        &t,
+        AddRequest {
+            name: "ctx7",
+            kind: AddKind::Mcp {
+                transport: &transport,
+            },
+            targets: Some(vec!["claude-code".to_string()]),
+            manifest: &manifest,
+            dry_run: false,
+            no_apply: true,
+        },
+    )
+    .expect("add");
+
+    let text = read(&manifest);
+    assert!(text.contains("  ctx7:\n"), "{text}");
+    assert!(text.contains("    command: npx\n"), "{text}");
+    assert!(
+        text.contains(r#"    args: ["-y", "@upstash/context7-mcp"]"#),
+        "参数是 YAML 数组：{text}"
+    );
+    assert!(
+        text.contains(r#"      API_KEY: "${CONTEXT7_API_KEY}""#),
+        "env 的值保持 ${{VAR}} 引用：{text}"
+    );
+    assert!(text.contains("    targets: [claude-code]\n"), "{text}");
+    assert!(out.contains("新增 mcp/ctx7"), "{out}");
+}
+
+/// 同名的 skill 与 MCP 可以共存——它们是两种能力，重名只在**同一段**里判。
+#[test]
+fn the_same_name_can_live_in_two_sections() {
+    let t = TempHome::new();
+    t.write(".agents/skills/foo/SKILL.md", "# foo");
+    t.write(MANIFEST, base_manifest());
+    let manifest = t.path(MANIFEST);
+
+    add_shared_foo(&t, &manifest, true).expect("先加 skill");
+    let args: Vec<String> = Vec::new();
+    let env: Vec<(String, String)> = Vec::new();
+    let transport = McpTransport::Stdio {
+        command: "npx".to_string(),
+        args: args.clone(),
+        env: env.iter().cloned().collect(),
+    };
+    add(
+        &t,
+        AddRequest {
+            name: "foo",
+            kind: AddKind::Mcp {
+                transport: &transport,
+            },
+            targets: None,
+            manifest: &manifest,
+            dry_run: false,
+            no_apply: true,
+        },
+    )
+    .expect("同名的 MCP 不该被 skill 挡住");
+
+    let text = read(&manifest);
+    assert!(text.contains("skills:\n  foo:\n"), "{text}");
+    assert!(text.contains("mcps:\n  foo:\n"), "{text}");
+}
+
+/// `remove` 三段都够得着：skill / MCP / plugin 的条目都该删得掉。
+#[test]
+fn remove_reaches_all_three_sections() {
+    let t = TempHome::new();
+    t.mkdir(".claude");
+    t.write(
+        MANIFEST,
+        "version: 1\n\nharnesses:\n  claude-code: { enabled: true }\n\n\
+         skills:\n  a-skill:\n    source: agents-dir\n\n\
+         mcps:\n  an-mcp:\n    command: npx\n    targets: [claude-code]\n\n\
+         plugins:\n  a-plugin:\n    source: snapshot\n    targets: [claude-code]\n",
+    );
+
+    remove(&t, &["a-skill", "an-mcp", "a-plugin"], true).expect("三段都该删得掉");
+
+    let text = read(&t.path(MANIFEST));
+    assert!(!text.contains("a-skill"), "{text}");
+    assert!(!text.contains("an-mcp"), "{text}");
+    assert!(!text.contains("a-plugin"), "{text}");
 }
 
 /// 本地仓库三个 tag：`upgrade` 要挑**数字段最大**的那个，并且第二次跑不动文件。

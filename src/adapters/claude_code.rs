@@ -1,7 +1,7 @@
 use crate::adapters::{CLAUDE_CODE, HarnessAdapter};
 use crate::apply::mcp::{McpMechanism, McpTarget};
 use crate::capability::{
-    CapId, Capability, Kind, Origin, Spec, Support, Targets, normalize_locator,
+    CapId, Capability, Kind, McpTransport, Origin, Spec, Support, Targets, normalize_locator,
 };
 use crate::home::Home;
 use crate::skills_dir::try_read_skill_entries;
@@ -314,38 +314,71 @@ pub(crate) fn mcp_capability(
 ) -> anyhow::Result<Capability> {
     let context = format!("mcp server `{name}`");
     let cfg = expect_object(cfg, file, &context)?;
-    let command = optional_string(cfg, "command", file, &context)?
-        .map(String::from)
-        .unwrap_or_default();
 
-    let mut args = Vec::new();
-    if let Some(list) = optional_array(cfg.get("args"), file, &format!("{context} field `args`"))? {
-        for (i, element) in list.iter().enumerate() {
-            args.push(
-                expect_string(element, file, &format!("{context} field `args[{i}]`"))?.to_string(),
-            );
-        }
-    }
-
-    let mut env = BTreeMap::new();
-    if let Some(fields) = optional_object(cfg.get("env"), file, &format!("{context} field `env`"))?
-    {
-        for (k, v) in fields {
-            env.insert(
-                k.clone(),
-                expect_string(v, file, &format!("{context} field `env` key `{k}`"))?.to_string(),
-            );
-        }
-    }
+    // 两种传输**恰好一种**：有 `url` 就是 http，否则按 stdio 读 `command`。
+    // 两边都没有时留 `command: ""`——那是"配了个空条目"的事实，由 doctor 报，
+    // 不在这里编一个形态出来。
+    let transport = match optional_string(cfg, "url", file, &context)? {
+        Some(url) => McpTransport::Http {
+            url: url.to_string(),
+            headers: read_string_map(cfg.get("headers"), file, &context, "headers")?,
+        },
+        None => McpTransport::Stdio {
+            command: optional_string(cfg, "command", file, &context)?
+                .map(String::from)
+                .unwrap_or_default(),
+            args: read_string_array(cfg.get("args"), file, &context, "args")?,
+            env: read_string_map(cfg.get("env"), file, &context, "env")?,
+        },
+    };
 
     Ok(Capability {
         id: CapId::new(Kind::Mcp, name.to_string()),
         origin: Origin::Adopted {
             harness: harness.into(),
         },
-        spec: Spec::Mcp { command, args, env },
+        spec: Spec::Mcp { transport },
         targets: Targets::All,
     })
+}
+
+/// `args` 一类的字符串数组。缺键或 `null` 都是空表；形状不对照常报错。
+fn read_string_array(
+    value: Option<&Value>,
+    file: &Path,
+    context: &str,
+    field: &str,
+) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    let Some(list) = optional_array(value, file, &format!("{context} field `{field}`"))? else {
+        return Ok(out);
+    };
+    for (i, element) in list.iter().enumerate() {
+        out.push(
+            expect_string(element, file, &format!("{context} field `{field}[{i}]`"))?.to_string(),
+        );
+    }
+    Ok(out)
+}
+
+/// `env` / `headers` 一类的字符串映射。
+fn read_string_map(
+    value: Option<&Value>,
+    file: &Path,
+    context: &str,
+    field: &str,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    let Some(fields) = optional_object(value, file, &format!("{context} field `{field}`"))? else {
+        return Ok(out);
+    };
+    for (k, v) in fields {
+        out.insert(
+            k.clone(),
+            expect_string(v, file, &format!("{context} field `{field}` key `{k}`"))?.to_string(),
+        );
+    }
+    Ok(out)
 }
 
 /// 值的类型名，只用于报错。**永远不返回值本身**——actual 侧的配置可能是明文密钥，
@@ -692,13 +725,15 @@ mod tests {
         assert_eq!(
             m.spec,
             Spec::Mcp {
-                command: "npx".into(),
-                args: vec!["-y".into(), "@upstash/context7-mcp".into()],
-                env: [(
-                    "CONTEXT7_API_KEY".to_string(),
-                    "${CONTEXT7_API_KEY}".to_string()
-                )]
-                .into(),
+                transport: McpTransport::Stdio {
+                    command: "npx".into(),
+                    args: vec!["-y".into(), "@upstash/context7-mcp".into()],
+                    env: [(
+                        "CONTEXT7_API_KEY".to_string(),
+                        "${CONTEXT7_API_KEY}".to_string()
+                    )]
+                    .into(),
+                },
             }
         );
         assert!(find(&caps, Kind::Mcp, "kimi-cu").is_some());
@@ -741,6 +776,27 @@ mod tests {
         );
     }
 
+    /// http 型（`type: http` + `url` + `headers`）要读出来——context7 那种插件就是它。
+    #[test]
+    fn reads_an_http_mcp_server() {
+        let t = TempHome::new();
+        t.write(
+            ".claude.json",
+            r#"{ "mcpServers": { "ctx": { "type": "http", "url": "https://mcp.context7.com/mcp", "headers": { "Authorization": "${K}" } } } }"#,
+        );
+        let caps = ClaudeCode::new(t.home.clone()).read_state().unwrap();
+        match &find(&caps, Kind::Mcp, "ctx").unwrap().spec {
+            Spec::Mcp {
+                transport: McpTransport::Http { url, headers },
+                ..
+            } => {
+                assert_eq!(url, "https://mcp.context7.com/mcp");
+                assert_eq!(headers["Authorization"], "${K}", "引用原样保留");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn env_reference_is_preserved_unexpanded() {
         let t = TempHome::new();
@@ -750,7 +806,10 @@ mod tests {
         );
         let caps = ClaudeCode::new(t.home.clone()).read_state().unwrap();
         match &find(&caps, Kind::Mcp, "m").unwrap().spec {
-            Spec::Mcp { env, .. } => {
+            Spec::Mcp {
+                transport: McpTransport::Stdio { env, .. },
+                ..
+            } => {
                 assert_eq!(env["K"], "${HENV_TEST_SECRET_XYZ}", "must stay a reference");
                 assert!(!env.values().any(|v| v == "expanded-value"));
             }
@@ -1472,7 +1531,10 @@ mod tests {
             .read_state()
             .expect("`null` 是「没有值」，不是形状故障");
         match &find(&caps, Kind::Mcp, "m").unwrap().spec {
-            Spec::Mcp { command, .. } => assert_eq!(command, ""),
+            Spec::Mcp {
+                transport: McpTransport::Stdio { command, .. },
+                ..
+            } => assert_eq!(command, ""),
             other => panic!("{other:?}"),
         }
         match &find(&caps, Kind::Plugin, "p").unwrap().spec {
@@ -1556,7 +1618,10 @@ mod tests {
             .read_state()
             .expect("`args: null` 是没配 args，不是形状故障");
         match &find(&caps, Kind::Mcp, "m").unwrap().spec {
-            Spec::Mcp { args, .. } => assert!(args.is_empty(), "{args:?}"),
+            Spec::Mcp {
+                transport: McpTransport::Stdio { args, .. },
+                ..
+            } => assert!(args.is_empty(), "{args:?}"),
             other => panic!("{other:?}"),
         }
     }
@@ -1574,7 +1639,10 @@ mod tests {
             .read_state()
             .expect("`env: null` 是没配 env，不是形状故障");
         match &find(&caps, Kind::Mcp, "m").unwrap().spec {
-            Spec::Mcp { env, .. } => assert!(env.is_empty(), "{env:?}"),
+            Spec::Mcp {
+                transport: McpTransport::Stdio { env, .. },
+                ..
+            } => assert!(env.is_empty(), "{env:?}"),
             other => panic!("{other:?}"),
         }
     }
@@ -1701,7 +1769,10 @@ mod tests {
         let caps = ClaudeCode::new(t.home.clone()).read_state().unwrap();
         for name in ["bare", "only-args"] {
             match &find(&caps, Kind::Mcp, name).unwrap().spec {
-                Spec::Mcp { command, args, env } => {
+                Spec::Mcp {
+                    transport: McpTransport::Stdio { command, args, env },
+                    ..
+                } => {
                     assert_eq!(*command, "", "{name}");
                     assert!(args.is_empty(), "{name}");
                     assert!(env.is_empty(), "{name}");
@@ -1733,9 +1804,11 @@ mod tests {
         assert_eq!(
             cap.spec,
             Spec::Mcp {
-                command: "npx".into(),
-                args: vec!["-y".into(), "pkg".into()],
-                env: [("K".to_string(), "${K}".to_string())].into(),
+                transport: McpTransport::Stdio {
+                    command: "npx".into(),
+                    args: vec!["-y".into(), "pkg".into()],
+                    env: [("K".to_string(), "${K}".to_string())].into(),
+                },
             }
         );
     }

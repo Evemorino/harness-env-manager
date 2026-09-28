@@ -186,7 +186,7 @@ pub fn lookup<'a>(
 mod tests {
     use super::*;
     use crate::apply::mcp::McpMechanism;
-    use crate::capability::{Kind, SkillSource, Spec};
+    use crate::capability::{Kind, McpTransport, SkillSource, Spec};
     use crate::diff::{Action, PlanEntry};
     use crate::manifest::KNOWN_HARNESSES;
     use crate::testutil::{FakeAdapter, TempHome};
@@ -306,9 +306,11 @@ mod tests {
                 path: None,
             },
             Kind::Mcp => Spec::Mcp {
-                command: String::new(),
-                args: Vec::new(),
-                env: Default::default(),
+                transport: McpTransport::Stdio {
+                    command: String::new(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                },
             },
             Kind::Plugin => Spec::Plugin {
                 marketplace: None,

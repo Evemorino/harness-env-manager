@@ -9,11 +9,10 @@
 
 use crate::apply::HarnessReport;
 use crate::apply::{mcp_claude, mcp_json, mcp_toml};
-use crate::capability::{Capability, Kind, Spec};
+use crate::capability::{Capability, Kind, McpTransport, Spec};
 use crate::diff::{Action, HarnessPlan};
 use crate::store::hash::hash_mcp_spec;
 use crate::store::provenance::{Ledger, LedgerEntry};
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 /// 一家的 MCP 写目标。
@@ -74,7 +73,7 @@ pub fn deliver_mcps(
             failures.push(format!("{}：计划里有它、清单里没有，未交付", e.id.label()));
             continue;
         };
-        let Spec::Mcp { command, args, env } = &d.spec else {
+        let Spec::Mcp { transport } = &d.spec else {
             failures.push(format!("{}：清单里这条不是 MCP 规格，未交付", e.id.label()));
             continue;
         };
@@ -82,7 +81,7 @@ pub fn deliver_mcps(
         // update 在 claude 上要先摘再写（实测 add-json 对已存在的名字直接失败）。
         // 其余两家是整棵子树替换，天然就是 update。
         let replace = matches!(e.action, Action::Update { .. });
-        match dispatch(target, &e.id.name, command, args, env, replace) {
+        match dispatch(target, &e.id.name, transport, replace) {
             Ok(()) => {
                 report.delivered.push(e.id.label());
                 ledger.record(LedgerEntry {
@@ -96,7 +95,7 @@ pub fn deliver_mcps(
                     // **重算**的哈希（源与目标之间隔着一次拷贝）；MCP 没有那层——
                     // 写入器要么成功要么报错，不存在「成功但写了别的」。
                     // 这个选择由「apply 之后 diff 必须是 in-sync」的性质测试兜底。
-                    content_hash: hash_mcp_spec(command, args, env),
+                    content_hash: hash_mcp_spec(transport),
                     delivered_at_unix: super::now_unix(),
                 });
             }
@@ -114,35 +113,44 @@ pub fn deliver_mcps(
 fn dispatch(
     target: &McpTarget,
     name: &str,
-    command: &str,
-    args: &[String],
-    env: &BTreeMap<String, String>,
+    transport: &McpTransport,
     replace: bool,
 ) -> anyhow::Result<()> {
     match &target.mechanism {
-        McpMechanism::CodexToml => {
-            mcp_toml::upsert_codex_mcp(&target.path, name, command, args, env)
-        }
-        McpMechanism::KimiJson => mcp_json::upsert_kimi_mcp(&target.path, name, command, args, env),
+        McpMechanism::CodexToml => mcp_toml::upsert_codex_mcp(&target.path, name, transport),
+        McpMechanism::KimiJson => mcp_json::upsert_kimi_mcp(&target.path, name, transport),
         McpMechanism::ClaudeCli { binary } => {
             if replace {
                 // 先摘再写。remove 失败就停在这儿——add 会覆盖掉一份我们并不认识的东西。
                 mcp_claude::claude_remove(binary, name)?;
             }
-            mcp_claude::claude_add_json(binary, name, &claude_spec_json(command, args, env))
+            mcp_claude::claude_add_json(binary, name, &claude_spec_json(transport))
         }
     }
 }
 
 /// claude CLI 收的 `--json` 载荷。键名与它自己写出来的形状一致。
-fn claude_spec_json(command: &str, args: &[String], env: &BTreeMap<String, String>) -> String {
+/// `claude mcp add-json` 吃的载荷。http 型要带 `type: "http"`——实测 claude 靠它区分
+/// 传输（没有它会当成 stdio 去找 `command`）。
+fn claude_spec_json(transport: &McpTransport) -> String {
     let mut v = serde_json::Map::new();
-    v.insert("command".into(), command.into());
-    if !args.is_empty() {
-        v.insert("args".into(), serde_json::json!(args));
-    }
-    if !env.is_empty() {
-        v.insert("env".into(), serde_json::json!(env));
+    match transport {
+        McpTransport::Stdio { command, args, env } => {
+            v.insert("command".into(), command.as_str().into());
+            if !args.is_empty() {
+                v.insert("args".into(), serde_json::json!(args));
+            }
+            if !env.is_empty() {
+                v.insert("env".into(), serde_json::json!(env));
+            }
+        }
+        McpTransport::Http { url, headers } => {
+            v.insert("type".into(), "http".into());
+            v.insert("url".into(), url.as_str().into());
+            if !headers.is_empty() {
+                v.insert("headers".into(), serde_json::json!(headers));
+            }
+        }
     }
     serde_json::Value::Object(v).to_string()
 }
@@ -189,10 +197,10 @@ mod tests {
         let entry = l.find("codex", Kind::Mcp, "context7").expect("要记账");
         assert_eq!(entry.path, target.path);
         assert_eq!(entry.source_id, "manifest:mcp/context7");
-        let Spec::Mcp { command, args, env } = &d.spec else {
+        let Spec::Mcp { transport } = &d.spec else {
             unreachable!()
         };
-        assert_eq!(entry.content_hash, hash_mcp_spec(command, args, env));
+        assert_eq!(entry.content_hash, hash_mcp_spec(transport));
     }
 
     /// 这家没有 MCP 写目标（`mcp_target()` 给 `None`）：空报告，不是失败。

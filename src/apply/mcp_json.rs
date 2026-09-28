@@ -6,18 +6,12 @@
 //! 读取也用它，golden 会跟着动），收益只是键序——不值得。别的顶层键一个不少即可。
 
 use crate::apply::write::write_config;
+use crate::capability::McpTransport;
 use anyhow::Context as _;
-use std::collections::BTreeMap;
 use std::path::Path;
 
 /// 把一条 MCP 写进 kimi 的 `mcp.json`，`mcpServers.<name>` 整棵替换。
-pub fn upsert_kimi_mcp(
-    target: &Path,
-    name: &str,
-    command: &str,
-    args: &[String],
-    env: &BTreeMap<String, String>,
-) -> anyhow::Result<()> {
+pub fn upsert_kimi_mcp(target: &Path, name: &str, transport: &McpTransport) -> anyhow::Result<()> {
     let existing = match std::fs::read_to_string(target) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -48,12 +42,24 @@ pub fn upsert_kimi_mcp(
 
     // 整棵替换：上一版多出来的 args / env 不许留在新配置里。
     let mut server = serde_json::Map::new();
-    server.insert("command".into(), command.into());
-    if !args.is_empty() {
-        server.insert("args".into(), serde_json::json!(args));
-    }
-    if !env.is_empty() {
-        server.insert("env".into(), serde_json::json!(env));
+    match transport {
+        McpTransport::Stdio { command, args, env } => {
+            server.insert("command".into(), command.as_str().into());
+            if !args.is_empty() {
+                server.insert("args".into(), serde_json::json!(args));
+            }
+            if !env.is_empty() {
+                server.insert("env".into(), serde_json::json!(env));
+            }
+        }
+        // kimi 的远端 MCP 没有 `type` 字段（实测它的配置里只有 url/headers——
+        // 与 claude 那份不同，那边靠 `type` 区分传输）。
+        McpTransport::Http { url, headers } => {
+            server.insert("url".into(), url.as_str().into());
+            if !headers.is_empty() {
+                server.insert("headers".into(), serde_json::json!(headers));
+            }
+        }
     }
     servers.insert(name.to_string(), serde_json::Value::Object(server));
 
@@ -103,6 +109,15 @@ pub fn remove_kimi_mcp(target: &Path, name: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试里构造一条 stdio transport——调用点都只需要这一种形态。
+    fn stdio_t(command: &str, args: &[String], env: &BTreeMap<String, String>) -> McpTransport {
+        McpTransport::Stdio {
+            command: command.to_string(),
+            args: args.to_vec(),
+            env: env.clone(),
+        }
+    }
     use crate::testutil::TempHome;
     use std::collections::BTreeMap;
 
@@ -116,11 +131,43 @@ mod tests {
         vec!["-y".to_string(), "@upstash/context7-mcp".to_string()]
     }
 
+    /// http 型写出来的是 `url` + `headers`，**没有 `command`**——整棵替换的语义要覆盖到
+    /// 换形态这一层（上一版是 stdio，这一版是 http，旧字段不许留下）。
+    #[test]
+    fn writes_an_http_server_and_drops_the_stdio_fields() {
+        let t = TempHome::new();
+        let p = t.path(".kimi-code/mcp.json");
+        upsert_kimi_mcp(&p, "ctx", &stdio_t("npx", &args2(), &env1())).unwrap();
+
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".to_string(), "${K}".to_string());
+        upsert_kimi_mcp(
+            &p,
+            "ctx",
+            &McpTransport::Http {
+                url: "https://mcp.context7.com/mcp".to_string(),
+                headers,
+            },
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&p).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let s = &v["mcpServers"]["ctx"];
+        assert_eq!(s["url"], "https://mcp.context7.com/mcp");
+        assert_eq!(s["headers"]["Authorization"], "${K}");
+        assert!(
+            s["command"].is_null(),
+            "换成 http 后旧 command 不许留下：{text}"
+        );
+        assert!(s["args"].is_null(), "换成 http 后旧 args 不许留下：{text}");
+    }
+
     #[test]
     fn writes_into_a_fresh_file() {
         let t = TempHome::new();
         let p = t.path(".kimi-code/mcp.json");
-        upsert_kimi_mcp(&p, "context7", "npx", &args2(), &env1()).unwrap();
+        upsert_kimi_mcp(&p, "context7", &stdio_t("npx", &args2(), &env1())).unwrap();
 
         let text = std::fs::read_to_string(&p).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -142,7 +189,7 @@ mod tests {
             ".kimi-code/mcp.json",
             "{\"zeta\": 1, \"alpha\": {\"a\": true}}\n",
         );
-        upsert_kimi_mcp(&p, "context7", "npx", &[], &BTreeMap::new()).unwrap();
+        upsert_kimi_mcp(&p, "context7", &stdio_t("npx", &[], &BTreeMap::new())).unwrap();
 
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
@@ -157,8 +204,8 @@ mod tests {
     fn replacing_a_server_drops_stale_keys() {
         let t = TempHome::new();
         let p = t.path(".kimi-code/mcp.json");
-        upsert_kimi_mcp(&p, "context7", "npx", &args2(), &env1()).unwrap();
-        upsert_kimi_mcp(&p, "context7", "uvx", &[], &BTreeMap::new()).unwrap();
+        upsert_kimi_mcp(&p, "context7", &stdio_t("npx", &args2(), &env1())).unwrap();
+        upsert_kimi_mcp(&p, "context7", &stdio_t("uvx", &[], &BTreeMap::new())).unwrap();
 
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
@@ -176,7 +223,7 @@ mod tests {
             ".kimi-code/mcp.json",
             "{\"mcpServers\": {\"user-own\": {\"command\": \"their-binary\"}}}\n",
         );
-        upsert_kimi_mcp(&p, "context7", "npx", &[], &BTreeMap::new()).unwrap();
+        upsert_kimi_mcp(&p, "context7", &stdio_t("npx", &[], &BTreeMap::new())).unwrap();
 
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
@@ -193,7 +240,7 @@ mod tests {
             ".kimi-code/mcp.json",
             "{\"mcpServers\": null, \"keep\": 1}\n",
         );
-        upsert_kimi_mcp(&p, "context7", "npx", &[], &BTreeMap::new()).unwrap();
+        upsert_kimi_mcp(&p, "context7", &stdio_t("npx", &[], &BTreeMap::new())).unwrap();
 
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
@@ -208,7 +255,7 @@ mod tests {
         let p = t.path(".kimi-code/mcp.json");
         t.write(".kimi-code/mcp.json", "[1, 2, 3]\n");
         let before = std::fs::read(&p).unwrap();
-        assert!(upsert_kimi_mcp(&p, "x", "npx", &[], &BTreeMap::new()).is_err());
+        assert!(upsert_kimi_mcp(&p, "x", &stdio_t("npx", &[], &BTreeMap::new())).is_err());
         assert_eq!(std::fs::read(&p).unwrap(), before);
     }
 
@@ -221,7 +268,8 @@ mod tests {
         t.write(".kimi-code/mcp.json", "{\"mcpServers\": \"oops\"}\n");
         let before = std::fs::read(&p).unwrap();
 
-        let err = upsert_kimi_mcp(&p, "context7", "npx", &[], &BTreeMap::new()).unwrap_err();
+        let err =
+            upsert_kimi_mcp(&p, "context7", &stdio_t("npx", &[], &BTreeMap::new())).unwrap_err();
         assert!(format!("{err:#}").contains("mcpServers"), "{err:#}");
         assert_eq!(std::fs::read(&p).unwrap(), before, "拒绝就不能动文件");
         assert!(!p.with_file_name("mcp.json.henv.bak").exists());
@@ -239,7 +287,8 @@ mod tests {
         );
         let before = std::fs::read(&p).unwrap();
 
-        let err = upsert_kimi_mcp(&p, "context7", "npx", &[], &BTreeMap::new()).unwrap_err();
+        let err =
+            upsert_kimi_mcp(&p, "context7", &stdio_t("npx", &[], &BTreeMap::new())).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             !msg.contains("sk-live-abc"),
@@ -256,7 +305,7 @@ mod tests {
         let mut e = BTreeMap::new();
         e.insert("K".to_string(), "${K}".to_string());
         e.insert("W".to_string(), "${A_B1}".to_string());
-        upsert_kimi_mcp(&p, "context7", "npx", &[], &e).unwrap();
+        upsert_kimi_mcp(&p, "context7", &stdio_t("npx", &[], &e)).unwrap();
 
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
@@ -301,8 +350,13 @@ mod tests {
         let t = TempHome::new();
         let p = t.path(".kimi-code/mcp.json");
         t.write(".kimi-code/mcp.json", "{\"keep\": 1}\n");
-        upsert_kimi_mcp(&p, "user-own", "their-binary", &[], &BTreeMap::new()).unwrap();
-        upsert_kimi_mcp(&p, "context7", "npx", &args2(), &env1()).unwrap();
+        upsert_kimi_mcp(
+            &p,
+            "user-own",
+            &stdio_t("their-binary", &[], &BTreeMap::new()),
+        )
+        .unwrap();
+        upsert_kimi_mcp(&p, "context7", &stdio_t("npx", &args2(), &env1())).unwrap();
 
         remove_kimi_mcp(&p, "context7").unwrap();
 

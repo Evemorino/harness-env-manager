@@ -3,7 +3,7 @@
 
 use crate::adapters::HarnessAdapter;
 use crate::apply::mcp::McpTarget;
-use crate::capability::{CapId, Capability, Kind, Origin, Spec, Support, Targets};
+use crate::capability::{CapId, Capability, Kind, McpTransport, Origin, Spec, Support, Targets};
 use crate::home::Home;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -243,9 +243,11 @@ impl FakeAdapter {
             id: CapId::new(Kind::Mcp, name),
             origin: Origin::Manifest,
             spec: Spec::Mcp {
-                command: command.into(),
-                args: Vec::new(),
-                env: BTreeMap::new(),
+                transport: McpTransport::Stdio {
+                    command: command.into(),
+                    args: Vec::new(),
+                    env: BTreeMap::new(),
+                },
             },
             targets: Targets::All,
         }

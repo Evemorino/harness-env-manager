@@ -5,8 +5,8 @@
 //! 文件，不是加一个键。§9.12 解禁 `toml_edit` 就是为了这一处。
 
 use crate::apply::write::write_config;
+use crate::capability::McpTransport;
 use anyhow::Context as _;
-use std::collections::BTreeMap;
 use std::path::Path;
 use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
 
@@ -17,13 +17,7 @@ use toml_edit::{DocumentMut, InlineTable, Item, Table, Value};
 ///
 /// 失败一律**不动文件**（`write_config` 的 rename 保证）：读不出来、解不开、
 /// 类型不对，都在这儿停下。
-pub fn upsert_codex_mcp(
-    target: &Path,
-    name: &str,
-    command: &str,
-    args: &[String],
-    env: &BTreeMap<String, String>,
-) -> anyhow::Result<()> {
+pub fn upsert_codex_mcp(target: &Path, name: &str, transport: &McpTransport) -> anyhow::Result<()> {
     let existing = match std::fs::read_to_string(target) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
@@ -40,7 +34,7 @@ pub fn upsert_codex_mcp(
         .entry("mcp_servers")
         .or_insert(Item::Table(Table::new()));
     let mut slots = Slots::of(item, target)?;
-    slots.replace(name, command, args, env);
+    slots.replace(name, transport);
 
     write_config(target, doc.to_string().as_bytes())
 }
@@ -100,52 +94,75 @@ impl<'a> Slots<'a> {
         }
     }
 
-    fn replace(
-        &mut self,
-        name: &str,
-        command: &str,
-        args: &[String],
-        env: &BTreeMap<String, String>,
-    ) {
+    fn replace(&mut self, name: &str, transport: &McpTransport) {
         match self {
             // 块表可以装子表，env 因此能写成 `[mcp_servers.<n>.env]`，
             // 与 codex 自己写出来的形状一致。
             Slots::Block(t) => {
                 let mut server = Table::new();
-                server.insert("command", toml_edit::value(command));
-                if !args.is_empty() {
-                    let mut arr = toml_edit::Array::new();
-                    for a in args {
-                        arr.push(a.as_str());
+                match transport {
+                    McpTransport::Stdio { command, args, env } => {
+                        server.insert("command", toml_edit::value(command));
+                        if !args.is_empty() {
+                            let mut arr = toml_edit::Array::new();
+                            for a in args {
+                                arr.push(a.as_str());
+                            }
+                            server.insert("args", toml_edit::value(arr));
+                        }
+                        if !env.is_empty() {
+                            let mut e = Table::new();
+                            for (k, v) in env {
+                                e.insert(k, toml_edit::value(v.as_str()));
+                            }
+                            server.insert("env", Item::Table(e));
+                        }
                     }
-                    server.insert("args", toml_edit::value(arr));
-                }
-                if !env.is_empty() {
-                    let mut e = Table::new();
-                    for (k, v) in env {
-                        e.insert(k, toml_edit::value(v.as_str()));
+                    // 远端 MCP：codex 把请求头放在 `http_headers`（读路径也认这个拼写）。
+                    McpTransport::Http { url, headers } => {
+                        server.insert("url", toml_edit::value(url));
+                        if !headers.is_empty() {
+                            let mut h = Table::new();
+                            for (k, v) in headers {
+                                h.insert(k, toml_edit::value(v.as_str()));
+                            }
+                            server.insert("http_headers", Item::Table(h));
+                        }
                     }
-                    server.insert("env", Item::Table(e));
                 }
                 t.insert(name, Item::Table(server));
             }
             // 内联表里只能放内联值——放 `Item::Table` 会产出非法 TOML。
             Slots::Inline(t) => {
                 let mut server = InlineTable::new();
-                server.insert("command", command.into());
-                if !args.is_empty() {
-                    let mut arr = toml_edit::Array::new();
-                    for a in args {
-                        arr.push(a.as_str());
+                match transport {
+                    McpTransport::Stdio { command, args, env } => {
+                        server.insert("command", command.into());
+                        if !args.is_empty() {
+                            let mut arr = toml_edit::Array::new();
+                            for a in args {
+                                arr.push(a.as_str());
+                            }
+                            server.insert("args", Value::Array(arr));
+                        }
+                        if !env.is_empty() {
+                            let mut e = InlineTable::new();
+                            for (k, v) in env {
+                                e.insert(k, v.as_str().into());
+                            }
+                            server.insert("env", Value::InlineTable(e));
+                        }
                     }
-                    server.insert("args", Value::Array(arr));
-                }
-                if !env.is_empty() {
-                    let mut e = InlineTable::new();
-                    for (k, v) in env {
-                        e.insert(k, v.as_str().into());
+                    McpTransport::Http { url, headers } => {
+                        server.insert("url", url.into());
+                        if !headers.is_empty() {
+                            let mut h = InlineTable::new();
+                            for (k, v) in headers {
+                                h.insert(k, v.as_str().into());
+                            }
+                            server.insert("http_headers", Value::InlineTable(h));
+                        }
                     }
-                    server.insert("env", Value::InlineTable(e));
                 }
                 t.insert(name, Value::InlineTable(server));
             }
@@ -168,6 +185,15 @@ impl<'a> Slots<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 测试里构造一条 stdio transport——调用点都只需要这一种形态。
+    fn stdio_t(command: &str, args: &[String], env: &BTreeMap<String, String>) -> McpTransport {
+        McpTransport::Stdio {
+            command: command.to_string(),
+            args: args.to_vec(),
+            env: env.clone(),
+        }
+    }
     use crate::testutil::TempHome;
     use std::collections::BTreeMap;
 
@@ -181,11 +207,46 @@ mod tests {
         vec!["-y".to_string(), "@upstash/context7-mcp".to_string()]
     }
 
+    /// codex 的远端 MCP：`url` + `http_headers`（与 kimi 的 `headers` 拼法不同，
+    /// 与自家读路径必须一致）。
+    #[test]
+    fn writes_an_http_server_with_url_and_http_headers() {
+        let t = TempHome::new();
+        let p = t.path(".codex/config.toml");
+        upsert_codex_mcp(&p, "ctx", &stdio_t("npx", &args2(), &env1())).unwrap();
+
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".to_string(), "${K}".to_string());
+        upsert_codex_mcp(
+            &p,
+            "ctx",
+            &McpTransport::Http {
+                url: "https://mcp.context7.com/mcp".to_string(),
+                headers,
+            },
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&p).unwrap();
+        assert!(
+            text.contains("url = \"https://mcp.context7.com/mcp\""),
+            "{text}"
+        );
+        assert!(
+            text.contains("[mcp_servers.ctx.http_headers]"),
+            "请求头要用 codex 自己的拼写：{text}"
+        );
+        assert!(
+            !text.contains("command"),
+            "换成 http 后旧 command 不许留下：{text}"
+        );
+    }
+
     #[test]
     fn writes_into_a_fresh_file() {
         let t = TempHome::new();
         let p = t.path(".codex/config.toml");
-        upsert_codex_mcp(&p, "context7", "npx", &args2(), &env1()).unwrap();
+        upsert_codex_mcp(&p, "context7", &stdio_t("npx", &args2(), &env1())).unwrap();
 
         let text = std::fs::read_to_string(&p).unwrap();
         let doc: toml::Value = toml::from_str(&text).unwrap();
@@ -206,7 +267,7 @@ mod tests {
             "# 我的 codex 配置\nexperimental_bearer_token = \"x\"\n\n\
              [projects.\"/Users/nava/thing\"]\ntrust_level = \"trusted\"\n",
         );
-        upsert_codex_mcp(&p, "context7", "npx", &args2(), &env1()).unwrap();
+        upsert_codex_mcp(&p, "context7", &stdio_t("npx", &args2(), &env1())).unwrap();
 
         let text = std::fs::read_to_string(&p).unwrap();
         assert!(text.contains("# 我的 codex 配置"), "注释丢了：\n{text}");
@@ -222,8 +283,8 @@ mod tests {
     fn replacing_a_server_drops_stale_keys() {
         let t = TempHome::new();
         let p = t.path(".codex/config.toml");
-        upsert_codex_mcp(&p, "context7", "npx", &args2(), &env1()).unwrap();
-        upsert_codex_mcp(&p, "context7", "uvx", &[], &BTreeMap::new()).unwrap();
+        upsert_codex_mcp(&p, "context7", &stdio_t("npx", &args2(), &env1())).unwrap();
+        upsert_codex_mcp(&p, "context7", &stdio_t("uvx", &[], &BTreeMap::new())).unwrap();
 
         let text = std::fs::read_to_string(&p).unwrap();
         let doc: toml::Value = toml::from_str(&text).unwrap();
@@ -250,7 +311,7 @@ mod tests {
             ".codex/config.toml",
             "[mcp_servers.user-own]\ncommand = \"their-binary\"\nargs = [\"--flag\"]\n",
         );
-        upsert_codex_mcp(&p, "context7", "npx", &[], &BTreeMap::new()).unwrap();
+        upsert_codex_mcp(&p, "context7", &stdio_t("npx", &[], &BTreeMap::new())).unwrap();
 
         let text = std::fs::read_to_string(&p).unwrap();
         let doc: toml::Value = toml::from_str(&text).unwrap();
@@ -275,7 +336,7 @@ mod tests {
             ".codex/config.toml",
             "keep = 1\nmcp_servers = { user-own = { command = \"x\" } }\n",
         );
-        upsert_codex_mcp(&p, "context7", "npx", &[], &BTreeMap::new()).unwrap();
+        upsert_codex_mcp(&p, "context7", &stdio_t("npx", &[], &BTreeMap::new())).unwrap();
 
         let text = std::fs::read_to_string(&p).unwrap();
         let doc: toml::Value = toml::from_str(&text).unwrap();
@@ -299,7 +360,7 @@ mod tests {
         let t = TempHome::new();
         let p = t.path(".codex/config.toml");
         for name in ["with.dot", "with space", "a\"b", "c'd"] {
-            upsert_codex_mcp(&p, name, "npx", &[], &BTreeMap::new()).unwrap();
+            upsert_codex_mcp(&p, name, &stdio_t("npx", &[], &BTreeMap::new())).unwrap();
         }
         let text = std::fs::read_to_string(&p).unwrap();
         let doc: toml::Value = toml::from_str(&text).unwrap();
@@ -320,7 +381,8 @@ mod tests {
         t.write(".codex/config.toml", "mcp_servers = \"oops\"\n");
         let before = std::fs::read(&p).unwrap();
 
-        let err = upsert_codex_mcp(&p, "context7", "npx", &[], &BTreeMap::new()).unwrap_err();
+        let err =
+            upsert_codex_mcp(&p, "context7", &stdio_t("npx", &[], &BTreeMap::new())).unwrap_err();
         assert!(format!("{err:#}").contains("mcp_servers"), "{err:#}");
         assert_eq!(std::fs::read(&p).unwrap(), before, "拒绝就不能动文件");
         assert!(!p.with_file_name("config.toml.henv.bak").exists());
@@ -338,7 +400,8 @@ mod tests {
         );
         let before = std::fs::read(&p).unwrap();
 
-        let err = upsert_codex_mcp(&p, "context7", "npx", &[], &BTreeMap::new()).unwrap_err();
+        let err =
+            upsert_codex_mcp(&p, "context7", &stdio_t("npx", &[], &BTreeMap::new())).unwrap_err();
         let msg = format!("{err:#}");
         assert!(
             !msg.contains("sk-live-abc"),
@@ -355,7 +418,7 @@ mod tests {
         let mut e = BTreeMap::new();
         e.insert("K".to_string(), "${K}".to_string());
         e.insert("W".to_string(), "${A_B1}".to_string());
-        upsert_codex_mcp(&p, "context7", "npx", &[], &e).unwrap();
+        upsert_codex_mcp(&p, "context7", &stdio_t("npx", &[], &e)).unwrap();
 
         let text = std::fs::read_to_string(&p).unwrap();
         let doc: toml::Value = toml::from_str(&text).unwrap();
@@ -414,8 +477,8 @@ mod tests {
         let t = TempHome::new();
         let p = t.path(".codex/config.toml");
         t.write(".codex/config.toml", "# 用户自己写的\nmodel = \"gpt-5\"\n");
-        upsert_codex_mcp(&p, "other", "their-binary", &[], &BTreeMap::new()).unwrap();
-        upsert_codex_mcp(&p, "context7", "npx", &args2(), &env1()).unwrap();
+        upsert_codex_mcp(&p, "other", &stdio_t("their-binary", &[], &BTreeMap::new())).unwrap();
+        upsert_codex_mcp(&p, "context7", &stdio_t("npx", &args2(), &env1())).unwrap();
 
         remove_codex_mcp(&p, "context7").unwrap();
 

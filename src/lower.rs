@@ -3,7 +3,9 @@
 //! plugin 在此**不**被拆解：spec §2.1 第 2 条确认三家 harness 都有 plugin 机制且 bundle 自带
 //! per-harness manifest，v1 以对账为主。拆解是 Plan B 在目标 harness 缺 manifest 时的降级路径。
 
-use crate::capability::{CapId, Capability, Kind, Origin, SkillSource, Spec, normalize_locator};
+use crate::capability::{
+    CapId, Capability, Kind, McpTransport, Origin, SkillSource, Spec, normalize_locator,
+};
 use crate::manifest::{
     DegradeAction, DegradePolicy, Manifest, PluginEntry, PluginSourceKind, SkillSourceKind,
 };
@@ -88,12 +90,23 @@ pub fn lower(m: &Manifest) -> Vec<Capability> {
         out.push(Capability {
             id: CapId::new(Kind::Mcp, name.clone()),
             origin: Origin::Manifest,
+            // 校验（`Manifest::validate`）已经保证两种传输**恰好一种**，所以这里
+            // `command` 与 `url` 必有一个在；`expect` 是契约，不是可能失败的分支。
             spec: Spec::Mcp {
-                command: e.command.clone(),
-                args: e.args.clone(),
-                // env 值已由 `secrets::validate_env` 保证是裸 `${VAR}` 引用：
-                // 原样搬运，绝不展开、绝不重新引号、绝不剥掉花括号。
-                env: e.env.clone(),
+                transport: match (&e.command, &e.url) {
+                    (Some(command), None) => McpTransport::Stdio {
+                        command: command.clone(),
+                        args: e.args.clone(),
+                        // env 值已由 `secrets::validate_env` 保证是裸 `${VAR}` 引用：
+                        // 原样搬运，绝不展开、绝不重新引号、绝不剥掉花括号。
+                        env: e.env.clone(),
+                    },
+                    (None, Some(url)) => McpTransport::Http {
+                        url: url.clone(),
+                        headers: e.headers.clone(),
+                    },
+                    _ => unreachable!("manifest 校验保证 command 与 url 恰好二选一"),
+                },
             },
             targets: e.targets.clone(),
         });
@@ -255,9 +268,11 @@ mod tests {
                 path: None,
             },
             Kind::Mcp => Spec::Mcp {
-                command: "npx".into(),
-                args: vec![],
-                env: Default::default(),
+                transport: McpTransport::Stdio {
+                    command: "npx".into(),
+                    args: vec![],
+                    env: Default::default(),
+                },
             },
             Kind::Command => Spec::Command {
                 path: PathBuf::from("/p"),
@@ -313,7 +328,10 @@ plugins:
         let mcp = caps.iter().find(|c| c.id.kind == Kind::Mcp).unwrap();
         assert_eq!(mcp.id.name, "context7");
         match &mcp.spec {
-            Spec::Mcp { command, args, env } => {
+            Spec::Mcp {
+                transport: McpTransport::Stdio { command, args, env },
+                ..
+            } => {
                 assert_eq!(command, "npx");
                 assert_eq!(
                     args,
@@ -477,7 +495,10 @@ plugins:
         let yaml = "version: 1\nmcps:\n  a:\n    command: npx\n    env:\n      K: ${K}\n";
         let caps = lower(&m(yaml));
         match &caps[0].spec {
-            Spec::Mcp { env, .. } => {
+            Spec::Mcp {
+                transport: McpTransport::Stdio { env, .. },
+                ..
+            } => {
                 assert_eq!(env["K"], "${K}", "reference must not be expanded")
             }
             other => panic!("expected Mcp, got {other:?}"),

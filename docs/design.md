@@ -140,7 +140,10 @@ Plan B 是写路径，以下 7 条经实测，修正或补充 §2.1 与 §5–§
    `[mcp_servers]`，其余字节原样）是对的；整文件重新序列化会重排键序、改写内联表形态。
 
 4. **`~/.kimi-code/mcp.json` 结构简单**：`{ mcpServers: { <name>: { command, args } } }`，无嵌套怪形。
-   普通 JSON merge 足够，不需要特殊处理；只需保留未知的顶层键。
+   普通 JSON merge 足够，不需要特殊处理；只需保留未知的顶层键。远端 MCP 是同一个键下的
+   `{ url, headers }`（2026-09-28 实测：kimi 自己的文档字符串写「A minimal http entry needs
+   `url`」，字段映射表把 codex 的 `http_headers` 对成 `headers`），**没有 `type`**——与 claude
+   那份靠 `type` 区分传输的写法不同。
 
 5. **两家配置目录都没有 `.bak` 残留** ⇒ `.bak` 是 Plan B 新引入的约定，**没有历史包袱要兼容**，
    命名与轮转规则可以自由定（§9.7）。
@@ -295,6 +298,16 @@ mcps:
     env:
       CONTEXT7_API_KEY: ${CONTEXT7_API_KEY}   # 只允许引用，字面量密钥校验报错
     targets: all                # all 或显式列表 [claude-code, codex]
+
+  # 远端 MCP：与上面**二选一**（校验里判「恰好一种」）。
+  # `headers` 的值同样只允许**裸** ${VAR} 引用——那是放凭据的地方，
+  # 所以 `Bearer ${TOKEN}` 或 `${TOKEN:-}` 这类带前缀/默认值的写法表达不了
+  # （§9.6 的「已知的表达力边界」）。
+  remote-docs:
+    url: https://mcp.example.com/mcp
+    headers:
+      Authorization: ${DOCS_TOKEN}
+    targets: all
 
 plugins:
   superpowers-bundle:
@@ -758,6 +771,50 @@ codex」正是这么写的）。理由同 §9.3：那份内容是**清单要求�
 
 `env` 一律以 `${VAR}` 引用形态写入，**永不展开**（§3 决策 3）。
 
+**MCP 有两种传输形态，不是一种（2026-09-28）。** 原先的载荷只有 stdio 三件套
+（`command`/`args`/`env`），而本机实测 claude 的 `context7` plugin 内容其实只有一份
+`.mcp.json`——没有 `command`、没有 `args`，它连的是远端服务器：
+
+```json
+{"mcpServers":{"context7":{"type":"http","url":"https://mcp.context7.com/mcp",
+  "headers":{"Authorization":"${CONTEXT7_API_KEY}"}}}}
+```
+
+所以清单的载荷是两态的 `McpTransport`：`Stdio { command, args, env }` /
+`Http { url, headers }`，校验要求**恰好一种**——`command` 与 `url` 互斥且必有其一，
+`args`/`env` 只跟 `command` 走、`headers` 只跟 `url` 走。`headers` 的值与 `env` 同一条门禁：
+必须是裸 `${VAR}` 引用，字面量拒绝（那正是放凭据的地方）。
+
+三家对这两种形态的**字段拼法各不相同**，读写两侧都按这张表：
+
+| harness | stdio | http |
+|---|---|---|
+| claude-code | `command` / `args` / `env` | `type: "http"` + `url` + `headers` |
+| codex | `command` / `args` / `env`（**不写 `type`**） | `url` + `[mcp_servers.<n>.http_headers]` |
+| kimi-code | `command` / `args` / `env`（**不写 `type`**） | `url` + `headers` |
+
+- **claude 靠 `type` 区分传输**：上面那份 plugin 里是 `type: "http"`，stdio 条目则是
+  `type: "stdio"`（本机 `~/.claude.json` 的 `kimi-cu` 就是这样）。写路径是 shell out，
+  JSON 载荷原样交给 claude——隔离 HOME 实测 `claude mcp add-json -s user` 收下
+  `{"type":"http","url":…,"headers":…}` 并**逐字**写进 `~/.claude.json`。
+- **codex 把请求头叫 `http_headers`**（`headers` 是 SDK 侧的写法），而且 `type` 可省：
+  隔离 `CODEX_HOME` 实测，只写 `command` 的条目与只写 `url` + `http_headers` 的条目都被
+  `codex mcp list` 正常识别（后者显示 Auth = Bearer token）。henv 因此**不写 `type`**——
+  少一个字段就少一处要跟上游对齐的拼法。
+- **kimi 两者都不用**：它的 http 条目就是 `url` + `headers`（§2.2 第 4 条的实测），多一个
+  `type` 只会是个它不认识的键。
+
+**传输类型进哈希。** `store::hash::hash_mcp_spec(&McpTransport)` 把形态作为首字节掺进去
+（`b"s"` / `b"h"`），于是「同一个名字从 stdio 换成 http」在账本上就是一次改动，`diff` 报
+`update` 而不是 `in-sync`。写入侧**整棵子树替换**（codex 改 `[mcp_servers.<n>]`、
+kimi 换 `mcpServers.<n>`、claude 是 `remove` 后 `add-json`——见下），所以换形态时旧形态的
+字段不会留下：stdio → http 后 `command`/`args`/`env` 必须消失，反向同理。这条有专门的测试。
+
+**已知的表达力边界**：`${VAR}` 只能是**裸引用**，所以 context7 plugin 原文里
+`${CONTEXT7_API_KEY:-}` 那种「带默认值」的 shell 展开写法清单**表达不了**——那是
+`${VAR}` 门禁换来的（它同时是「拦住字面量密钥」的那道闸）。要那种形态得手工改配置，
+并把那条从清单里排除。
+
 **claude 那条必须显式指定 user 级 scope——已核实，不再只是意图。** 本机实测
 `claude mcp add-json` 的 `-s, --scope <scope>` 取 `local|user|project`，**默认 `local`**；
 而 `local` 落在 `projects.<cwd>.mcpServers`，正是读路径明确不读的项目级位置（§2.1 第 1 条）。
@@ -793,15 +850,17 @@ config`，退出码非 0，没有 `--force` 之类的覆盖开关；`remove` 只
 `compare_versions`、完全不看账本，所以报的是 `update`；B3a 把这个裁决点补上。
 代价（**已接受**）：用户想让 henv 接管一个自己手配过的同名 MCP，得先自己删掉再 `apply`。
 
-`update` 的 from/to 用**可读命令行**（`npx -y @upstash/context7-mcp`）而不是哈希：MCP 的
-「内容」就是它的命令行，哈希在这里只是账本用的凭证。凭证由
-`store::hash::hash_mcp_spec(command, args, env)`（与 `hash_dir` 并列）产出，读写两侧共用
-一份实现——两侧各算各的，正是「账本哈希对不上」这类谜题的来源。
+`update` 的 from/to 用**可读摘要**（`mcp_summary`）而不是哈希：stdio 那条是命令行
+（`npx -y @upstash/context7-mcp`），http 那条是 `http <url>`，两者的 `env`/`headers` 都只
+列键名。MCP 的「内容」就是这些字段，哈希在这里只是账本用的凭证。凭证由
+`store::hash::hash_mcp_spec(&McpTransport)`（与 `hash_dir` 并列）产出，读写两侧共用一份
+实现——两侧各算各的，正是「账本哈希对不上」这类谜题的来源。
 
-**为什么是三个原生字段而不是 `hash_spec(&Spec)`**（2026-09-26 与实现对齐）：`Spec` 没有
-`Serialize`，为哈希去 derive 它会把序列化形状变成对外契约；而 `&Spec` 版本还要为另外六个
-变体（`Skill`/`Plugin`/`Hook`/`Command`/`Agent`/`Only`）写永远走不到的 arm。三个原生字段
-顺带让「拿一个 skill spec 算 mcp 哈希」在类型上不可表达。**env 的值参与哈希**——与
+**为什么是原生的 `McpTransport` 而不是 `hash_spec(&Spec)`**（2026-09-26 与实现对齐，
+2026-09-28 随远端 MCP 从「三个字段」改成「一个两态载荷」）：`Spec` 没有 `Serialize`，
+为哈希去 derive 它会把序列化形状变成对外契约；而 `&Spec` 版本还要为另外六个变体
+（`Skill`/`Plugin`/`Hook`/`Command`/`Agent`/`Only`）写永远走不到的 arm。原生载荷顺带让
+「拿一个 skill spec 算 mcp 哈希」在类型上不可表达。**`env`/`headers` 的值参与哈希**——与
 `mcp_summary`（只渲染键名，§3 决策 3）不同，账本要认得出「同一条 server 换了一个环境变量
 引用」是改动。
 
@@ -855,6 +914,8 @@ henv apply [-m env.yaml] [--yes] [--prune] [--harness <name>]
 henv skills list --repo <url> [--ref <r>] [--path <p>]        ← Plan B 新增
 henv add <name> [--source git|local|agents-dir] [--repo <r>] [--path <p>] [--ref <r>] \
          [--targets <list>] [-m env.yaml] [--dry-run] [--no-apply] [--yes] [--harness <name>]
+henv add <name> --mcp --command <c> [--arg <a>]... [--env KEY='${VAR}']... [同上其余开关]
+henv add <name> --mcp --url <u> [--header KEY='${VAR}']...                   [同上其余开关]
 henv remove <name>... [-m env.yaml] [--dry-run] [--keep] [--yes] [--harness <name>]
 henv upgrade [<name>...] [--to <ref>] [-m env.yaml] [--dry-run] [--no-apply] [--yes]
              [--harness <name>]                                ← Plan E 新增
@@ -878,6 +939,30 @@ henv upgrade [<name>...] [--to <ref>] [-m env.yaml] [--dry-run] [--no-apply] [--
 **报告里那句提示与账本同源**（2026-09-26）：drift 行括号里写的是 `--prune` 对这条
 **会做什么**——账本记着的写「未在清单中，--prune 可删」，其余写「未在清单中，只报不删」。
 判据与 `prune_plan` 用的 `ledger.find` 是同一个，所以报告不会承诺它做不到的删除。
+
+**`add` 加两类东西**（2026-09-28）：skill（`--source` 三选一）与 MCP
+（`--mcp --command …` 或 `--mcp --url …`，后者是远端 MCP，§9.6），两者互斥——「这次加的
+是哪一类」由参数本身说清，不靠猜；两种传输也互斥，缺了会报 `--mcp requires --command or
+--url`。MCP **跳过「验证源可取」**：它没有源目录，`--command` 多半由 `npx`/`uvx` 在运行时
+解析，`--url` 更是一段远端地址，而交付本来也不检查可达性（claude 走它自己的 CLI，
+codex/kimi 只写配置）；假装校验一遍只会给假信心。`--env` / `--header` 的值在 CLI 层就要求
+`${VAR}` 形式（清单层也拒字面量，但那要等用户敲完一整串参数才报），而且 shell 里要用单引号
+包住，否则 `${VAR}` 会先被 shell 展开成空串。
+
+**`add` 的参数只有三个合法格子，格子之外一律报错**（2026-09-28）：两条正交维度——载荷
+（skill / MCP）与 MCP 的传输（stdio / `--command` 那一组，远端 / `--url` 那一组）——交叉出
+skill、stdio MCP、http MCP 三个形状；`--arg`/`--env` 只属于 stdio，`--header` 只属于远端。
+**这条判断不能只靠 clap**：实测 `requires` 在「A 要求 B、而 B 与已给的 C 冲突」时会**连要求
+一起丢掉**——`--mcp --command npx --header K=${V}`、`--mcp --url … --arg -y`、
+`--mcp --url … --env K=${V}`，以及 skill 模式里塞一个 `--url`，都会被解析器收下，然后那个
+参数在构造载荷时**静默消失**：清单里少一个字段，而用户以为加上了。所以 `check_add_flags`
+在 CLI 层显式再判一遍并点名那个被丢下的参数——`--env` 配 `--url` 那句还会顺手说清「远端
+凭据走 `--header`」。回归锁在 `src/main.rs` 的测试里，四条被 clap 放行的形状各占一行。
+
+**`remove` 三段都够得着**（2026-09-28）：按名字在 skills / mcps / plugins 里找，删对应那一段
+（plugin 按 **key** 匹配，不按它的身份 `entry`——删条目删的是 YAML 的键）。`upgrade` 仍然
+只动 `source: git` 的 skill：MCP 条目**没有版本字段**，plugin 的 `versions:` 是**观测记录**
+而不是期望值（刷新它是 `scan` 的活），所以那两个 kind 上根本不存在「升级」这个动作。
 
 **`add` / `remove` / `upgrade` 是清单编辑命令**（2026-09-28，Plan E）：它们的产物是**清单
 文本**，交付与撤销仍然走 `apply` / `apply --prune` 的同一条路径——三个命令不实现自己的

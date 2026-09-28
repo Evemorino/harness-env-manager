@@ -14,7 +14,7 @@
 //! - **表达不了的必须说出来。** 清单 schema 表达不了的 kind、随 plugin 分发的内容、来源
 //!   不可判定的条目，一律进 `skips` 并写明理由——静默丢弃会让人以为「本机没有」。
 
-use crate::capability::{Capability, Kind, Origin, SkillSource, Spec};
+use crate::capability::{Capability, Kind, McpTransport, Origin, SkillSource, Spec};
 use crate::diff::HarnessState;
 use crate::home::Home;
 use crate::manifest::Manifest;
@@ -238,27 +238,41 @@ fn shape(cap: &Capability, harnesses: &BTreeMap<String, Capability>) -> Adoption
             SkillSource::Unknown => unreachable!("not adoptable: unknown skill source"),
             SkillSource::Git { .. } => unreachable!("not adoptable: git source"),
         },
-        Spec::Mcp { command, args, env } => {
-            let mut out = String::new();
-            let _ = writeln!(out, "  command: {}", scalar(command));
-            if !args.is_empty() {
-                let items: Vec<String> = args.iter().map(|a| scalar(a)).collect();
-                let _ = writeln!(out, "  args: [{}]", items.join(", "));
-            }
-            if !env.is_empty() {
-                out.push_str("  env:\n");
-                for (k, v) in env {
-                    // 值永远是 `${VAR}` 引用，原样写回——**不展开**（§3 决策 3）。
-                    let _ = writeln!(out, "    {}: {}", scalar(k), scalar(v));
+        // 收养按**传输形态**分岔：stdio 写 `command`/`args`/`env`，http 写 `url`/`headers`。
+        // 值一律 `${VAR}` 引用、原样写回，**不展开**（§3 决策 3）。
+        Spec::Mcp { transport } => match transport {
+            McpTransport::Stdio { command, args, env } => {
+                let mut out = String::new();
+                let _ = writeln!(out, "  command: {}", scalar(command));
+                if !args.is_empty() {
+                    let items: Vec<String> = args.iter().map(|a| scalar(a)).collect();
+                    let _ = writeln!(out, "  args: [{}]", items.join(", "));
                 }
+                if !env.is_empty() {
+                    out.push_str("  env:\n");
+                    for (k, v) in env {
+                        let _ = writeln!(out, "    {}: {}", scalar(k), scalar(v));
+                    }
+                }
+                let summary = if args.is_empty() {
+                    format!("command={command}")
+                } else {
+                    format!("command={command} args={}", args.join(" "))
+                };
+                (out, summary)
             }
-            let summary = if args.is_empty() {
-                format!("command={command}")
-            } else {
-                format!("command={command} args={}", args.join(" "))
-            };
-            (out, summary)
-        }
+            McpTransport::Http { url, headers } => {
+                let mut out = String::new();
+                let _ = writeln!(out, "  url: {}", scalar(url));
+                if !headers.is_empty() {
+                    out.push_str("  headers:\n");
+                    for (k, v) in headers {
+                        let _ = writeln!(out, "    {}: {}", scalar(k), scalar(v));
+                    }
+                }
+                (out, format!("url={url}"))
+            }
+        },
         // §10.3：plugin 收养成记录型条目。**逐家**记版本，且**只记 version 形**的
         // （Review Focus 5）：sha 形的目录名（`db467cc56673`）记进去就是一条 diff
         // 说「不可比」的死值，比不记更坏——它看起来像是记下了什么。
@@ -657,9 +671,11 @@ mod tests {
                 "context7",
                 "codex",
                 Spec::Mcp {
-                    command: "npx".into(),
-                    args: vec!["-y".into(), "@upstash/context7-mcp".into()],
-                    env,
+                    transport: McpTransport::Stdio {
+                        command: "npx".into(),
+                        args: vec!["-y".into(), "@upstash/context7-mcp".into()],
+                        env,
+                    },
                 },
             )],
         )];
@@ -670,7 +686,7 @@ mod tests {
         assert_eq!(a.section, Section::Mcps);
         let parsed = parse_with(a.section, &a.name, &a.body);
         let entry = &parsed.mcps["context7"];
-        assert_eq!(entry.command, "npx");
+        assert_eq!(entry.command.as_deref(), Some("npx"));
         assert_eq!(entry.args, vec!["-y", "@upstash/context7-mcp"]);
         assert_eq!(
             entry.env["CONTEXT7_API_KEY"], "${CONTEXT7_API_KEY}",
@@ -890,9 +906,11 @@ mod tests {
                 "m",
                 "codex",
                 Spec::Mcp {
-                    command: "npx".into(),
-                    args: Vec::new(),
-                    env: Default::default(),
+                    transport: McpTransport::Stdio {
+                        command: "npx".into(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                    },
                 },
             )],
         )];
@@ -924,9 +942,11 @@ mod tests {
                     "m",
                     "claude-code",
                     Spec::Mcp {
-                        command: "npx".into(),
-                        args: Vec::new(),
-                        env: Default::default(),
+                        transport: McpTransport::Stdio {
+                            command: "npx".into(),
+                            args: Vec::new(),
+                            env: Default::default(),
+                        },
                     },
                 ),
             ],
@@ -1058,9 +1078,11 @@ mod tests {
                         "kimi-cu",
                         "kimi-code",
                         Spec::Mcp {
-                            command: "uvx".into(),
-                            args: Vec::new(),
-                            env,
+                            transport: McpTransport::Stdio {
+                                command: "uvx".into(),
+                                args: Vec::new(),
+                                env,
+                            },
                         },
                     ),
                     cap(

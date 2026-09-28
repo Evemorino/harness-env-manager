@@ -90,6 +90,57 @@ pub enum SkillSource {
     Unknown,
 }
 
+/// 一个 MCP 的两种传输形态。**恰好一种**——这是清单校验与三家适配器读写的共同契约。
+///
+/// 为什么值得单独一个类型：这两种形态**没有公共字段**（stdio 有命令、没有 URL；http 反之），
+/// 用一个「可有可无的 command」去表示会让每个读取点都得自己判空——而漏判一次就是一个
+/// 静默的错判。类型在这里替所有下游把关。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum McpTransport {
+    /// 本地进程：起一个命令，走 stdio 通信。
+    Stdio {
+        command: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+    },
+    /// 远端：一个 URL，可选的请求头（放凭据的地方，所以值同样必须是 `${VAR}` 引用）。
+    Http {
+        url: String,
+        headers: BTreeMap<String, String>,
+    },
+}
+
+impl McpTransport {
+    /// 人读的一行摘要。**只渲染键名，绝不渲染值**——`actual` 侧的值是从活配置里读回来的，
+    /// 可能就是明文密钥（§3 决策 3）。
+    pub(crate) fn summary(&self) -> String {
+        match self {
+            McpTransport::Stdio { command, args, env } => {
+                let mut s = command.clone();
+                for a in args {
+                    s.push(' ');
+                    s.push_str(a);
+                }
+                if !env.is_empty() {
+                    s.push_str(" [env: ");
+                    s.push_str(&env.keys().cloned().collect::<Vec<_>>().join(","));
+                    s.push(']');
+                }
+                s
+            }
+            McpTransport::Http { url, headers } => {
+                let mut s = format!("http {url}");
+                if !headers.is_empty() {
+                    s.push_str(" [headers: ");
+                    s.push_str(&headers.keys().cloned().collect::<Vec<_>>().join(","));
+                    s.push(']');
+                }
+                s
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Spec {
     Skill {
@@ -97,9 +148,7 @@ pub enum Spec {
         path: Option<PathBuf>,
     },
     Mcp {
-        command: String,
-        args: Vec<String>,
-        env: BTreeMap<String, String>,
+        transport: McpTransport,
     },
     Plugin {
         marketplace: Option<String>,
@@ -233,22 +282,8 @@ pub fn normalize_locator(value: Option<&str>) -> Option<String> {
 ///
 /// 可见性提成 `pub(crate)` 是因为 `diff` 要拿它渲染 `update` 的 from/to——
 /// 再写一个同样的渲染函数就等于有了两份「什么算同一个 MCP」的定义。
-pub(crate) fn mcp_summary(
-    command: &str,
-    args: &[String],
-    env: &BTreeMap<String, String>,
-) -> String {
-    let mut s = String::from(command);
-    if !args.is_empty() {
-        s.push(' ');
-        s.push_str(&args.join(" "));
-    }
-    if !env.is_empty() {
-        s.push_str(" [env: ");
-        s.push_str(&env.keys().cloned().collect::<Vec<_>>().join(","));
-        s.push(']');
-    }
-    s
+pub(crate) fn mcp_summary(transport: &McpTransport) -> String {
+    transport.summary()
 }
 
 /// 判据（spec §2.1 第 3 条，2026-09-25 修订）：plugin 用 entry 名作身份、版本比较见
@@ -275,24 +310,13 @@ pub fn compare_versions(desired: &Spec, actual: &Spec) -> VersionMatch {
                 }
             }
         }
-        (
-            Spec::Mcp {
-                command: dc,
-                args: da,
-                env: de,
-            },
-            Spec::Mcp {
-                command: ac,
-                args: aa,
-                env: ae,
-            },
-        ) => {
-            if dc == ac && da == aa && de == ae {
+        (Spec::Mcp { transport: dt }, Spec::Mcp { transport: at }) => {
+            if dt == at {
                 VersionMatch::Same
             } else {
                 VersionMatch::Different {
-                    from: mcp_summary(ac, aa, ae),
-                    to: mcp_summary(dc, da, de),
+                    from: mcp_summary(at),
+                    to: mcp_summary(dt),
                 }
             }
         }
@@ -476,9 +500,11 @@ mod tests {
         let c = Capability::new(
             CapId::new(Kind::Mcp, "context7"),
             Spec::Mcp {
-                command: "npx".into(),
-                args: vec!["-y".into(), "@upstash/context7-mcp".into()],
-                env: BTreeMap::new(),
+                transport: McpTransport::Stdio {
+                    command: "npx".into(),
+                    args: vec!["-y".into(), "@upstash/context7-mcp".into()],
+                    env: BTreeMap::new(),
+                },
             },
         );
         assert_eq!(c.origin, Origin::Manifest);
@@ -616,12 +642,14 @@ mod tests {
     #[test]
     fn mcp_compares_command_args_and_env() {
         let mcp = |cmd: &str, args: Vec<&str>, env: Vec<(&str, &str)>| Spec::Mcp {
-            command: cmd.into(),
-            args: args.into_iter().map(String::from).collect(),
-            env: env
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
+            transport: McpTransport::Stdio {
+                command: cmd.into(),
+                args: args.into_iter().map(String::from).collect(),
+                env: env
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            },
         };
         assert_eq!(
             compare_versions(
@@ -674,9 +702,11 @@ mod tests {
     #[test]
     fn mcp_different_reports_actual_as_from_and_desired_as_to() {
         let mcp = |cmd: &str, args: Vec<&str>| Spec::Mcp {
-            command: cmd.into(),
-            args: args.into_iter().map(String::from).collect(),
-            env: Default::default(),
+            transport: McpTransport::Stdio {
+                command: cmd.into(),
+                args: args.into_iter().map(String::from).collect(),
+                env: Default::default(),
+            },
         };
         assert_eq!(
             compare_versions(
@@ -706,12 +736,14 @@ mod tests {
     #[test]
     fn mcp_summary_renders_env_key_names_never_values() {
         let mcp = |cmd: &str, args: Vec<&str>, env: Vec<(&str, &str)>| Spec::Mcp {
-            command: cmd.into(),
-            args: args.into_iter().map(String::from).collect(),
-            env: env
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
+            transport: McpTransport::Stdio {
+                command: cmd.into(),
+                args: args.into_iter().map(String::from).collect(),
+                env: env
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
+            },
         };
         // 同一个键换了值 → 摘要同串。不显示值就分不清值，这是换取「密钥永不进产物」
         // 而**已裁定接受**的残余，不要试图消掉。

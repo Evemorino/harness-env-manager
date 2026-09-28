@@ -9,8 +9,8 @@
 
 use crate::adapters::HarnessAdapter;
 use crate::capability::{
-    CapId, Capability, Kind, Origin, RecordedMatch, SkillSource, Spec, Support, VersionMatch,
-    compare_recorded_version, compare_versions, mcp_summary,
+    CapId, Capability, Kind, McpTransport, Origin, RecordedMatch, SkillSource, Spec, Support,
+    VersionMatch, compare_recorded_version, compare_versions, mcp_summary,
 };
 use crate::lower::{DegradeTable, SnapshotTable, SourceHarnessTable};
 use crate::manifest::DegradeAction;
@@ -285,9 +285,9 @@ fn content_verdict(
 }
 
 /// 取出 MCP 的三段载荷；不是 MCP 就 `None`。
-fn mcp_fields(spec: &Spec) -> Option<(&str, &[String], &BTreeMap<String, String>)> {
+fn mcp_fields(spec: &Spec) -> Option<&McpTransport> {
     match spec {
-        Spec::Mcp { command, args, env } => Some((command, args, env)),
+        Spec::Mcp { transport } => Some(transport),
         _ => None,
     }
 }
@@ -304,20 +304,20 @@ fn mcp_verdict(
     actual: &Capability,
     ledger: &Ledger,
 ) -> Option<Verdict> {
-    let (dc, da, de) = mcp_fields(&cap.spec)?;
-    let (ac, aa, ae) = mcp_fields(&actual.spec)?;
+    let dt = mcp_fields(&cap.spec)?;
+    let at = mcp_fields(&actual.spec)?;
 
     // 第一行：字节相同就不看账本。与 content_verdict 同一条道理——
     // 目标已经是对的了，它当初是谁放的不改变这个事实。
-    if dc == ac && da == aa && de == ae {
+    if dt == at {
         return Some(Verdict {
             action: Action::InSync,
             note: None,
         });
     }
 
-    let to = mcp_summary(dc, da, de);
-    let from = mcp_summary(ac, aa, ae);
+    let to = mcp_summary(dt);
+    let from = mcp_summary(at);
     match ledger.find(harness, Kind::Mcp, &cap.id.name) {
         // 不同 + 无账本：目标上有一个同名、内容不同、又不是我们放的东西。
         // §9.3 不变式二：绝不覆盖，报出来让人自己决定。
@@ -329,7 +329,7 @@ fn mcp_verdict(
         }),
         // 哈希算的是**现状**（从配置里读回来的那份），不是期望。
         // 拿期望去比，改一次清单就会让所有 MCP 假报「被手改过」。
-        Some(entry) if entry.content_hash == hash_mcp_spec(ac, aa, ae) => Some(Verdict {
+        Some(entry) if entry.content_hash == hash_mcp_spec(at) => Some(Verdict {
             action: Action::Update { from, to },
             note: None,
         }),
@@ -1565,9 +1565,11 @@ mod tests {
 
     fn mcp_spec(cmd: &str) -> Spec {
         Spec::Mcp {
-            command: cmd.into(),
-            args: vec![],
-            env: Default::default(),
+            transport: McpTransport::Stdio {
+                command: cmd.into(),
+                args: vec![],
+                env: Default::default(),
+            },
         }
     }
 
@@ -1708,14 +1710,14 @@ mod tests {
     #[test]
     fn a_differing_mcp_we_delivered_is_an_update() {
         let actual = FakeAdapter::mcp("context7", "old");
-        let Spec::Mcp { command, args, env } = &actual.spec else {
+        let Spec::Mcp { transport } = &actual.spec else {
             unreachable!()
         };
         let mut l = Ledger::default();
         l.record(mcp_entry(
             "codex",
             "context7",
-            &crate::store::hash::hash_mcp_spec(command, args, env),
+            &crate::store::hash::hash_mcp_spec(transport),
         ));
 
         let hp = run_with_ledger(
@@ -1755,14 +1757,14 @@ mod tests {
     #[test]
     fn changing_the_manifest_does_not_fake_a_hand_edit() {
         let old_desired = FakeAdapter::mcp("context7", "npx");
-        let Spec::Mcp { command, args, env } = &old_desired.spec else {
+        let Spec::Mcp { transport } = &old_desired.spec else {
             unreachable!()
         };
         let mut l = Ledger::default();
         l.record(mcp_entry(
             "codex",
             "context7",
-            &crate::store::hash::hash_mcp_spec(command, args, env),
+            &crate::store::hash::hash_mcp_spec(transport),
         ));
 
         // 现状与账本哈希一致 → 没被手改过，尽管期望已经变了

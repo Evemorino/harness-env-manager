@@ -72,6 +72,7 @@ mod tests {
     // `read_state` 是 trait 方法：冒烟测试要在 `ClaudeCode` 上直接调它，
     // 就得把 trait 带进作用域（计划里的测试正文漏了这一行）。
     use crate::adapters::HarnessAdapter as _;
+    use crate::capability::McpTransport;
     use crate::testutil::{FakeCli, TempHome};
     use std::path::PathBuf;
 
@@ -225,7 +226,10 @@ mod tests {
             .find(|c| c.id.name == name)
             .expect("读路径必须看得见刚写进去的那条");
         match &got.spec {
-            crate::capability::Spec::Mcp { command, args, env } => {
+            crate::capability::Spec::Mcp {
+                transport: McpTransport::Stdio { command, args, env },
+                ..
+            } => {
                 assert_eq!(command, "npx");
                 assert_eq!(args[0], "-y");
                 assert_eq!(env["K"], "${K}", "引用原样保留");
@@ -239,7 +243,10 @@ mod tests {
         let caps = adapter.read_state().unwrap();
         let got = caps.iter().find(|c| c.id.name == name).unwrap();
         match &got.spec {
-            crate::capability::Spec::Mcp { command, .. } => assert_eq!(command, "uvx"),
+            crate::capability::Spec::Mcp {
+                transport: McpTransport::Stdio { command, .. },
+                ..
+            } => assert_eq!(command, "uvx"),
             other => panic!("{other:?}"),
         }
     }

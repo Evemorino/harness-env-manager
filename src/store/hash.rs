@@ -1,9 +1,9 @@
 //! 目录内容指纹。spec §9.3 把「需不需要交付」的判定单位定成**内容是否等价**、
 //! 不是形态是否相同——所以这里要回答的是「这两坨字节一不一样」。
 
+use crate::capability::McpTransport;
 use anyhow::Context as _;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// 目录（或单文件）的内容指纹，十六进制 SHA-256。
@@ -41,33 +41,59 @@ pub fn hash_str(s: &str) -> String {
     hex(hasher.finalize().as_slice())
 }
 
-/// MCP 的三段载荷的规范化哈希，用作账本的 `content_hash`。
+/// 一条 MCP 的传输载荷的规范化哈希，用作账本的 `content_hash`。
 ///
-/// **为什么收三个字段而不是一个 `&Spec`**：`Spec` 没有 `Serialize`；为哈希去 derive
-/// serde 会把序列化形状变成对外契约。而 `&Spec` 版本还得为另外五个变体写永远走不到的
-/// arm——错误最喜欢住在那儿。三个原生字段顺带让「拿一个 skill spec 来算 mcp 哈希」
+/// **为什么收 `&McpTransport` 而不是一个 `&Spec`**：`Spec` 没有 `Serialize`；为哈希去
+/// derive serde 会把序列化形状变成对外契约。而 `&Spec` 版本还得为另外五个变体写永远
+/// 走不到的 arm——错误最喜欢住在那儿。收传输类型顺带让「拿一个 skill spec 来算 mcp 哈希」
 /// 在类型上不可表达。
 ///
-/// **env 的值参与哈希**，与 `capability::mcp_summary`（只渲染键名，§3 决策 3）不同：
+/// **值的部分参与哈希**（stdio 的 `env`、http 的 `headers`），与 `McpTransport::summary`
+/// （只渲染键名，§3 决策 3）不同：
 /// 摘要是给人看的，哈希是给 `compare_versions` 的 Same/Different 判定配套的账面。
-pub fn hash_mcp_spec(command: &str, args: &[String], env: &BTreeMap<String, String>) -> String {
+pub fn hash_mcp_spec(transport: &McpTransport) -> String {
     let mut hasher = Sha256::new();
     hasher.update([0u8, 0]);
-    hasher.update(command.as_bytes());
-    hasher.update([0]);
-    hasher.update((args.len() as u64).to_le_bytes());
-    for a in args {
-        hasher.update((a.len() as u64).to_le_bytes());
-        hasher.update(a.as_bytes());
+    // 传输类型先入哈希：stdio 与 http 的载荷形状不同，不加这一字节就可能撞上同一个哈希
+    // （比如两边其余字段都为空时）。
+    match transport {
+        McpTransport::Stdio { command, args, env } => {
+            hasher.update(*b"s");
+            hasher.update(command.as_bytes());
+            hasher.update([0]);
+            hash_list(&mut hasher, args.iter());
+            hash_pairs(&mut hasher, env.iter());
+        }
+        McpTransport::Http { url, headers } => {
+            hasher.update(*b"h");
+            hasher.update(url.as_bytes());
+            hasher.update([0]);
+            hash_pairs(&mut hasher, headers.iter());
+        }
     }
-    hasher.update((env.len() as u64).to_le_bytes());
-    for (k, v) in env {
+    hex(hasher.finalize().as_slice())
+}
+
+/// 一串字符串：先长度再内容，避免 `["ab","c"]` 与 `["a","bc"]` 撞车。
+fn hash_list<'a>(hasher: &mut Sha256, items: impl Iterator<Item = &'a String>) {
+    let items: Vec<&String> = items.collect();
+    hasher.update((items.len() as u64).to_le_bytes());
+    for item in items {
+        hasher.update((item.len() as u64).to_le_bytes());
+        hasher.update(item.as_bytes());
+    }
+}
+
+/// 一串键值：键与值都算（与 `summary` 只渲染键名相反，理由见函数文档）。
+fn hash_pairs<'a>(hasher: &mut Sha256, pairs: impl Iterator<Item = (&'a String, &'a String)>) {
+    let pairs: Vec<(&String, &String)> = pairs.collect();
+    hasher.update((pairs.len() as u64).to_le_bytes());
+    for (k, v) in pairs {
         hasher.update((k.len() as u64).to_le_bytes());
         hasher.update(k.as_bytes());
         hasher.update((v.len() as u64).to_le_bytes());
         hasher.update(v.as_bytes());
     }
-    hex(hasher.finalize().as_slice())
 }
 
 fn hash_entry(root: &Path, path: &Path, hasher: &mut Sha256) -> anyhow::Result<()> {
@@ -128,42 +154,48 @@ mod tests {
     use super::*;
     use crate::testutil::TempHome;
 
-    /// 与 `mcp_summary` 的关键区别：**env 值参与哈希**。`compare_versions` 的 Mcp arm
-    /// 比的是 `dc == ac && da == aa && de == ae`——env 值不同就是 Different，
-    /// 所以哈希也必须把值算进去，否则账本会说「这是我交付的」而 diff 说不一致。
+    fn stdio(command: &str, args: &[&str], env: &[(&str, &str)]) -> McpTransport {
+        McpTransport::Stdio {
+            command: command.to_string(),
+            args: args.iter().map(|s| (*s).to_string()).collect(),
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        }
+    }
+
+    /// 与 `McpTransport::summary` 的关键区别：**值参与哈希**。`compare_versions` 的 Mcp arm
+    /// 比的是整个 transport 相等——env 值不同就是 Different，所以哈希也必须把值算进去，
+    /// 否则账本会说「这是我交付的」而 diff 说不一致。
     #[test]
     fn hash_mcp_spec_covers_all_three_fields() {
-        let none = BTreeMap::new();
-        let a = hash_mcp_spec("npx", &["-y".into(), "pkg".into()], &none);
+        let a = hash_mcp_spec(&stdio("npx", &["-y", "pkg"], &[]));
         assert_eq!(
             a,
-            hash_mcp_spec("npx", &["-y".into(), "pkg".into()], &none),
+            hash_mcp_spec(&stdio("npx", &["-y", "pkg"], &[])),
             "同输入同哈希"
         );
         assert_ne!(
             a,
-            hash_mcp_spec("npxx", &["-y".into(), "pkg".into()], &none),
+            hash_mcp_spec(&stdio("npxx", &["-y", "pkg"], &[])),
             "command 要算"
         );
-        assert_ne!(a, hash_mcp_spec("npx", &["-y".into()], &none), "args 要算");
+        assert_ne!(a, hash_mcp_spec(&stdio("npx", &["-y"], &[])), "args 要算");
         assert_ne!(
             a,
-            hash_mcp_spec("npx", &["y".into(), "pkg".into()], &none),
+            hash_mcp_spec(&stdio("npx", &["y", "pkg"], &[])),
             "args 逐项比"
         );
 
-        let mut e1 = BTreeMap::new();
-        e1.insert("K".to_string(), "${K}".to_string());
-        let mut e2 = BTreeMap::new();
-        e2.insert("K".to_string(), "${OTHER}".to_string());
         assert_ne!(
-            hash_mcp_spec("npx", &[], &e1),
-            hash_mcp_spec("npx", &[], &e2),
+            hash_mcp_spec(&stdio("npx", &[], &[("K", "${K}")])),
+            hash_mcp_spec(&stdio("npx", &[], &[("K", "${OTHER}")])),
             "env 的**值**要算——只算键名会让两种不同的配置哈希相同"
         );
         assert_ne!(
-            hash_mcp_spec("npx", &[], &none),
-            hash_mcp_spec("npx", &[], &e1)
+            hash_mcp_spec(&stdio("npx", &[], &[])),
+            hash_mcp_spec(&stdio("npx", &[], &[("K", "${K}")]))
         );
     }
 
@@ -171,10 +203,9 @@ mod tests {
     /// 这条测试对着 `feed` 的那条注释，注释里的承诺必须真的成立。
     #[test]
     fn hash_mcp_spec_is_not_confused_by_field_boundaries() {
-        let none = BTreeMap::new();
         assert_ne!(
-            hash_mcp_spec("ab", &["c".into()], &none),
-            hash_mcp_spec("a", &["bc".into()], &none)
+            hash_mcp_spec(&stdio("ab", &["c"], &[])),
+            hash_mcp_spec(&stdio("a", &["bc"], &[]))
         );
     }
 

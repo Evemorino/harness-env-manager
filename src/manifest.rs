@@ -68,11 +68,19 @@ pub struct SkillEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpEntry {
-    pub command: String,
+    /// stdio 型：起哪个命令。与 `url` **恰好二选一**（校验里判）。
+    #[serde(default)]
+    pub command: Option<String>,
     #[serde(default)]
     pub args: Vec<String>,
     #[serde(default, deserialize_with = "env_refs")]
     pub env: BTreeMap<String, String>,
+    /// http 型：连哪个远端。与 `command` **恰好二选一**。
+    #[serde(default)]
+    pub url: Option<String>,
+    /// http 型的请求头——凭据常放这里，所以值同样必须是 `${VAR}` 引用。
+    #[serde(default, deserialize_with = "env_refs")]
+    pub headers: BTreeMap<String, String>,
     #[serde(default)]
     pub targets: Targets,
 }
@@ -594,10 +602,36 @@ impl Manifest {
                     "{at}: name must be a single path component (no `/`, no `\\`, not `.`/`..`, not empty)"
                 ));
             }
-            // `command` 是 serde 必填字段，所以这里永远是 `Some`：缺失由反序列化挡，
-            // 空白由这条挡（与上面两条同一个规则、同一个消息形状）。
-            reject_blank(&at, "command", Some(&m.command), &mut e);
-            for (k, v) in &m.env {
+            // 两种传输**恰好一种**：stdio 要 `command`，http 要 `url`。两个都给、都不给，
+            // 或者把只属于那一种的字段写给另一种，都在这里拦下——下游的读写按这条契约
+            // 分支，漏判一次就是一个静默的错判。
+            match (&m.command, &m.url) {
+                (None, None) => {
+                    e.push(format!(
+                        "{at}: needs either `command` (stdio) or `url` (http)"
+                    ));
+                }
+                (Some(_), Some(_)) => {
+                    e.push(format!(
+                        "{at}: `command` and `url` are mutually exclusive (stdio vs http)"
+                    ));
+                }
+                _ => {}
+            }
+            reject_blank(&at, "command", m.command.as_deref(), &mut e);
+            reject_blank(&at, "url", m.url.as_deref(), &mut e);
+            if m.url.is_some() {
+                if !m.args.is_empty() {
+                    e.push(format!("{at}: `args` only applies to `command` (stdio)"));
+                }
+                if !m.env.is_empty() {
+                    e.push(format!("{at}: `env` only applies to `command` (stdio)"));
+                }
+            }
+            if m.command.is_some() && !m.headers.is_empty() {
+                e.push(format!("{at}: `headers` only applies to `url` (http)"));
+            }
+            for (k, v) in m.env.iter().chain(m.headers.iter()) {
                 if let Err(msg) = secrets::validate_env(k, v) {
                     e.push(format!("{at}: {msg}"));
                 }
@@ -763,7 +797,8 @@ plugins:
         );
 
         let c = &m.mcps["context7"];
-        assert_eq!(c.command, "npx");
+        assert_eq!(c.command.as_deref(), Some("npx"));
+        assert_eq!(c.url, None);
         assert_eq!(c.args, vec!["-y", "@upstash/context7-mcp"]);
         assert_eq!(c.env["CONTEXT7_API_KEY"], "${CONTEXT7_API_KEY}");
         assert_eq!(c.targets, Targets::All);
@@ -876,6 +911,56 @@ plugins:
     /// 标量」的手滑形态，所以断言的是**值不得出现**。`env` 一词必须由 expected 文本
     /// 带出来（路径已降级为 `mcps.a:`，没有它就没人知道是哪一写出错）——注意不能只
     /// 断言 `contains("env")`，外层的 `env.yaml` 会让它恒真。
+    /// 两种传输**恰好一种**：都不给、都给、把只属于一种的字段写给另一种，都拦下。
+    #[test]
+    fn mcp_needs_exactly_one_transport() {
+        let err = |yaml: &str| Manifest::parse(yaml).unwrap_err().to_string();
+
+        let neither = err("version: 1\nmcps:\n  a:\n    args: [\"-y\"]\n");
+        assert!(neither.contains("needs either `command`"), "{neither}");
+
+        let both = err("version: 1\nmcps:\n  a:\n    command: npx\n    url: \"https://x/mcp\"\n");
+        assert!(both.contains("mutually exclusive"), "{both}");
+
+        let args_on_http =
+            err("version: 1\nmcps:\n  a:\n    url: \"https://x/mcp\"\n    args: [\"-y\"]\n");
+        assert!(
+            args_on_http.contains("`args` only applies to `command`"),
+            "{args_on_http}"
+        );
+
+        let headers_on_stdio =
+            err("version: 1\nmcps:\n  a:\n    command: npx\n    headers:\n      K: ${K}\n");
+        assert!(
+            headers_on_stdio.contains("`headers` only applies to `url`"),
+            "{headers_on_stdio}"
+        );
+    }
+
+    /// http 型解得出来，且 `headers` 的值与 `env` 同一条规则：必须是 `${VAR}` 引用。
+    #[test]
+    fn an_http_mcp_parses_and_its_headers_are_refs_too() {
+        let m = Manifest::parse(
+            "version: 1\nmcps:\n  context7:\n    url: \"https://mcp.context7.com/mcp\"\n    \
+             headers:\n      Authorization: ${CONTEXT7_API_KEY}\n",
+        )
+        .expect("http mcp");
+        let c = &m.mcps["context7"];
+        assert_eq!(c.command, None);
+        assert_eq!(c.url.as_deref(), Some("https://mcp.context7.com/mcp"));
+        assert_eq!(c.headers["Authorization"], "${CONTEXT7_API_KEY}");
+
+        // 字面量密钥在 headers 里同样被拒。
+        let err = Manifest::parse(
+            "version: 1\nmcps:\n  a:\n    url: \"https://x/mcp\"\n    \
+             headers:\n      Authorization: sk-live-abc123\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("Authorization"), "{err}");
+        assert!(!err.contains("sk-live-abc123"), "must not echo: {err}");
+    }
+
     #[test]
     fn mistyped_env_node_does_not_echo_the_value() {
         for node in [

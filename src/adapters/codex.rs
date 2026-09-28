@@ -1,7 +1,9 @@
 use crate::adapters::claude_code::split_plugin_key;
 use crate::adapters::{CODEX, HarnessAdapter};
 use crate::apply::mcp::{McpMechanism, McpTarget};
-use crate::capability::{CapId, Capability, Kind, Origin, SkillSource, Spec, Support, Targets};
+use crate::capability::{
+    CapId, Capability, Kind, McpTransport, Origin, SkillSource, Spec, Support, Targets,
+};
 use crate::home::Home;
 use crate::skills_dir::try_read_skill_entries;
 use anyhow::anyhow;
@@ -65,45 +67,38 @@ impl Codex {
         for (name, cfg) in servers {
             let context = format!("mcp server `{name}`");
             let cfg = toml_expect_table(cfg, file, &context)?;
-            // `command` 缺键才是 `""`（`Spec::Mcp.command` 是 `String`，v1 里「没有
-            // command」和「command 是空串」同为没配）；`command = 5` 是故障。
-            let command = toml_optional_string(cfg, "command", file, &context)?
-                .unwrap_or_default()
-                .to_string();
-
-            let mut args = Vec::new();
-            if let Some(list) =
-                toml_optional_array(cfg.get("args"), file, &format!("{context} field `args`"))?
-            {
-                for (i, element) in list.iter().enumerate() {
-                    args.push(
-                        toml_expect_string(element, file, &format!("{context} field `args[{i}]`"))?
-                            .to_string(),
-                    );
-                }
-            }
-
-            let mut env = BTreeMap::new();
-            if let Some(fields) =
-                toml_optional_table(cfg.get("env"), file, &format!("{context} field `env`"))?
-            {
-                for (k, v) in fields {
+            // 两种传输**恰好一种**：有 `url` 就是 http（请求头在 `http_headers`），
+            // 否则按 stdio 读 `command` / `args` / `env`。
+            //
+            // `command` 缺键才是 `""`——「没有 command」和「command 是空串」同为没配；
+            // `command = 5` 是故障。
+            let transport = match toml_optional_string(cfg, "url", file, &context)? {
+                Some(url) => McpTransport::Http {
+                    url: url.to_string(),
+                    headers: toml_string_map(
+                        cfg.get("http_headers"),
+                        file,
+                        &context,
+                        "http_headers",
+                    )?,
+                },
+                None => McpTransport::Stdio {
+                    command: toml_optional_string(cfg, "command", file, &context)?
+                        .unwrap_or_default()
+                        .to_string(),
+                    args: toml_string_array(cfg.get("args"), file, &context, "args")?,
                     // 保持 `${VAR}` 引用形态，绝不展开。报错只到键名为止——actual 侧的
                     // 值可能就是明文密钥，而这条消息会进终端输出和 Task 14 的快照。
-                    env.insert(
-                        k.clone(),
-                        toml_expect_string(v, file, &format!("{context} field `env` key `{k}`"))?
-                            .to_string(),
-                    );
-                }
-            }
+                    env: toml_string_map(cfg.get("env"), file, &context, "env")?,
+                },
+            };
 
             out.push(Capability {
                 id: CapId::new(Kind::Mcp, name.clone()),
                 origin: Origin::Adopted {
                     harness: CODEX.into(),
                 },
-                spec: Spec::Mcp { command, args, env },
+                spec: Spec::Mcp { transport },
                 targets: Targets::All,
             });
         }
@@ -329,6 +324,49 @@ fn toml_optional_array<'a>(
         return Ok(None);
     };
     toml_expect_array(value, file, what).map(Some)
+}
+
+/// `args` 一类的字符串数组。缺键或 `null` 都是空表；形状不对照常报错。
+fn toml_string_array(
+    value: Option<&TomlValue>,
+    file: &Path,
+    context: &str,
+    field: &str,
+) -> anyhow::Result<Vec<String>> {
+    let mut out = Vec::new();
+    let Some(list) = toml_optional_array(value, file, &format!("{context} field `{field}`"))?
+    else {
+        return Ok(out);
+    };
+    for (i, element) in list.iter().enumerate() {
+        out.push(
+            toml_expect_string(element, file, &format!("{context} field `{field}[{i}]`"))?
+                .to_string(),
+        );
+    }
+    Ok(out)
+}
+
+/// `env` / `http_headers` 一类的字符串映射。报错只到键名为止——值可能是明文密钥。
+fn toml_string_map(
+    value: Option<&TomlValue>,
+    file: &Path,
+    context: &str,
+    field: &str,
+) -> anyhow::Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    let Some(fields) = toml_optional_table(value, file, &format!("{context} field `{field}`"))?
+    else {
+        return Ok(out);
+    };
+    for (k, v) in fields {
+        out.insert(
+            k.clone(),
+            toml_expect_string(v, file, &format!("{context} field `{field}` key `{k}`"))?
+                .to_string(),
+        );
+    }
+    Ok(out)
 }
 
 /// 可选字符串字段：键缺失 → `Ok(None)`；**有值但不是字符串** → 故障上抛，不塌成 `None`。
@@ -587,14 +625,16 @@ CONTEXT7_API_KEY = "${CONTEXT7_API_KEY}"
         assert_eq!(
             a.spec,
             Spec::Mcp {
-                command: "/abs/Electron".into(),
-                args: vec![
-                    "/abs/app".into(),
-                    "--mcp-stdio".into(),
-                    "--app".into(),
-                    "desktop".into()
-                ],
-                env: Default::default(),
+                transport: McpTransport::Stdio {
+                    command: "/abs/Electron".into(),
+                    args: vec![
+                        "/abs/app".into(),
+                        "--mcp-stdio".into(),
+                        "--app".into(),
+                        "desktop".into()
+                    ],
+                    env: Default::default(),
+                },
             }
         );
         assert_eq!(
@@ -611,7 +651,10 @@ CONTEXT7_API_KEY = "${CONTEXT7_API_KEY}"
 
         let c = find(&caps, Kind::Mcp, "context7").unwrap();
         match &c.spec {
-            Spec::Mcp { env, .. } => {
+            Spec::Mcp {
+                transport: McpTransport::Stdio { env, .. },
+                ..
+            } => {
                 // 原样保留引用形态，绝不展开成真实密钥
                 assert_eq!(env["CONTEXT7_API_KEY"], "${CONTEXT7_API_KEY}");
             }
@@ -648,9 +691,11 @@ env = {}
             assert_eq!(
                 m.spec,
                 Spec::Mcp {
-                    command: String::new(),
-                    args: Vec::new(),
-                    env: Default::default(),
+                    transport: McpTransport::Stdio {
+                        command: String::new(),
+                        args: Vec::new(),
+                        env: Default::default(),
+                    },
                 },
                 "`{name}`：缺键与「类型对且为空」同为正常空值"
             );
@@ -659,6 +704,28 @@ env = {}
 
     /// `[mcp_servers]` 写了头却没配任何 server：类型对且为空 = 合法空结果，不是故障。
     /// 与 `mcp_servers_key_that_is_not_a_table_...` 一起把「空」和「坏」分开钉。
+    /// 远端 MCP：codex 用 `url` + `http_headers`（与 claude 的 `type: http` 拼法不同）。
+    #[test]
+    fn reads_an_http_mcp_server() {
+        let t = TempHome::new();
+        write_config(
+            &t,
+            "[mcp_servers.ctx]\nurl = \"https://mcp.context7.com/mcp\"\n\
+             [mcp_servers.ctx.http_headers]\nAuthorization = \"${K}\"\n",
+        );
+        let caps = Codex::new(t.home.clone()).read_state().unwrap();
+        match &find(&caps, Kind::Mcp, "ctx").unwrap().spec {
+            Spec::Mcp {
+                transport: McpTransport::Http { url, headers },
+                ..
+            } => {
+                assert_eq!(url, "https://mcp.context7.com/mcp");
+                assert_eq!(headers["Authorization"], "${K}");
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn an_empty_mcp_servers_table_is_not_an_error() {
         let t = TempHome::new();
