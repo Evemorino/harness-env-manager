@@ -302,13 +302,22 @@ mcps:
     targets: all                # all 或显式列表 [claude-code, codex]
 
   # 远端 MCP：与上面**二选一**（校验里判「恰好一种」）。
-  # `headers` 的值也是引用——那是放凭据的地方。允许 `${TOKEN}` 与 `${TOKEN:-}`
-  # （空默认值，意思是「变量可以缺」），但 `${TOKEN:-sk-live}` 这种非空默认值不行：
-  # 那等于把密钥从后门带进清单。带前缀的 `Bearer ${TOKEN}` 同样表达不了。
+  # `headers` 的值也是引用——那是放凭据的地方。允许 `${TOKEN}`、`${TOKEN:-}`
+  # （空默认值，意思是「变量可以缺」）与 `Bearer ${TOKEN}`；`${TOKEN:-sk-live}` 这种
+  # 非空默认值不行：那等于把密钥从后门带进清单。
   remote-docs:
     url: https://mcp.example.com/mcp
     headers:
       Authorization: ${DOCS_TOKEN}
+    targets: all
+
+  # `Bearer ${TOKEN}` 是一等写法：它对应 codex 的 `bearer_token_env_var` 与 kimi 的
+  # `bearerTokenEnvVar`，所以**三家都交付得了**（上面那条裸值在 kimi 上没有写法，
+  # 会报 undeliverable——见 §9.6 的那张表）。
+  bearer-docs:
+    url: https://mcp.example.com/mcp
+    headers:
+      Authorization: Bearer ${DOCS_TOKEN}
     targets: all
 
 plugins:
@@ -788,17 +797,18 @@ codex」正是这么写的）。理由同 §9.3：那份内容是**清单要求�
 所以清单的载荷是两态的 `McpTransport`：`Stdio { command, args, env }` /
 `Http { url, headers }`，校验要求**恰好一种**——`command` 与 `url` 互斥且必有其一，
 `args`/`env` 只跟 `command` 走、`headers` 只跟 `url` 走。`headers` 的值与 `env` 同一条门禁：
-必须是引用，字面量拒绝（那正是放凭据的地方）。允许的形态是 `${VAR}` 与 `${VAR:-}`
-（**空**默认值，2026-09-28 放开：claude 自己那份 context7 plugin 就是这么写的）；
-`${VAR:-sk-live-abc}` 这种非空默认值照旧拒绝——它等于把密钥从后门带进清单。
+必须是引用，字面量拒绝（那正是放凭据的地方）。允许的形态是 `${VAR}`、`${VAR:-}`
+（**空**默认值，2026-09-28 放开：claude 自己那份 context7 plugin 就是这么写的），以及
+带 `Bearer ` 前缀的那两种——那个前缀对应 codex / kimi 原生的 bearer 字段，不是「任意字面量
++ 引用」的开口。`${VAR:-sk-live-abc}` 这种非空默认值照旧拒绝：它等于把密钥从后门带进清单。
 
 三家对这两种形态的**拼法各不相同**，读写两侧都按这张表：
 
 | harness | 条目骨架 | 凭据怎么写 |
 |---|---|---|
-| claude-code | stdio：`command` / `args`；http：`type: "http"` + `url` | `env` / `headers` 里**原样写** `${VAR}`——它会展开 |
-| codex | 同上，**不写 `type`** | stdio 走 `env_vars = ["VAR"]`（同名转发）；http 走 `[mcp_servers.<n>.env_http_headers]`，表里是「头名 → 变量名」 |
-| kimi-code | stdio：`command` / `args`；http：`url`（**不写 `type`**） | **写不出来**，见下 |
+| claude-code | stdio：`command` / `args`；http：`type: "http"` + `url` | `env` / `headers` 里**原样写**清单里的值——它会展开 |
+| codex | 同上，**不写 `type`** | stdio：`env_vars = ["VAR"]`（同名转发）；http：`Bearer ${VAR}` → `bearer_token_env_var`，其余引用 → `[mcp_servers.<n>.env_http_headers]`（头名 → 变量名） |
+| kimi-code | stdio：`command` / `args`；http：`url`（**不写 `type`**） | 只有 `Authorization: Bearer ${VAR}` → `bearerTokenEnvVar`；**其余一律写不出来**，见下 |
 
 骨架那几列的依据：claude 靠 `type` 区分传输（它自己那份 plugin 就是 `type: "http"`，
 stdio 条目则是 `type: "stdio"`，本机 `~/.claude.json` 的 `kimi-cu` 即如此）；codex 与 kimi
@@ -820,18 +830,31 @@ stdio 条目则是 `type: "stdio"`，本机 `~/.claude.json` 的 `kimi-cu` 即�
   `mergeStdioEnv` 直接 `Object.assign(merged, configEnv)`。它唯一的环境取值通道
   `bearerTokenEnvVar` **固定发 `Bearer <token>`**。
 
+**`Bearer ${VAR}` 是一等写法，不是「引用 + 任意字面量」的开口（2026-09-28）。** 它一一对应
+codex 的 `bearer_token_env_var` 与 kimi 的 `bearerTokenEnvVar`——两家都发
+`Authorization: Bearer <token>`，而后者是 **kimi 唯一**能从环境取凭据的通道。没有它，
+「带凭据的 MCP 交付到 kimi」是一个恒定的 `undeliverable`。所以门禁只给这**一个**前缀开口
+（`Bearer ${VAR}` / `Bearer ${VAR:-}`），别的词（`Basic `、小写 `bearer `）照旧拒。
+
 **表达不了的条目报 `undeliverable`，绝不退化成字面量。** 判据是纯函数
 `adapters::mcp_expressible`：`diff` 用它把**要写盘的动作**（`install` / `update`）改判成
 `undeliverable`，`in-sync` / `conflict` / `unknown` 照旧保留——那三个回答的是「本机现在是
-不是清单要的」，与能不能写无关。两条已知缺口都在 kimi 上，理由分别是：
+不是清单要的」，与能不能写无关。剩下的缺口是：
 
-- `Authorization: ${VAR}` 这种**裸值**在 kimi 上没有写法：它的 `headers` 是字面量，而
-  `bearerTokenEnvVar` 会加上 `Bearer ` 前缀。那个前缀是一层语义，henv 不替用户决定。
-- stdio 的 `env`（哪怕同名）同样写不了：kimi 的 `env` 是字面量，henv 不会把值写死进配置。
+- kimi 上只有 `Authorization: Bearer ${VAR}` 一种 header 写法：裸值 `${VAR}`、别的头名、
+  同时两个头都不行（`bearerTokenEnvVar` 只填 `Authorization`，而 kimi 的 `headers` 是字面量）。
+- kimi 的 stdio `env`（哪怕同名）写不了：它的 `env` 是字面量，henv 不会把值写死进配置。
+- codex 的**换名映射**（`K: ${OTHER}`）写不了：`env_vars` 只按原名转发。
+- `${VAR:-}`（含 `Bearer ${VAR:-}`）在 codex / kimi 上都写不了：它们的取值字段收的是变量名，
+  「变量缺失时取空值」那层语义没有落点——**不能把默认值扔掉**，那等于悄悄把变量变成必需的。
 
-codex 那边唯一的缺口是**换名映射**（`K: ${OTHER}`）：它的 `env_vars` 只按原名转发。
-这三条都由 `mcp_expressible` 一句话说清，写器里再各留一道闸——计划错了也不会有半个字面量
+这几条都由 `mcp_expressible` 一句话说清，写器里再各留一道闸——计划错了也不会有半个字面量
 落到配置里。
+
+**`scan` 按条跳过表达不了的值，不再整场失败（2026-09-28）。** harness 配置里的值可以是
+字面量（手工写的 `Authorization = "Bearer sk-…"`），而清单只收引用。修之前那种条目会写出一份
+解不开的清单，落盘自检直接失败——**一条手工条目拖垮整次收养**。现在 `adoptable` 逐条判值：
+收不了就进报告的那一行说清是哪一格（**只点键名，绝不回显值**），其余照常收养。
 
 **传输类型进哈希。** `store::hash::hash_mcp_spec(&McpTransport)` 把形态作为首字节掺进去
 （`b"s"` / `b"h"`），于是「同一个名字从 stdio 换成 http」在账本上就是一次改动，`diff` 报

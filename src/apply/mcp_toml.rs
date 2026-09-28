@@ -147,15 +147,34 @@ impl<'a> Slots<'a> {
                             server.insert("env_vars", toml_edit::value(vars));
                         }
                     }
-                    // 远端 MCP：凭据走 `env_http_headers`（头名 → 变量名）。
+                    // 远端 MCP 的凭据有两条通道：
+                    // - `Authorization: Bearer ${VAR}` → `bearer_token_env_var`（codex 那条
+                    //   bearer 通道，只作用于 Authorization）；
+                    // - 其余引用 → `env_http_headers`（头名 → 变量名）。
+                    // 标量先插、子表后插：toml_edit 按插入顺序输出，而 TOML 里标量不能
+                    // 出现在子表头之后。
                     McpTransport::Http { url, headers } => {
-                        server.insert("url", toml_edit::value(url));
-                        if !headers.is_empty() {
-                            let mut h = Table::new();
-                            for (header, value) in headers {
-                                h.insert(header, toml_edit::value(ref_var(value)?));
+                        let mut bearer: Option<&str> = None;
+                        let mut env_headers = Table::new();
+                        for (header, value) in headers {
+                            if let Some(var) = crate::secrets::parse_bearer_var(value) {
+                                if !header.eq_ignore_ascii_case("authorization") {
+                                    anyhow::bail!(
+                                        "codex's bearer channel only fills `Authorization` \
+                                         (`{header}` has no bearer form)"
+                                    );
+                                }
+                                bearer = Some(var);
+                                continue;
                             }
-                            server.insert("env_http_headers", Item::Table(h));
+                            env_headers.insert(header, toml_edit::value(ref_var(value)?));
+                        }
+                        server.insert("url", toml_edit::value(url));
+                        if let Some(var) = bearer {
+                            server.insert("bearer_token_env_var", toml_edit::value(var));
+                        }
+                        if !env_headers.is_empty() {
+                            server.insert("env_http_headers", Item::Table(env_headers));
                         }
                     }
                 }
@@ -183,13 +202,27 @@ impl<'a> Slots<'a> {
                         }
                     }
                     McpTransport::Http { url, headers } => {
-                        server.insert("url", url.into());
-                        if !headers.is_empty() {
-                            let mut h = InlineTable::new();
-                            for (header, value) in headers {
-                                h.insert(header, ref_var(value)?.into());
+                        let mut bearer: Option<&str> = None;
+                        let mut env_headers = InlineTable::new();
+                        for (header, value) in headers {
+                            if let Some(var) = crate::secrets::parse_bearer_var(value) {
+                                if !header.eq_ignore_ascii_case("authorization") {
+                                    anyhow::bail!(
+                                        "codex's bearer channel only fills `Authorization` \
+                                         (`{header}` has no bearer form)"
+                                    );
+                                }
+                                bearer = Some(var);
+                                continue;
                             }
-                            server.insert("env_http_headers", Value::InlineTable(h));
+                            env_headers.insert(header, ref_var(value)?.into());
+                        }
+                        server.insert("url", url.into());
+                        if let Some(var) = bearer {
+                            server.insert("bearer_token_env_var", var.into());
+                        }
+                        if !env_headers.is_empty() {
+                            server.insert("env_http_headers", Value::InlineTable(env_headers));
                         }
                     }
                 }
@@ -580,5 +613,61 @@ mod tests {
         assert!(remove_codex_mcp(&p, "context7").is_err());
 
         assert_eq!(std::fs::read(&p).unwrap(), before);
+    }
+
+    /// `Authorization: Bearer ${VAR}` 走 codex 那条 bearer 通道（codex 自己发
+    /// `Authorization: Bearer <token>`，与清单说的是同一件事）。同一份配置里别的头仍然
+    /// 走 `env_http_headers`——两条通道可以并存。
+    #[test]
+    fn the_bearer_form_becomes_bearer_token_env_var() {
+        let t = TempHome::new();
+        let p = t.path(".codex/config.toml");
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".to_string(), "Bearer ${K}".to_string());
+        headers.insert("X-Extra".to_string(), "${W}".to_string());
+        upsert_codex_mcp(
+            &p,
+            "ctx",
+            &McpTransport::Http {
+                url: "https://mcp.context7.com/mcp".to_string(),
+                headers,
+            },
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&p).unwrap();
+        let doc: toml::Value = toml::from_str(&text).unwrap();
+        let s = &doc["mcp_servers"]["ctx"];
+        assert_eq!(s["bearer_token_env_var"].as_str(), Some("K"), "{text}");
+        assert_eq!(
+            s["env_http_headers"]["X-Extra"].as_str(),
+            Some("W"),
+            "{text}"
+        );
+        assert!(!text.contains("${K}"), "字面引用文本不许落进配置：\n{text}");
+    }
+
+    /// bearer 前缀只对应 `Authorization`；换个头名 codex 送不出去，宁可失败。
+    #[test]
+    fn a_bearer_value_on_another_header_is_refused() {
+        let t = TempHome::new();
+        let p = t.path(".codex/config.toml");
+        t.write(".codex/config.toml", "model = \"gpt-5\"\n");
+        let before = std::fs::read(&p).unwrap();
+        let mut headers = BTreeMap::new();
+        headers.insert("X-Auth".to_string(), "Bearer ${K}".to_string());
+
+        let err = upsert_codex_mcp(
+            &p,
+            "ctx",
+            &McpTransport::Http {
+                url: "https://mcp.context7.com/mcp".to_string(),
+                headers,
+            },
+        )
+        .unwrap_err();
+
+        assert!(format!("{err:#}").contains("Authorization"), "{err:#}");
+        assert_eq!(std::fs::read(&p).unwrap(), before, "报错就不能动文件");
     }
 }

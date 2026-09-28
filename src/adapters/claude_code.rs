@@ -319,10 +319,24 @@ pub(crate) fn mcp_capability(
     // 两边都没有时留 `command: ""`——那是"配了个空条目"的事实，由 doctor 报，
     // 不在这里编一个形态出来。
     let transport = match optional_string(cfg, "url", file, &context)? {
-        Some(url) => McpTransport::Http {
-            url: url.to_string(),
-            headers: read_string_map(cfg.get("headers"), file, &context, "headers")?,
-        },
+        Some(url) => {
+            let mut headers = read_string_map(cfg.get("headers"), file, &context, "headers")?;
+            // kimi 的 `bearerTokenEnvVar` 是「从环境取一个 token，发成
+            // `Authorization: Bearer <token>`」——**它的唯一凭据通道**。读回成清单里
+            // 那个一等写法，否则「henv 自己按 bearer 交付的条目」下一轮 diff 会被报成
+            // update（写下去的是 `bearerTokenEnvVar`，读回来却什么都没有）。
+            //
+            // claude 没有这个字段（它的 headers 直接吃 `${VAR}`），所以只在 kimi 上认。
+            if harness == crate::adapters::KIMI_CODE {
+                if let Some(var) = optional_string(cfg, "bearerTokenEnvVar", file, &context)? {
+                    headers.insert("Authorization".to_string(), format!("Bearer ${{{var}}}"));
+                }
+            }
+            McpTransport::Http {
+                url: url.to_string(),
+                headers,
+            }
+        }
         None => McpTransport::Stdio {
             command: optional_string(cfg, "command", file, &context)?
                 .map(String::from)
@@ -1783,6 +1797,34 @@ mod tests {
     }
 
     // ============ 共享 helper 的跨 Task 字段（Task 10/11/13/14 的输入） ============
+
+    /// `bearerTokenEnvVar` 是 **kimi 的**字段，claude 的 `mcpServers` 里没有它
+    /// （claude 的头直接吃 `${VAR}`）。共享 helper 按家分岔，所以这条要钉住：
+    /// 在 claude 上读它等于凭空造出一条清单里的 bearer 写法，而 claude 发出去的
+    /// 根本不是那个东西。
+    #[test]
+    fn the_bearer_token_field_is_kimi_only() {
+        let cfg = json!({
+            "url": "https://mcp.context7.com/mcp",
+            "bearerTokenEnvVar": "CONTEXT7_API_KEY"
+        });
+        let claude = mcp_capability("ctx", &cfg, CLAUDE_CODE, Path::new(".claude.json")).unwrap();
+        match &claude.spec {
+            Spec::Mcp {
+                transport: McpTransport::Http { headers, .. },
+                ..
+            } => assert!(headers.is_empty(), "claude 不认这个字段：{headers:?}"),
+            other => panic!("{other:?}"),
+        }
+        let kimi = mcp_capability("ctx", &cfg, KIMI_CODE, Path::new("mcp.json")).unwrap();
+        match &kimi.spec {
+            Spec::Mcp {
+                transport: McpTransport::Http { headers, .. },
+                ..
+            } => assert_eq!(headers["Authorization"], "Bearer ${CONTEXT7_API_KEY}"),
+            other => panic!("{other:?}"),
+        }
+    }
 
     /// Task 11 用 `KIMI_CODE` 走同一个 helper。评审实测：把 helper 里的
     /// `harness: harness.into()` 换成硬编码 `"claude-code"` 时，144 条全绿——

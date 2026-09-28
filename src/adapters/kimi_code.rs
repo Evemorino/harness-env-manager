@@ -1229,6 +1229,30 @@ mod tests {
 
     // ============ supports()：kimi 的接纳度矩阵（spec §2.1） ============
 
+    /// `bearerTokenEnvVar` 是 kimi **唯一**的环境取值通道（它固定发
+    /// `Authorization: Bearer <token>`）：读回来必须是清单里那个一等写法，否则
+    /// 「henv 自己按 bearer 交付的条目」下一轮 diff 会被报成 update。
+    #[test]
+    fn reads_bearer_token_env_var_as_a_bearer_reference() {
+        let t = TempHome::new();
+        t.write(
+            ".kimi-code/mcp.json",
+            r#"{ "mcpServers": { "ctx": {
+                "url": "https://mcp.context7.com/mcp",
+                "bearerTokenEnvVar": "CONTEXT7_API_KEY"
+            } } }"#,
+        );
+        let caps = KimiCode::new(t.home.clone()).read_state().unwrap();
+        let got = find(&caps, Kind::Mcp, "ctx").expect("读得到");
+        match &got.spec {
+            Spec::Mcp {
+                transport: McpTransport::Http { headers, .. },
+                ..
+            } => assert_eq!(headers["Authorization"], "Bearer ${CONTEXT7_API_KEY}"),
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// kimi 原生接纳 MCP 与 Plugin 两种 kind；Skill/Hook/Command/Agent 无用户级目录或
     /// 配置，散装（非 Plugin origin）一律 Unsupported。`Spec::Mcp` 只是占位载荷。
     #[test]

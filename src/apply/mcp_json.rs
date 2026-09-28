@@ -63,11 +63,23 @@ pub fn upsert_kimi_mcp(target: &Path, name: &str, transport: &McpTransport) -> a
         }
         // kimi 的远端 MCP 没有 `type` 字段（实测它的配置里只有 url/headers——
         // 与 claude 那份不同，那边靠 `type` 区分传输）。
+        //
+        // 凭据只有一条通道：`bearerTokenEnvVar`（kimi 固定发 `Bearer <token>`），
+        // 所以只有 `Authorization: Bearer ${VAR}` 这一种写法能忠实落地；其余写法计划侧
+        // 已经判成 undeliverable，走到这里还带着就是计划错了——宁可失败。
         McpTransport::Http { url, headers } => {
-            if !headers.is_empty() {
-                anyhow::bail!(
-                    "kimi-code cannot express MCP header values; refusing to write them literally"
-                );
+            for (header, value) in headers {
+                let Some(var) = crate::secrets::parse_bearer_var(value) else {
+                    anyhow::bail!(
+                        "kimi-code cannot express this MCP header; refusing to write it literally"
+                    );
+                };
+                if !header.eq_ignore_ascii_case("authorization") {
+                    anyhow::bail!(
+                        "kimi-code's bearer channel only fills `Authorization`; refusing to drop `{header}`"
+                    );
+                }
+                server.insert("bearerTokenEnvVar".into(), var.into());
             }
             server.insert("url".into(), url.as_str().into());
         }
@@ -201,6 +213,36 @@ mod tests {
         assert!(format!("{err:#}").contains("cannot express"), "{err:#}");
 
         assert_eq!(std::fs::read(&p).unwrap(), before, "拒绝就不能动文件");
+    }
+
+    /// **唯一的例外是 bearer 形态**：kimi 自己也只有那一条环境通道（`bearerTokenEnvVar`，
+    /// 固定发 `Authorization: Bearer <token>`），所以 `Authorization: Bearer ${VAR}`
+    /// 能忠实落地——kimi 上因此不再是「只要带凭据就交付不了」。
+    #[test]
+    fn the_bearer_form_becomes_bearer_token_env_var() {
+        let t = TempHome::new();
+        let p = t.path(".kimi-code/mcp.json");
+        let mut headers = BTreeMap::new();
+        headers.insert("Authorization".to_string(), "Bearer ${K}".to_string());
+        upsert_kimi_mcp(
+            &p,
+            "ctx",
+            &McpTransport::Http {
+                url: "https://mcp.context7.com/mcp".to_string(),
+                headers,
+            },
+        )
+        .unwrap();
+
+        let text = std::fs::read_to_string(&p).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let s = &v["mcpServers"]["ctx"];
+        assert_eq!(s["url"], "https://mcp.context7.com/mcp");
+        assert_eq!(s["bearerTokenEnvVar"], "K", "{text}");
+        assert!(
+            s.get("headers").is_none(),
+            "凭据不许以字面量形式落盘：{text}"
+        );
     }
 
     #[test]

@@ -43,17 +43,40 @@ pub fn parse_manifest_ref(value: &str) -> Option<&str> {
     is_ident(inner).then_some(inner)
 }
 
+/// `"Bearer ${FOO}"` / `"Bearer ${FOO:-}"` → `Some("FOO")`；其余 → `None`。
+///
+/// 这个前缀是**一等写法**，不是「任意字面量 + 引用」的开口：它一一对应 codex 的
+/// `bearer_token_env_var` 与 kimi 的 `bearerTokenEnvVar`（两家都发
+/// `Authorization: Bearer <token>`）。没有它，那两家原生的 bearer 通道就没有入口——
+/// 而那是 kimi 唯一能从环境取凭据的方式（§9.6）。
+pub fn parse_bearer_ref(value: &str) -> Option<&str> {
+    parse_manifest_ref(value.strip_prefix("Bearer ")?)
+}
+
+/// 严格版：只吃 `Bearer ${FOO}`（不带默认值）。codex / kimi 的 bearer 字段收的是**变量名**，
+/// 「变量缺失时取空值」那层语义在它们那儿没有落点，所以翻译层用这一版。
+pub fn parse_bearer_var(value: &str) -> Option<&str> {
+    parse_ref(value.strip_prefix("Bearer ")?)
+}
+
+/// **门禁的完整判据**：`${VAR}`、`${VAR:-}`，以及带 `Bearer ` 前缀的那两种。
+/// 清单校验（[`validate_env`]）与 CLI 的 `--env` / `--header` 共用它——两层曾经各判一套，
+/// 症状是命令行放行、落盘才报（§9.6）。
+pub fn is_manifest_value(value: &str) -> bool {
+    parse_manifest_ref(value).is_some() || parse_bearer_ref(value).is_some()
+}
+
 /// 校验单个 env / header 值。错误信息包含 key 名但**绝不回显 value**（防止密钥进日志/终端）。
 /// 措辞里不出现任何可能被当作 fixture 值的词（`literal` / `secret` 等），下游测试
 /// 会用「值不得出现在消息里」做断言。
 pub fn validate_env(key: &str, value: &str) -> Result<(), String> {
-    match parse_manifest_ref(value) {
-        Some(_) => Ok(()),
-        None => Err(format!(
-            "env `{key}` must be a ${{VAR}} reference; `${{VAR:-}}` with an empty default is \
-             allowed too (value not shown)"
-        )),
+    if is_manifest_value(value) {
+        return Ok(());
     }
+    Err(format!(
+        "env `{key}` must be a ${{VAR}} reference, optionally prefixed with `Bearer `; \
+         `${{VAR:-}}` with an empty default is allowed too (value not shown)"
+    ))
 }
 
 /// 返回在环境中缺失（或为空）的变量名，保持输入顺序。
@@ -119,8 +142,8 @@ mod tests {
     /// 其中 `"reference"` 让「把值拼进消息」的写法几乎不可能凑巧等于 WANT。
     #[test]
     fn validate_env_message_is_pinned_and_never_carries_the_value() {
-        const WANT: &str = "env `K` must be a ${VAR} reference; `${VAR:-}` with an empty default \
-                            is allowed too (value not shown)";
+        const WANT: &str = "env `K` must be a ${VAR} reference, optionally prefixed with `Bearer \
+                            `; `${VAR:-}` with an empty default is allowed too (value not shown)";
         for v in ["sk-live-123", "s", "", "K", "reference", "  spaced  "] {
             assert_eq!(
                 validate_env("K", v).unwrap_err(),
@@ -144,6 +167,29 @@ mod tests {
         // 严格版（翻译层用的那个）不吃 `:-`：codex 的取值字段收的是变量名。
         assert_eq!(parse_ref("${K:-}"), None);
         assert_eq!(parse_ref("${K}"), Some("K"));
+    }
+
+    /// `Bearer ${VAR}` 是**一等写法**：它一一对应 codex 的 `bearer_token_env_var` 与
+    /// kimi 的 `bearerTokenEnvVar`（两家都发 `Authorization: Bearer <token>`），
+    /// 而后者是 kimi 唯一能从环境取凭据的通道。
+    #[test]
+    fn a_bearer_prefix_is_a_first_class_shape_not_an_arbitrary_literal() {
+        // 门禁收两种默认值形态的 bearer。
+        assert_eq!(parse_bearer_ref("Bearer ${K}"), Some("K"));
+        assert_eq!(parse_bearer_ref("Bearer ${K:-}"), Some("K"));
+        assert!(validate_env("Authorization", "Bearer ${K}").is_ok());
+        assert!(validate_env("Authorization", "Bearer ${K:-}").is_ok());
+        // 翻译层的严格版不吃默认值：bearer 字段收的是变量名。
+        assert_eq!(parse_bearer_var("Bearer ${K}"), Some("K"));
+        assert_eq!(parse_bearer_var("Bearer ${K:-}"), None);
+
+        // 只认这一个前缀，别的词一律不认——否则「引用 + 任意字面量」就从这道闸漏进来了。
+        assert_eq!(parse_bearer_ref("Basic ${K}"), None);
+        assert_eq!(parse_bearer_ref("bearer ${K}"), None);
+        assert_eq!(parse_bearer_ref("Bearer sk-live-abc"), None);
+        assert_eq!(parse_bearer_ref("Bearer ${K:-sk-live-abc}"), None);
+        assert!(validate_env("Authorization", "Basic ${K}").is_err());
+        assert!(validate_env("Authorization", "Bearer sk-live-abc").is_err());
     }
 
     #[test]

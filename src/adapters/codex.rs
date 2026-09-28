@@ -87,6 +87,15 @@ impl Codex {
                     )? {
                         headers.insert(header, format!("${{{var}}}"));
                     }
+                    // `bearer_token_env_var` 是 codex 那条 bearer 通道——它固定送
+                    // `Authorization: Bearer <token>`，所以读回成清单里的一等写法。
+                    // 写路径就是从它来的（见 `mcp_toml`），读回来不是同一个形状就会
+                    // 每轮都报 update。
+                    if let Some(var) =
+                        toml_optional_string(cfg, "bearer_token_env_var", file, &context)?
+                    {
+                        headers.insert("Authorization".to_string(), format!("Bearer ${{{var}}}"));
+                    }
                     McpTransport::Http {
                         url: url.to_string(),
                         headers,
@@ -782,6 +791,27 @@ env = {}
                 assert_eq!(env["K"], "${K}");
                 assert_eq!(env["W"], "${W}");
             }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// `bearer_token_env_var` 是 codex 那条 bearer 通道：读回来必须是清单里的
+    /// `Authorization: Bearer ${VAR}`，否则「henv 自己按这个写法交付的条目」下一轮
+    /// diff 会报 update（写下去的是 bearer 字段，读回来却什么都没有）。
+    #[test]
+    fn reads_bearer_token_env_var_as_a_bearer_reference() {
+        let t = TempHome::new();
+        write_config(
+            &t,
+            "[mcp_servers.ctx]\nurl = \"https://mcp.context7.com/mcp\"\n\
+             bearer_token_env_var = \"CONTEXT7_API_KEY\"\n",
+        );
+        let caps = Codex::new(t.home.clone()).read_state().unwrap();
+        match &find(&caps, Kind::Mcp, "ctx").unwrap().spec {
+            Spec::Mcp {
+                transport: McpTransport::Http { headers, .. },
+                ..
+            } => assert_eq!(headers["Authorization"], "Bearer ${CONTEXT7_API_KEY}"),
             other => panic!("{other:?}"),
         }
     }

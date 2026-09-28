@@ -151,12 +151,12 @@ fn pairs(map: &std::collections::BTreeMap<String, String>) -> String {
 }
 
 /// 一个 env / header 值渲染成什么：**认得出的引用照原样**（那只是个变量名，`${K:-}` 的
-/// `:-` 也是要看见的信息），其余一律 `***`。
+/// `:-` 与 `Bearer ` 前缀也是要看见的信息），其余一律 `***`。
 ///
-/// 判据借清单门禁那条（[`crate::secrets::parse_manifest_ref`]）而不是「看起来像不像」的
+/// 判据借清单门禁那条（[`crate::secrets::is_manifest_value`]）而不是「看起来像不像」的
 /// 启发式：门禁收什么，这里就显示什么，两份规则不会漂。
 fn shown_value(value: &str) -> &str {
-    if crate::secrets::parse_manifest_ref(value).is_some() {
+    if crate::secrets::is_manifest_value(value) {
         value
     } else {
         "***"

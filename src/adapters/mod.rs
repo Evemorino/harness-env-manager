@@ -58,6 +58,14 @@ pub(crate) fn mcp_expressible(harness: &str, transport: &McpTransport) -> Result
                 if crate::secrets::parse_ref(value) == Some(key.as_str()) {
                     continue;
                 }
+                // `Bearer ${VAR}` 是 header 的写法：codex 的 bearer 字段专指
+                // `Authorization`，`env` 里没有它的位置。
+                if crate::secrets::parse_bearer_ref(value).is_some() {
+                    return Err(format!(
+                        "`Bearer ${{VAR}}` 是 header 的写法（codex 的 `bearer_token_env_var` \
+                         专指 `Authorization`）；`{key}` 这个 env 表达不了"
+                    ));
+                }
                 // `${K:-}` 也是同名，但带着「变量缺失时取空值」那一层语义，而 `env_vars`
                 // 只收变量名——那层语义没有落点。**不能把默认值扔掉当成同名转发**：
                 // 变量缺失时 codex 会报缺输入（可见），而清单说的是「缺了也行」。
@@ -77,12 +85,26 @@ pub(crate) fn mcp_expressible(harness: &str, transport: &McpTransport) -> Result
         }
         (CODEX, McpTransport::Http { headers, .. }) => {
             for (name, value) in headers {
-                if crate::secrets::parse_ref(value).is_none() {
+                // 裸引用 → `env_http_headers`（头名 → 变量名）。
+                if crate::secrets::parse_ref(value).is_some() {
+                    continue;
+                }
+                // `Bearer ${VAR}` → `bearer_token_env_var`，但那个字段**只**管
+                // `Authorization`：别的头名它送不出去。
+                if crate::secrets::parse_bearer_var(value).is_some() {
+                    if name.eq_ignore_ascii_case("authorization") {
+                        continue;
+                    }
                     return Err(format!(
-                        "codex 的 `env_http_headers` 里放的是**变量名**，只认裸 `${{VAR}}`；\
-                         `{name}` 上这种写法（比如 `${{VAR:-}}` 的默认值）表达不了"
+                        "codex 的 `bearer_token_env_var` 只作用于 `Authorization`；`{name}` \
+                         这个头写不出 `Bearer ${{VAR}}` 的语义"
                     ));
                 }
+                return Err(format!(
+                    "codex 的取值字段收的是**变量名**（`env_http_headers` 或 \
+                     `bearer_token_env_var`），`{name}` 上这种写法（比如 `${{VAR:-}}` 的\
+                     默认值）表达不了"
+                ));
             }
             Ok(())
         }
@@ -99,9 +121,23 @@ pub(crate) fn mcp_expressible(harness: &str, transport: &McpTransport) -> Result
             if headers.is_empty() {
                 return Ok(());
             }
+            // kimi 只有一条环境取值通道，而它固定发 `Bearer <token>`——所以
+            // `Authorization: Bearer ${VAR}` 正是它能表达的那一种（且只有这一种）。
+            // `headers.len() == 1` 与 `next()` 是同一个条件的两半：只有恰好一个头时
+            // 它才可能是那条唯一的 bearer 通道。
+            if headers.len() == 1 {
+                if let Some((name, value)) = headers.iter().next() {
+                    if name.eq_ignore_ascii_case("authorization")
+                        && crate::secrets::parse_bearer_var(value).is_some()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
             Err(
                 "kimi-code 的 MCP `headers` 是字面量，它唯一的环境取值通道 `bearerTokenEnvVar` \
-                 固定发 `Bearer <token>`；`Authorization: ${VAR}` 这种裸值表达不了"
+                 固定发 `Bearer <token>`——所以只有 `Authorization: Bearer ${VAR}` 这一种\
+                 header 写法表达得了（裸值、别的头名、多个头都不行）"
                     .to_string(),
             )
         }
@@ -324,11 +360,31 @@ mod tests {
         let defaulted = mcp_expressible(CODEX, &http(&[("Authorization", "${K:-}")])).unwrap_err();
         assert!(defaulted.contains("env_http_headers"), "{defaulted}");
 
-        // kimi：凭据一个都写不出来，但「没有凭据」的条目照常交付。
+        // `Bearer ${VAR}` 走两家的 bearer 字段：codex 的只作用于 `Authorization`，
+        // 换个头名它送不出去；kimi 也只有这一条通道。
+        assert!(mcp_expressible(CODEX, &http(&[("Authorization", "Bearer ${K}")])).is_ok());
+        assert!(
+            mcp_expressible(CODEX, &http(&[("X-Auth", "Bearer ${K}")])).is_err(),
+            "codex 的 bearer 通道只认 Authorization"
+        );
+        assert!(mcp_expressible(KIMI_CODE, &http(&[("Authorization", "Bearer ${K}")])).is_ok());
+        // 带默认值的 bearer 两家都表达不了（它们的字段收的是变量名）。
+        assert!(mcp_expressible(CODEX, &http(&[("Authorization", "Bearer ${K:-}")])).is_err());
+        assert!(mcp_expressible(KIMI_CODE, &http(&[("Authorization", "Bearer ${K:-}")])).is_err());
+
+        // kimi：`Bearer` 之外的凭据写法一个都写不出来，「没有凭据」的条目照常交付。
         assert!(mcp_expressible(KIMI_CODE, &http(&[])).is_ok());
         assert!(mcp_expressible(KIMI_CODE, &stdio(&[])).is_ok());
         assert!(mcp_expressible(KIMI_CODE, &stdio(&[("K", "${K}")])).is_err());
         assert!(mcp_expressible(KIMI_CODE, &http(&[("Authorization", "${K}")])).is_err());
+        assert!(
+            mcp_expressible(
+                KIMI_CODE,
+                &http(&[("Authorization", "Bearer ${K}"), ("X-Extra", "${K}")])
+            )
+            .is_err(),
+            "kimi 只有一条 header 通道，多个头表达不了"
+        );
 
         // 第五家的名字不该在这里被当成「写得出来」。
         assert!(mcp_expressible("cursor", &http(&[])).is_err());

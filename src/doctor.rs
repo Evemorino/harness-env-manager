@@ -207,7 +207,9 @@ pub fn env_checks(manifest: &Manifest, lookup: &dyn Fn(&str) -> Option<String>) 
             .env
             .values()
             .chain(mcp.headers.values())
-            .filter_map(|v| secrets::parse_ref(v))
+            // `Bearer ${VAR}` 也是「现在就挡路」的引用，只是多了个前缀——
+            // 严格版的两个解析器各自管一种形态，取先命中的那个。
+            .filter_map(|v| secrets::parse_ref(v).or_else(|| secrets::parse_bearer_var(v)))
         {
             // `missing` 是「有没有值」这条判据的唯一定义，这里只借用它，不另写一份；
             // 单元素入参让「这条引用归哪个 key」不会错位。

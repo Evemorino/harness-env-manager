@@ -117,6 +117,9 @@ enum Command {
         env: Vec<(String, String)>,
         /// 远端 MCP 的请求头，写成 KEY='${VAR}'，可重复
         ///
+        /// 值也可以是 `Bearer ${VAR}`——它对应 codex 的 `bearer_token_env_var` 与 kimi 的
+        /// `bearerTokenEnvVar`（连 kimi 都收得下）。
+        ///
         /// **值要用单引号包住**，否则 shell 会先把 `${VAR}` 展开成空串。
         #[arg(
             long = "header",
@@ -280,9 +283,12 @@ fn parse_env(s: &str) -> Result<(String, String), String> {
     // 于是 `${K:-x}` 在命令行放行、落盘时才被清单层拦下，用户看到的是一句
     // 「refusing to write a manifest that does not parse back」——把「哪一层在判什么」
     // 暴露给了用户，而那本来只是我们内部的次序。
-    if henv::secrets::parse_manifest_ref(value).is_none() {
+    if !henv::secrets::is_manifest_value(value) {
         // 不回显值：与清单层同一条纪律（那可能是密钥，而终端会进日志与回滚缓冲）。
-        return Err("值必须是 ${VAR} 引用（或 ${VAR:-} 空默认值）——密钥不写进清单".to_string());
+        return Err(
+            "值必须是 ${VAR} 引用（可带 `Bearer ` 前缀；`${VAR:-}` 空默认值也可以）——密钥不写进清单"
+                .to_string(),
+        );
     }
     Ok((key.to_string(), value.to_string()))
 }
@@ -713,7 +719,7 @@ mod tests {
     /// parse back」——用户看到的是我们内部的次序，而不是「这个值不行」。
     #[test]
     fn the_env_gate_is_the_same_rule_the_manifest_uses() {
-        for good in ["K=${K}", "K=${K:-}"] {
+        for good in ["K=${K}", "K=${K:-}", "K=Bearer ${K}", "K=Bearer ${K:-}"] {
             assert!(parse_env(good).is_ok(), "CLI 该收：{good}");
             let (k, v) = parse_env(good).unwrap();
             assert!(
@@ -724,7 +730,8 @@ mod tests {
         for bad in [
             "K=sk-live-123",
             "K=${K:-sk-live-123}",
-            "K=Bearer ${K}",
+            "K=Bearer sk-live-123",
+            "K=Bearer ${K:-sk-live-123}",
             "K=",
         ] {
             assert!(parse_env(bad).is_err(), "CLI 该拒：{bad}");

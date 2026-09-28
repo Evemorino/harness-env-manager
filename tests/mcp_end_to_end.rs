@@ -242,3 +242,49 @@ fn a_second_apply_writes_nothing() {
         "无事可做的 apply 不该重写配置"
     );
 }
+
+/// **`Authorization: Bearer ${VAR}` 是拿凭据喂两家的那条路**（2026-09-28）。
+/// codex 有 `bearer_token_env_var`、kimi 有 `bearerTokenEnvVar`，两家都发
+/// `Authorization: Bearer <token>`——清单里那一个写法正好对应它们，于是 kimi 上
+/// 「带凭据的 MCP」第一次变得可交付（裸值 `${VAR}` 仍然交付不了，见上一条测试）。
+#[test]
+fn a_bearer_credential_lands_on_codex_and_kimi() {
+    let t = TempHome::new();
+    t.mkdir(".codex");
+    t.mkdir(".kimi-code");
+    t.write(
+        "env.yaml",
+        "version: 1\n\n\
+         mcps:\n  context7:\n    url: https://mcp.context7.com/mcp\n    headers:\n      \
+         Authorization: Bearer ${CONTEXT7_API_KEY}\n    targets: [codex, kimi-code]\n",
+    );
+
+    let planned = run_apply_to_string(&t);
+    assert!(planned.contains("delivered mcp/context7"), "{planned}");
+
+    // codex：照它自己的拼写写成 bearer 通道，绝不落 `${VAR}` 文本。
+    let codex = std::fs::read_to_string(t.path(".codex/config.toml")).unwrap();
+    let doc: toml::Value = toml::from_str(&codex).unwrap();
+    assert_eq!(
+        doc["mcp_servers"]["context7"]["bearer_token_env_var"].as_str(),
+        Some("CONTEXT7_API_KEY"),
+        "{codex}"
+    );
+    assert!(!codex.contains("${"), "{codex}");
+
+    // kimi：唯一的那条环境通道。
+    let kimi: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(t.path(".kimi-code/mcp.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        kimi["mcpServers"]["context7"]["bearerTokenEnvVar"], "CONTEXT7_API_KEY",
+        "{kimi}"
+    );
+
+    // 两家都读得回来：写下去的和读回来的必须是同一个形状。
+    let after = run_diff_to_string(&t);
+    assert!(
+        after.contains("0 install, 0 update") && after.contains("0 undeliverable"),
+        "apply 之后两家都该 in-sync：\n{after}"
+    );
+}

@@ -162,7 +162,26 @@ fn adoptable(cap: &Capability) -> Result<(), String> {
             // `repo:`/`ref:` 两格——写一条空壳 `source: git` 比不写更坏。
             SkillSource::Git { .. } => Err("来源是 git，但读不到 repo/ref，记不出这两格".into()),
         },
-        Spec::Mcp { .. } => Ok(()),
+        // MCP 的条件是**值**：清单只收引用（`${VAR}` / `${VAR:-}` / `Bearer ${VAR}`），
+        // 而 harness 配置里的值可以是字面量——手工写的 `Authorization = "Bearer sk-…"`
+        // 就是这样。照抄会写出一份**解不开的清单**（2026-09-28 实测：那会让整条 `scan`
+        // 在落盘自检那一关失败，一条条目拖垮整次收养）。所以这里按条判：表达不了就跳过，
+        // 并说明是哪一格——理由只点**键名**，绝不回显值（那可能就是密钥）。
+        Spec::Mcp { transport } => {
+            let pairs = match transport {
+                McpTransport::Stdio { env, .. } => env.iter(),
+                McpTransport::Http { headers, .. } => headers.iter(),
+            };
+            for (key, value) in pairs {
+                if !crate::secrets::is_manifest_value(value) {
+                    return Err(format!(
+                        "`{key}` 的值不是清单能表达的形态（只收 `${{VAR}}` / `${{VAR:-}}` / \
+                         `Bearer ${{VAR}}`），照抄会写出一份解不开的清单"
+                    ));
+                }
+            }
+            Ok(())
+        }
         // §10.3：plugin 收养成**记录型**条目（`source: snapshot`）——只记身份与逐家
         // 版本，不请求交付。它不再落进「交付请求」那套语义（`source_harness:` 拆解、
         // `targets` 决定送到哪几家），所以旧的那两难（恒 undeliverable / 静默扩范围）
@@ -1040,6 +1059,61 @@ mod tests {
         ] {
             assert!(scalar(quoted).starts_with('"'), "{quoted:?} 该引起来");
         }
+    }
+
+    /// 值的形态清单收不了（这里是手工写的字面量凭据）→ **按条跳过**，不是整次 scan 失败。
+    /// 修之前：那一行会让落盘自检失败，一条手工条目就能拖垮整场收养（2026-09-28 实测）。
+    /// 理由只点键名，**绝不回显值**——那可能就是密钥。
+    #[test]
+    fn an_unexpressible_value_is_skipped_not_fatal() {
+        let manifest = Manifest::parse("version: 1\n").unwrap();
+        let literal: std::collections::BTreeMap<String, String> = [(
+            "Authorization".to_string(),
+            "Bearer sk-live-9f3a".to_string(),
+        )]
+        .into();
+        let as_ref: std::collections::BTreeMap<String, String> =
+            [("Authorization".to_string(), "${K}".to_string())].into();
+        let states = vec![state(
+            "codex",
+            vec![
+                cap(
+                    "handmade",
+                    "codex",
+                    Spec::Mcp {
+                        transport: McpTransport::Http {
+                            url: "https://mcp.example.com/mcp".to_string(),
+                            headers: literal,
+                        },
+                    },
+                ),
+                cap(
+                    "byenv",
+                    "codex",
+                    Spec::Mcp {
+                        transport: McpTransport::Http {
+                            url: "https://mcp.context7.com/mcp".to_string(),
+                            headers: as_ref,
+                        },
+                    },
+                ),
+            ],
+        )];
+
+        let report = adoptions(&manifest, &states);
+
+        assert_eq!(report.adoptions.len(), 1, "另一条照常收养：{report:?}");
+        assert_eq!(
+            report.adoptions[0].summary,
+            "url=https://mcp.context7.com/mcp"
+        );
+        assert_eq!(report.skips.len(), 1, "{report:?}");
+        let skip = &report.skips[0];
+        assert!(skip.reason.contains("Authorization"), "{skip:?}");
+        assert!(
+            !skip.reason.contains("sk-live-9f3a"),
+            "理由不许回显值：{skip:?}"
+        );
     }
 
     /// 空报告是空操作：没有段、没有空行，只有末行。
