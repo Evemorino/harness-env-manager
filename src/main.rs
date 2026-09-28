@@ -275,11 +275,14 @@ fn parse_env(s: &str) -> Result<(String, String), String> {
     if key.is_empty() {
         return Err("键不能为空".to_string());
     }
-    let looks_like_ref = value.starts_with("${") && value.ends_with('}') && value.len() > 3;
-    if !looks_like_ref {
-        return Err(format!(
-            "值必须是 ${{VAR}} 引用（实际是 `{value}`）——密钥不写进清单"
-        ));
+    // **与清单层同一条规则**（`secrets::parse_manifest_ref`，也就是 `validate_env` 用的
+    // 那条）：这里放行的，清单层必须收。曾经这里是「以 `${` 开头、以 `}` 结尾」的粗判，
+    // 于是 `${K:-x}` 在命令行放行、落盘时才被清单层拦下，用户看到的是一句
+    // 「refusing to write a manifest that does not parse back」——把「哪一层在判什么」
+    // 暴露给了用户，而那本来只是我们内部的次序。
+    if henv::secrets::parse_manifest_ref(value).is_none() {
+        // 不回显值：与清单层同一条纪律（那可能是密钥，而终端会进日志与回滚缓冲）。
+        return Err("值必须是 ${VAR} 引用（或 ${VAR:-} 空默认值）——密钥不写进清单".to_string());
     }
     Ok((key.to_string(), value.to_string()))
 }
@@ -698,6 +701,38 @@ mod tests {
             "add x --mcp --url u --header K=${V}",
         ] {
             assert!(!add_is_refused(args), "不该被拒：{args}");
+        }
+    }
+
+    /// **`--env` / `--header` 的门禁必须与清单层是同一条规则**：CLI 放行的形状，清单层
+    /// 必须收；CLI 拒的形状，清单层也不该放。
+    ///
+    /// 这条是被一次真实的撞墙逼出来的（2026-09-28）：CLI 层原来只判「以 `${` 开头、以 `}`
+    /// 结尾」，于是把 claude 那份 context7 plugin 的值 `${CONTEXT7_API_KEY:-}` 原样敲进来
+    /// 会在**落盘那一刻**被清单层拦下，报的还是「refusing to write a manifest that does not
+    /// parse back」——用户看到的是我们内部的次序，而不是「这个值不行」。
+    #[test]
+    fn the_env_gate_is_the_same_rule_the_manifest_uses() {
+        for good in ["K=${K}", "K=${K:-}"] {
+            assert!(parse_env(good).is_ok(), "CLI 该收：{good}");
+            let (k, v) = parse_env(good).unwrap();
+            assert!(
+                henv::secrets::validate_env(&k, &v).is_ok(),
+                "CLI 收下的形状，清单层必须也收：{good}"
+            );
+        }
+        for bad in [
+            "K=sk-live-123",
+            "K=${K:-sk-live-123}",
+            "K=Bearer ${K}",
+            "K=",
+        ] {
+            assert!(parse_env(bad).is_err(), "CLI 该拒：{bad}");
+            let value = bad.split_once('=').map(|(_, v)| v).unwrap_or(bad);
+            assert!(
+                henv::secrets::validate_env("K", value).is_err(),
+                "CLI 拒的形状，清单层也不该放：{bad}"
+            );
         }
     }
 }

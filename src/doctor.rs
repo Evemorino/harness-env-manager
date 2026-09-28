@@ -192,12 +192,23 @@ fn detail_line(prefix: &str, subject: &str, detail: &str) -> String {
 /// 没有），消息里拼的只有名字。`apply` 会把未展开的引用原样写进 harness 配置，
 /// 所以缺值是「现在就挡路」而不是警告。
 ///
+/// **`${VAR:-}` 不报**：那是「变量可以缺」的写法（claude 自己那份 context7 plugin 就用
+/// 它），严格版的 [`secrets::parse_ref`] 天然把它滤掉——这里借的正是那条严格规则，
+/// 不是漏写。
+///
 /// `lookup` 由调用方注入（生产传 `std::env::var_os`，测试传假表）——这样这条判据
 /// 的可测性不依赖进程环境，测试也不必去改真实环境变量。
 pub fn env_checks(manifest: &Manifest, lookup: &dyn Fn(&str) -> Option<String>) -> Vec<Check> {
     let mut checks = Vec::new();
     for (key, mcp) in &manifest.mcps {
-        for var in mcp.env.values().filter_map(|v| secrets::parse_ref(v)) {
+        // `env` 与 `headers` 都要看：http 型 MCP 的凭据就在 headers 里，而它同样
+        // 「现在就挡路」——两边都是「缺值就发不出去」。
+        for var in mcp
+            .env
+            .values()
+            .chain(mcp.headers.values())
+            .filter_map(|v| secrets::parse_ref(v))
+        {
             // `missing` 是「有没有值」这条判据的唯一定义，这里只借用它，不另写一份；
             // 单元素入参让「这条引用归哪个 key」不会错位。
             if secrets::missing(&[var.to_string()], lookup).is_empty() {

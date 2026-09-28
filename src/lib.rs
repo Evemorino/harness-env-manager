@@ -1177,7 +1177,7 @@ mod tests {
         assert_eq!(
             err,
             format!(
-                "invalid manifest: {}: env.yaml invalid:\n  - mcps.c: env `K` must be a bare ${{VAR}} reference (value not shown)",
+                "invalid manifest: {}: env.yaml invalid:\n  - mcps.c: env `K` must be a ${{VAR}} reference; `${{VAR:-}}` with an empty default is allowed too (value not shown)",
                 t.path("env.yaml").display()
             )
         );

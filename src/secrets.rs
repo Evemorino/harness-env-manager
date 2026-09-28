@@ -3,32 +3,55 @@
 //! 密钥永远以引用形态流转：本模块只判断「语法是否为纯引用」与「变量是否存在」，
 //! **绝不展开值进任何产物**（spec §3 决策 3）。
 
-/// `"${FOO}"` → `Some("FOO")`；任何非纯引用形态 → `None`。
+/// 标识符规则：`[A-Za-z_][A-Za-z0-9_]*`。`$` `{` `}` 都不在里面，所以嵌套与拼接形态
+/// 由这一条一并拒掉，不需要单独的守卫；空串也由 `chars.next()` 挡下。
 /// 手写校验而非 regex，以守住「不引入 regex 依赖」的约束。
-pub fn parse_ref(value: &str) -> Option<&str> {
-    let inner = value.strip_prefix("${")?.strip_suffix('}')?;
-    // 标识符规则本身就排除了 `$ { }`（它们都不在 [A-Za-z0-9_] 里），
-    // 所以嵌套与拼接形态由下面这段一并拒掉，不需要单独的守卫。
-    // 空串也不用单独判：`chars.next()?` 就是那条规则的唯一实现。
-    let mut chars = inner.chars();
-    let first = chars.next()?;
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return None;
-    }
-    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return None;
-    }
-    Some(inner)
+fn is_ident(s: &str) -> bool {
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// 校验单个 env 值。错误信息包含 key 名但**绝不回显 value**（防止密钥进日志/终端）。
+/// `"${FOO}"` → `Some("FOO")`；任何非纯引用形态 → `None`。
+///
+/// 这是**目标 harness 的取值字段能表达的那种引用**：codex 的 `env_vars` /
+/// `env_http_headers` 收的是变量名，`${FOO:-}` 的「缺失时取空值」语义在那儿没有落点，
+/// 所以翻译层与写入器用严格版。**清单门禁**用的是 [`parse_manifest_ref`]。
+pub fn parse_ref(value: &str) -> Option<&str> {
+    let inner = value.strip_prefix("${")?.strip_suffix('}')?;
+    is_ident(inner).then_some(inner)
+}
+
+/// **清单门禁**的规则：`"${FOO}"` 与 `"${FOO:-}"`（**空**默认值）→ `Some("FOO")`，
+/// 其余任何形态 → `None`。
+///
+/// 单给空默认值开一个口，是因为真实世界的配置里有它——claude 自己那份 context7 plugin
+/// 就写着 `${CONTEXT7_API_KEY:-}`，把它照抄进清单不该报错。**非空**默认值照旧拒绝：
+/// `${FOO:-sk-live-abc}` 会把密钥从后门带进清单，那正是这道闸要挡的东西；空默认值不带
+/// 任何字面量，语义只是「这个变量可以缺」。
+///
+/// 注意它同时是 `diff` 渲染摘要时的判据（见 `capability::McpTransport::summary`）：
+/// 认得出的引用照原样显示，认不出的一律 `***`。
+pub fn parse_manifest_ref(value: &str) -> Option<&str> {
+    if let Some(var) = parse_ref(value) {
+        return Some(var);
+    }
+    let inner = value.strip_prefix("${")?.strip_suffix(":-}")?;
+    is_ident(inner).then_some(inner)
+}
+
+/// 校验单个 env / header 值。错误信息包含 key 名但**绝不回显 value**（防止密钥进日志/终端）。
 /// 措辞里不出现任何可能被当作 fixture 值的词（`literal` / `secret` 等），下游测试
 /// 会用「值不得出现在消息里」做断言。
 pub fn validate_env(key: &str, value: &str) -> Result<(), String> {
-    match parse_ref(value) {
+    match parse_manifest_ref(value) {
         Some(_) => Ok(()),
         None => Err(format!(
-            "env `{key}` must be a bare ${{VAR}} reference (value not shown)"
+            "env `{key}` must be a ${{VAR}} reference; `${{VAR:-}}` with an empty default is \
+             allowed too (value not shown)"
         )),
     }
 }
@@ -96,7 +119,8 @@ mod tests {
     /// 其中 `"reference"` 让「把值拼进消息」的写法几乎不可能凑巧等于 WANT。
     #[test]
     fn validate_env_message_is_pinned_and_never_carries_the_value() {
-        const WANT: &str = "env `K` must be a bare ${VAR} reference (value not shown)";
+        const WANT: &str = "env `K` must be a ${VAR} reference; `${VAR:-}` with an empty default \
+                            is allowed too (value not shown)";
         for v in ["sk-live-123", "s", "", "K", "reference", "  spaced  "] {
             assert_eq!(
                 validate_env("K", v).unwrap_err(),
@@ -104,6 +128,22 @@ mod tests {
                 "value {v:?} leaked or message drifted"
             );
         }
+    }
+
+    /// 门禁收哪些形态：裸引用，以及**空**默认值（claude 自己那份 context7 plugin 就写着
+    /// `${CONTEXT7_API_KEY:-}`，照抄进清单不该报错）。
+    #[test]
+    fn an_empty_default_is_accepted_and_a_non_empty_one_is_not() {
+        assert_eq!(parse_manifest_ref("${K}"), Some("K"));
+        assert_eq!(parse_manifest_ref("${K:-}"), Some("K"));
+        assert!(validate_env("K", "${K:-}").is_ok());
+
+        // 非空默认值会把密钥从后门带进清单——照旧拒。
+        assert_eq!(parse_manifest_ref("${K:-sk-live-abc}"), None);
+        assert!(validate_env("K", "${K:-sk-live-abc}").is_err());
+        // 严格版（翻译层用的那个）不吃 `:-`：codex 的取值字段收的是变量名。
+        assert_eq!(parse_ref("${K:-}"), None);
+        assert_eq!(parse_ref("${K}"), Some("K"));
     }
 
     #[test]

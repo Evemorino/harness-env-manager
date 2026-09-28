@@ -302,9 +302,9 @@ mcps:
     targets: all                # all 或显式列表 [claude-code, codex]
 
   # 远端 MCP：与上面**二选一**（校验里判「恰好一种」）。
-  # `headers` 的值同样只允许**裸** ${VAR} 引用——那是放凭据的地方，
-  # 所以 `Bearer ${TOKEN}` 或 `${TOKEN:-}` 这类带前缀/默认值的写法表达不了
-  # （§9.6 的「已知的表达力边界」）。
+  # `headers` 的值也是引用——那是放凭据的地方。允许 `${TOKEN}` 与 `${TOKEN:-}`
+  # （空默认值，意思是「变量可以缺」），但 `${TOKEN:-sk-live}` 这种非空默认值不行：
+  # 那等于把密钥从后门带进清单。带前缀的 `Bearer ${TOKEN}` 同样表达不了。
   remote-docs:
     url: https://mcp.example.com/mcp
     headers:
@@ -333,7 +333,10 @@ Schema 决策：
 
 1. **三类条目、一个出口**：`skills`/`mcps`/`plugins` 是用户书写视角；解析后全部变成
    Capability 流，`targets`、`degrade` 字段语义在三类上统一。
-2. **密钥语法即门禁**：`env` 值必须匹配 `${VAR}`，`manifest.rs` 校验阶段拒绝任何字面量。
+2. **密钥语法即门禁**：`env` / `headers` 的值必须是引用，`manifest.rs` 校验阶段拒绝任何字面量。
+   2026-09-28 起允许 `${VAR:-}`（**空**默认值，真实配置里有它）；非空默认值与带前缀的写法
+   照旧拒绝——那是这道闸要挡的东西（判据只有一份：`secrets::parse_manifest_ref`，
+   CLI 的 `--env` / `--header` 用的是同一个）。
 3. **degrade 策略按 plugin 条目声明**，不做全局开关：不同 bundle 对 hooks 的依赖程度不同。
 4. **`targets: all` 是默认值**：显式列表只用于定向分发场景。
 5. **`source_harness:` 的存在本身就是拆解请求**，不拿「`degrade:` 写没写」当开关：`degrade` 是
@@ -785,7 +788,9 @@ codex」正是这么写的）。理由同 §9.3：那份内容是**清单要求�
 所以清单的载荷是两态的 `McpTransport`：`Stdio { command, args, env }` /
 `Http { url, headers }`，校验要求**恰好一种**——`command` 与 `url` 互斥且必有其一，
 `args`/`env` 只跟 `command` 走、`headers` 只跟 `url` 走。`headers` 的值与 `env` 同一条门禁：
-必须是裸 `${VAR}` 引用，字面量拒绝（那正是放凭据的地方）。
+必须是引用，字面量拒绝（那正是放凭据的地方）。允许的形态是 `${VAR}` 与 `${VAR:-}`
+（**空**默认值，2026-09-28 放开：claude 自己那份 context7 plugin 就是这么写的）；
+`${VAR:-sk-live-abc}` 这种非空默认值照旧拒绝——它等于把密钥从后门带进清单。
 
 三家对这两种形态的**拼法各不相同**，读写两侧都按这张表：
 
@@ -834,10 +839,18 @@ codex 那边唯一的缺口是**换名映射**（`K: ${OTHER}`）：它的 `env_
 kimi 换 `mcpServers.<n>`、claude 是 `remove` 后 `add-json`——见下），所以换形态时旧形态的
 字段不会留下：stdio → http 后 `command`/`args`/`env` 必须消失，反向同理。这条有专门的测试。
 
-**已知的表达力边界**：`${VAR}` 只能是**裸引用**，所以 context7 plugin 原文里
-`${CONTEXT7_API_KEY:-}` 那种「带默认值」的 shell 展开写法清单**表达不了**——那是
-`${VAR}` 门禁换来的（它同时是「拦住字面量密钥」的那道闸）。要那种形态得手工改配置，
-并把那条从清单里排除。
+**门禁收哪些形态，以及它与各家的差距（2026-09-28）**：清单门禁（`secrets::validate_env`，
+CLI 的 `--env` / `--header` 用**同一条规则** `secrets::parse_manifest_ref`）收 `${VAR}` 与
+`${VAR:-}`（空默认值），拒字面量、拒非空默认值（`${VAR:-sk-live}` 等于把密钥从后门带进来）、
+拒带前缀的 `Bearer ${VAR}`。
+
+这几种形态的**交付命运不同**，全都由 `mcp_expressible` 一句话说清：
+`${VAR:-}` 在 claude 上原样写下去（它自己会展开默认值），在 codex 上**报 undeliverable**——
+`env_vars` / `env_http_headers` 收的是变量名，「变量缺失时取空值」那层语义没有落点，而把默认值
+扔掉等于悄悄把它变成「必须有」。**两层规则曾经不一致**（CLI 那时只判「以 `${` 开头、以 `}`
+结尾」），症状是把 context7 的值原样敲进命令行后，直到落盘那一刻才被清单层拦下，报的还是
+「refusing to write a manifest that does not parse back」——用户看到的是我们内部的次序。
+现在两边共用一份判据，并有回归测试钉住「CLI 放行的，清单层必须收」。
 
 **claude 那条必须显式指定 user 级 scope——已核实，不再只是意图。** 本机实测
 `claude mcp add-json` 的 `-s, --scope <scope>` 取 `local|user|project`，**默认 `local`**；
@@ -875,8 +888,11 @@ config`，退出码非 0，没有 `--force` 之类的覆盖开关；`remove` 只
 代价（**已接受**）：用户想让 henv 接管一个自己手配过的同名 MCP，得先自己删掉再 `apply`。
 
 `update` 的 from/to 用**可读摘要**（`mcp_summary`）而不是哈希：stdio 那条是命令行
-（`npx -y @upstash/context7-mcp`），http 那条是 `http <url>`，两者的 `env`/`headers` 都只
-列键名。MCP 的「内容」就是这些字段，哈希在这里只是账本用的凭证。凭证由
+（`npx -y @upstash/context7-mcp`），http 那条是 `http <url>`，两者的 `env`/`headers`
+渲染成 `键=引用`（`K=${K}`、`Authorization=${TOKEN:-}`），**认不出的形态一律 `***`**——
+只列键名的话，「把 header 从 `${A}` 换成 `${B}`」在 update 行上左右一模一样，等于没说改了什么
+（2026-09-28 实测反馈：context7 那次 diff 就是这种看不出差别的行）。MCP 的「内容」就是这些
+字段，哈希在这里只是账本用的凭证。凭证由
 `store::hash::hash_mcp_spec(&McpTransport)`（与 `hash_dir` 并列）产出，读写两侧共用一份
 实现——两侧各算各的，正是「账本哈希对不上」这类谜题的来源。
 
@@ -885,8 +901,8 @@ config`，退出码非 0，没有 `--force` 之类的覆盖开关；`remove` 只
 为哈希去 derive 它会把序列化形状变成对外契约；而 `&Spec` 版本还要为另外六个变体
 （`Skill`/`Plugin`/`Hook`/`Command`/`Agent`/`Only`）写永远走不到的 arm。原生载荷顺带让
 「拿一个 skill spec 算 mcp 哈希」在类型上不可表达。**`env`/`headers` 的值参与哈希**——与
-`mcp_summary`（只渲染键名，§3 决策 3）不同，账本要认得出「同一条 server 换了一个环境变量
-引用」是改动。
+`mcp_summary`（只渲染引用，字面量给 `***`，§3 决策 3）不同，账本要认得出「同一条 server
+换了一个环境变量引用」是改动。
 
 **账本键是 `(harness, kind, name)`，不是 `(harness, name)`。** 同名跨 kind 是清单明确允许的
 （`skills.foo` 与 `mcps.foo` 并存），而 `record` 的语义是「同名覆盖旧的」——键里不带 kind 的话，
@@ -1051,7 +1067,8 @@ skill、6 份 per-harness `plugin.json`（`.claude-plugin` / `.codex-plugin` / `
 每条带**来源摘要**（`agents-dir` / `local <路径>` / `git <repo>@<ref>` / `plugin <名>` /
 MCP 的 `mcp_summary`）和一处 **`[henv]` 标记**——有标记的是 henv 交付的（账本里查得到），
 没有的本机原生或手工放的。来源摘要里 MCP 只渲染键名与命令，绝不渲染 `env` 值
-（`mcp_summary` 的既有契约：actual 侧的值可能是明文密钥）。
+（`mcp_summary` 的契约：引用照原样、其余 `***`——actual 侧的值可能是明文密钥，
+而那也正是「一个引用换成了另一个」能被看见的地方）。
 
 只读：不写任何文件，连 henv 自己的缓存都不碰——`read_state` 全程只读。
 

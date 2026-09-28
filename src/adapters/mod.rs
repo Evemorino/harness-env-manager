@@ -54,17 +54,38 @@ pub(crate) fn mcp_expressible(harness: &str, transport: &McpTransport) -> Result
         (CLAUDE_CODE, _) => Ok(()),
         (CODEX, McpTransport::Stdio { env, .. }) => {
             for (key, value) in env {
-                // 同名转发（`K: ${K}`）就是 codex 的 `env_vars`；换个名字它没有对应写法。
-                if crate::secrets::parse_ref(value) != Some(key.as_str()) {
+                // 同名转发（`K: ${K}`）就是 codex 的 `env_vars`。
+                if crate::secrets::parse_ref(value) == Some(key.as_str()) {
+                    continue;
+                }
+                // `${K:-}` 也是同名，但带着「变量缺失时取空值」那一层语义，而 `env_vars`
+                // 只收变量名——那层语义没有落点。**不能把默认值扔掉当成同名转发**：
+                // 变量缺失时 codex 会报缺输入（可见），而清单说的是「缺了也行」。
+                if crate::secrets::parse_manifest_ref(value) == Some(key.as_str()) {
                     return Err(format!(
-                        "codex 的 `env` 只收字面量，从环境取值只能**同名**转发（`env_vars`）；\
-                         `{key}` 映射到别的变量名表达不了"
+                        "codex 的 `env_vars` 只收变量名，表达不了 `{key}` 上 `${{VAR:-}}` 的\
+                         「变量缺失时取空值」语义"
+                    ));
+                }
+                // 剩下的就是换名映射（`K: ${OTHER}`）：`env` 只能放字面量。
+                return Err(format!(
+                    "codex 的 `env` 只收字面量，从环境取值只能**同名**转发（`env_vars`）；\
+                     `{key}` 映射到别的变量名表达不了"
+                ));
+            }
+            Ok(())
+        }
+        (CODEX, McpTransport::Http { headers, .. }) => {
+            for (name, value) in headers {
+                if crate::secrets::parse_ref(value).is_none() {
+                    return Err(format!(
+                        "codex 的 `env_http_headers` 里放的是**变量名**，只认裸 `${{VAR}}`；\
+                         `{name}` 上这种写法（比如 `${{VAR:-}}` 的默认值）表达不了"
                     ));
                 }
             }
             Ok(())
         }
-        (CODEX, McpTransport::Http { .. }) => Ok(()),
         (KIMI_CODE, McpTransport::Stdio { env, .. }) => {
             if env.is_empty() {
                 return Ok(());
@@ -262,6 +283,55 @@ mod tests {
     #[test]
     fn harness_name_constants_are_the_three_spellings_manifest_accepts() {
         assert_eq!([CLAUDE_CODE, CODEX, KIMI_CODE], KNOWN_HARNESSES);
+    }
+
+    /// `mcp_expressible` 的三条判据（实测依据见函数文档）：claude 什么都能写；
+    /// codex 只认**同名裸引用**（stdio）与裸引用（http）；kimi 的凭据一个都写不出来。
+    #[test]
+    fn mcp_expressibility_matches_each_harnesss_value_channel() {
+        let stdio = |env: &[(&str, &str)]| McpTransport::Stdio {
+            command: "npx".into(),
+            args: vec![],
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        };
+        let http = |headers: &[(&str, &str)]| McpTransport::Http {
+            url: "https://x/mcp".into(),
+            headers: headers
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        };
+
+        // claude 展开 `${VAR}`：连带默认值的写法都照写。
+        assert!(mcp_expressible(CLAUDE_CODE, &http(&[("Authorization", "${K:-}")])).is_ok());
+        assert!(mcp_expressible(CLAUDE_CODE, &stdio(&[("A", "${B}")])).is_ok());
+
+        // codex 的取值字段收的是**变量名**：同名裸引用能表达。
+        assert!(mcp_expressible(CODEX, &stdio(&[("K", "${K}")])).is_ok());
+        assert!(mcp_expressible(CODEX, &http(&[("Authorization", "${K}")])).is_ok());
+        assert!(mcp_expressible(CODEX, &http(&[])).is_ok());
+
+        // 换名映射没有落点（`env_vars` 只按原名转发）。
+        let renamed = mcp_expressible(CODEX, &stdio(&[("K", "${OTHER}")])).unwrap_err();
+        assert!(renamed.contains("同名"), "{renamed}");
+
+        // `${VAR:-}` 的「缺了也行」语义没有落点——不能把默认值扔掉当同名转发。
+        let defaulted = mcp_expressible(CODEX, &stdio(&[("K", "${K:-}")])).unwrap_err();
+        assert!(defaulted.contains("env_vars"), "{defaulted}");
+        let defaulted = mcp_expressible(CODEX, &http(&[("Authorization", "${K:-}")])).unwrap_err();
+        assert!(defaulted.contains("env_http_headers"), "{defaulted}");
+
+        // kimi：凭据一个都写不出来，但「没有凭据」的条目照常交付。
+        assert!(mcp_expressible(KIMI_CODE, &http(&[])).is_ok());
+        assert!(mcp_expressible(KIMI_CODE, &stdio(&[])).is_ok());
+        assert!(mcp_expressible(KIMI_CODE, &stdio(&[("K", "${K}")])).is_err());
+        assert!(mcp_expressible(KIMI_CODE, &http(&[("Authorization", "${K}")])).is_err());
+
+        // 第五家的名字不该在这里被当成「写得出来」。
+        assert!(mcp_expressible("cursor", &http(&[])).is_err());
     }
 
     #[test]

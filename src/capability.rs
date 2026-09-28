@@ -111,8 +111,12 @@ pub enum McpTransport {
 }
 
 impl McpTransport {
-    /// 人读的一行摘要。**只渲染键名，绝不渲染值**——`actual` 侧的值是从活配置里读回来的，
-    /// 可能就是明文密钥（§3 决策 3）。
+    /// 人读的一行摘要。**只渲染引用，字面量一律 `***`**——`actual` 侧的值是从活配置里
+    /// 读回来的，可能就是明文密钥（§3 决策 3）。
+    ///
+    /// 引用本身没有秘密可泄露（`${CONTEXT7_API_KEY}` 只是个变量名），而且**必须**渲染出来：
+    /// 只显示键名时，把一个 header 从 `${A}` 改成 `${B}` 会让 `diff` 的 update 行左右
+    /// 一模一样（`[headers: Authorization] → [headers: Authorization]`），等于没说改了什么。
     pub(crate) fn summary(&self) -> String {
         match self {
             McpTransport::Stdio { command, args, env } => {
@@ -122,22 +126,40 @@ impl McpTransport {
                     s.push_str(a);
                 }
                 if !env.is_empty() {
-                    s.push_str(" [env: ");
-                    s.push_str(&env.keys().cloned().collect::<Vec<_>>().join(","));
-                    s.push(']');
+                    s.push_str(&format!(" [env: {}]", pairs(env)));
                 }
                 s
             }
             McpTransport::Http { url, headers } => {
                 let mut s = format!("http {url}");
                 if !headers.is_empty() {
-                    s.push_str(" [headers: ");
-                    s.push_str(&headers.keys().cloned().collect::<Vec<_>>().join(","));
-                    s.push(']');
+                    s.push_str(&format!(" [headers: {}]", pairs(headers)));
                 }
                 s
             }
         }
+    }
+}
+
+/// 一串 env / header 渲染成 `K=${K},W=***`：键序由 `BTreeMap` 保证稳定，值那一侧见
+/// [`shown_value`]。
+fn pairs(map: &std::collections::BTreeMap<String, String>) -> String {
+    map.iter()
+        .map(|(k, v)| format!("{k}={}", shown_value(v)))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+/// 一个 env / header 值渲染成什么：**认得出的引用照原样**（那只是个变量名，`${K:-}` 的
+/// `:-` 也是要看见的信息），其余一律 `***`。
+///
+/// 判据借清单门禁那条（[`crate::secrets::parse_manifest_ref`]）而不是「看起来像不像」的
+/// 启发式：门禁收什么，这里就显示什么，两份规则不会漂。
+fn shown_value(value: &str) -> &str {
+    if crate::secrets::parse_manifest_ref(value).is_some() {
+        value
+    } else {
+        "***"
     }
 }
 
@@ -675,22 +697,22 @@ mod tests {
         );
         // 上面三对 fixture 全都有 command 或 args 上的差异，`de == ae` 那一段其实没被
         // 看过一眼：把它删掉测试仍全绿。这一对 command+args 逐字相同、**只差 env 值**，
-        // 是唯一能杀掉该变异的形状。摘要按 A2 只渲染键名，所以 from/to 同串是裁定的残余。
+        // 是唯一能杀掉该变异的形状。引用照原样渲染，所以这次 from/to 是**看得出差别**的。
         assert_eq!(
             compare_versions(
-                &mcp("npx", vec!["-y", "pkg"], vec![("K", "v2")]),
-                &mcp("npx", vec!["-y", "pkg"], vec![("K", "v1")])
+                &mcp("npx", vec!["-y", "pkg"], vec![("K", "${B}")]),
+                &mcp("npx", vec!["-y", "pkg"], vec![("K", "${A}")])
             ),
             VersionMatch::Different {
-                from: "npx -y pkg [env: K]".into(),
-                to: "npx -y pkg [env: K]".into(),
+                from: "npx -y pkg [env: K=${A}]".into(),
+                to: "npx -y pkg [env: K=${B}]".into(),
             }
         );
         // env 逐字相同（键名与值都相同）才算 Same：这一对与上一对只在 env 的值上有差别
         assert_eq!(
             compare_versions(
-                &mcp("npx", vec!["-y", "pkg"], vec![("K", "v1")]),
-                &mcp("npx", vec!["-y", "pkg"], vec![("K", "v1")])
+                &mcp("npx", vec!["-y", "pkg"], vec![("K", "${A}")]),
+                &mcp("npx", vec!["-y", "pkg"], vec![("K", "${A}")])
             ),
             VersionMatch::Same
         );
@@ -728,13 +750,13 @@ mod tests {
         );
     }
 
-    /// `mcp_summary` 的第三个参数是**安全约束**，不是装饰：actual 侧的 env 值由 adapter 从
-    /// 活配置里读出来，可能就是明文真密钥，而摘要会进 Task 14 的终端输出与报告产物。
-    /// 所以这里把每条渲染串逐字钉死——任何把值拼进摘要的写法（`keys()` 换成 `values()`、
-    /// 加个 `= {v}`）都会立刻变红。键名顺序也是契约的一部分：BTreeMap 的字节升序 + `,`
-    /// 分隔，插入顺序不参与。
+    /// 摘要的渲染规则：**引用照原样，其余一律 `***`**。这一条的两头都重要——
+    /// `actual` 侧的 env 值由 adapter 从活配置里读出来，可能就是明文真密钥（安全约束），
+    /// 而只渲染键名会让 `${A}` → `${B}` 这种改动在报告里看不见（可用性约束，2026-09-28）。
+    /// 所以每条渲染串都逐字钉死：键名顺序是契约的一部分（BTreeMap 字节升序 + `,` 分隔，
+    /// 插入顺序不参与），值那一侧既不许漏出字面量，也不许把引用抹成 `***`。
     #[test]
-    fn mcp_summary_renders_env_key_names_never_values() {
+    fn mcp_summary_shows_references_and_redacts_everything_else() {
         let mcp = |cmd: &str, args: Vec<&str>, env: Vec<(&str, &str)>| Spec::Mcp {
             transport: McpTransport::Stdio {
                 command: cmd.into(),
@@ -745,27 +767,39 @@ mod tests {
                     .collect(),
             },
         };
-        // 同一个键换了值 → 摘要同串。不显示值就分不清值，这是换取「密钥永不进产物」
-        // 而**已裁定接受**的残余，不要试图消掉。
+        // actual 侧是字面量（手写的配置里会有）→ 只给 `***`，值一个字都不许露面；
+        // desired 侧是引用 → 照原样。两侧因此**看得出差别**。
         assert_eq!(
             compare_versions(
-                &mcp("npx", vec!["-y", "pkg"], vec![("K", "sk-live-9f3a")]),
-                &mcp("npx", vec!["-y", "pkg"], vec![("K", "${K}")])
+                &mcp("npx", vec!["-y", "pkg"], vec![("K", "${K}")]),
+                &mcp("npx", vec!["-y", "pkg"], vec![("K", "sk-live-9f3a")])
             ),
             VersionMatch::Different {
-                from: "npx -y pkg [env: K]".into(),
-                to: "npx -y pkg [env: K]".into(),
+                from: "npx -y pkg [env: K=***]".into(),
+                to: "npx -y pkg [env: K=${K}]".into(),
+            }
+        );
+        // 空默认值（`${K:-}`）也是要看见的信息：它与 `${K}` 不是同一件事，
+        // 而两个形状在清单里都合法。
+        assert_eq!(
+            compare_versions(
+                &mcp("npx", vec![], vec![("K", "${K:-}")]),
+                &mcp("npx", vec![], vec![("K", "${K}")])
+            ),
+            VersionMatch::Different {
+                from: "npx [env: K=${K}]".into(),
+                to: "npx [env: K=${K:-}]".into(),
             }
         );
         // 多键：字节升序、`,` 分隔、无空格；desired 侧的插入顺序是 Z 然后 A
         assert_eq!(
             compare_versions(
-                &mcp("npx", vec!["x"], vec![("Z", "sk-live-9f3a"), ("A", "${A}")]),
-                &mcp("npx", vec!["x"], vec![("A", "${A}"), ("Z", "other")])
+                &mcp("npx", vec!["x"], vec![("A", "${A}"), ("Z", "${Z}")]),
+                &mcp("npx", vec!["x"], vec![("Z", "sk-live-9f3a"), ("A", "${A}")])
             ),
             VersionMatch::Different {
-                from: "npx x [env: A,Z]".into(),
-                to: "npx x [env: A,Z]".into(),
+                from: "npx x [env: A=${A},Z=***]".into(),
+                to: "npx x [env: A=${A},Z=${Z}]".into(),
             }
         );
         // 只有一侧有 env → 另一侧不渲染 `[env: ]` 段，方向仍是 from=actual、to=desired
@@ -776,7 +810,7 @@ mod tests {
             ),
             VersionMatch::Different {
                 from: "npx -y pkg".into(),
-                to: "npx -y pkg [env: TOKEN]".into(),
+                to: "npx -y pkg [env: TOKEN=***]".into(),
             }
         );
         // 无 args 时 `[env: ]` 段直接跟在 command 后面（那个前导空格是它自己的）
@@ -787,7 +821,7 @@ mod tests {
             ),
             VersionMatch::Different {
                 from: "newbin".into(),
-                to: "newbin [env: K]".into(),
+                to: "newbin [env: K=${K}]".into(),
             }
         );
     }
